@@ -81,6 +81,8 @@ struct State {
     /// The Claude session has exchanges since it started (worth saving).
     session_dirty: bool,
     last_activity: Option<Instant>,
+    /// A session's memory update was requested and hasn't reported back.
+    memory_saving: bool,
     /// Quit requested; waiting for the memory save to finish.
     quitting: bool,
     meta_timer: Option<glib::SourceId>,
@@ -240,6 +242,7 @@ impl Ui {
                 empty_follow_ups: 0,
                 session_dirty: false,
                 last_activity: None,
+                memory_saving: false,
                 quitting: false,
                 meta_timer: None,
             }),
@@ -393,9 +396,9 @@ impl Ui {
                 return Reply::state(s);
             }
             Command::Memory => {
-                let path = fsc_core::memory::path(&self.cfg.claude_home());
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
-                let facts: Vec<&str> = text.lines().filter(|l| l.starts_with("- ")).collect();
+                let home = self.cfg.claude_home();
+                let path = fsc_core::memory::path(&home);
+                let facts = fsc_core::memory::load(&home);
                 return Reply::state(if facts.is_empty() {
                     "(nothing remembered yet)".to_string()
                 } else {
@@ -408,6 +411,8 @@ impl Ui {
                 let mut st = self.st.borrow_mut();
                 st.session_dirty = false;
                 st.last_activity = None;
+                // Forgetting cancels any save in flight; it won't report back.
+                st.memory_saving = false;
             }
             Command::Quit => self.quit(),
         }
@@ -477,11 +482,9 @@ impl Ui {
                     }
                 }
                 self.set_claude(if ok { Phase::Idle } else { Phase::Error });
-                {
-                    let mut st = self.st.borrow_mut();
-                    st.session_dirty = true;
-                    st.last_activity = Some(Instant::now());
-                }
+                // Not `session_dirty`: that's set when a prompt is sent, since
+                // a rotation also ends (interrupts) the turn it cuts short.
+                self.st.borrow_mut().last_activity = Some(Instant::now());
                 self.scroll_to_end();
 
                 let spoken = self.st.borrow().voice_turn && self.should_speak();
@@ -503,6 +506,7 @@ impl Ui {
                 eprintln!("fsc: {reason}");
             }
             ClaudeEvent::MemorySaved { ok, facts, error } => {
+                self.st.borrow_mut().memory_saving = false;
                 if ok {
                     self.flash_meta(&format!("MEMORY UPDATED · {facts} FACTS"));
                 } else {
@@ -609,6 +613,7 @@ impl Ui {
         if self.session_idle() {
             self.rotate_session();
         }
+        self.st.borrow_mut().session_dirty = true;
 
         let ex = gtk::Box::new(gtk::Orientation::Vertical, 6);
         let prefix = if voice { "󰍬" } else { "›" };
@@ -655,9 +660,17 @@ impl Ui {
     /// End the Claude session (saving memory) and mark it in the history.
     fn rotate_session(&self) {
         eprintln!("fsc: session idle, rotating");
-        self.claude.rotate(true);
+        self.end_session();
         self.add_divider("NEW SESSION");
+    }
+
+    /// Ask for a fresh Claude session, saving memory from this one if it had
+    /// any exchanges.
+    fn end_session(&self) {
         let mut st = self.st.borrow_mut();
+        let save = st.session_dirty;
+        self.claude.rotate(save);
+        st.memory_saving |= save && self.cfg.claude.memory;
         st.session_dirty = false;
         st.last_activity = None;
     }
@@ -683,19 +696,22 @@ impl Ui {
         self.trim_history();
     }
 
-    /// Quit, saving memory first if this session had any exchanges.
+    /// Quit, saving memory first if this session had any exchanges (or
+    /// waiting for a save already under way).
     fn quit(self: &Rc<Self>) {
-        let save = {
+        let (wait, dirty) = {
             let mut st = self.st.borrow_mut();
-            let save = self.cfg.claude.memory && st.session_dirty && !st.quitting;
+            let wait = self.cfg.claude.memory && (st.session_dirty || st.memory_saving) && !st.quitting;
             st.quitting = true;
-            save
+            (wait, st.session_dirty)
         };
-        if !save {
+        if !wait {
             self.app.quit();
             return;
         }
-        self.claude.rotate(true);
+        if dirty {
+            self.end_session();
+        }
         self.flash_meta_for("SAVING MEMORY…", Duration::from_secs(30));
         // Don't hang forever if the save stalls.
         let app = self.app.clone();
@@ -838,12 +854,7 @@ impl Ui {
     fn new_conversation(self: &Rc<Self>) {
         self.cancel_listen();
         self.audio.stop_speaking();
-        self.claude.rotate(true);
-        {
-            let mut st = self.st.borrow_mut();
-            st.session_dirty = false;
-            st.last_activity = None;
-        }
+        self.end_session();
         while let Some(child) = self.history.first_child() {
             self.history.remove(&child);
         }

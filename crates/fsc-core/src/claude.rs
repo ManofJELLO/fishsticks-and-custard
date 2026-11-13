@@ -116,7 +116,18 @@ struct Turn {
     interrupted: bool,
     /// The hidden end-of-session memory update: text is captured, not shown.
     internal: bool,
+    /// Internal: a user reply cut short by a rotation is still winding down.
+    /// Its output is discarded; the memory update is sent once it ends.
+    draining: bool,
     buf: String,
+}
+
+/// What `handle_line` reports about a hidden turn.
+enum Internal {
+    /// The interrupted user turn ended: the memory update can be sent now.
+    Drained,
+    /// The memory update finished.
+    Memory { ok: bool, reply: String },
 }
 
 /// Kill the current process (if any) and start a new session.
@@ -131,6 +142,50 @@ async fn send_user(proc: &mut Option<Proc>, text: &str) -> std::io::Result<()> {
     let p = proc.as_mut().ok_or_else(|| std::io::Error::other("claude is not running"))?;
     let msg = json!({ "type": "user", "message": { "role": "user", "content": text } });
     write_line(&mut p.stdin, &msg).await
+}
+
+async fn send_interrupt(p: &mut Proc, req_id: &mut u64) -> std::io::Result<()> {
+    *req_id += 1;
+    let msg = json!({
+        "type": "control_request",
+        "request_id": format!("fsc_{req_id}"),
+        "request": { "subtype": "interrupt" },
+    });
+    write_line(&mut p.stdin, &msg).await
+}
+
+/// Ask the session for its memory update. `false` (and a failed
+/// `MemorySaved`) if it couldn't be sent.
+async fn begin_save<F: Fn(ClaudeEvent)>(proc: &mut Option<Proc>, turn: &mut Turn, home: &Path, emit: &F) -> bool {
+    let prompt = memory::update_prompt(&memory::load(home));
+    match send_user(proc, &prompt).await {
+        Ok(()) => {
+            eprintln!("fsc: saving memory before starting a new session");
+            *turn = Turn { active: true, internal: true, ..Default::default() };
+            true
+        }
+        Err(e) => {
+            emit(ClaudeEvent::MemorySaved { ok: false, facts: memory::load(home).len(), error: Some(e.to_string()) });
+            false
+        }
+    }
+}
+
+/// Store the memory update's reply and report the outcome.
+fn finish_save(home: &Path, ok: bool, reply: String) -> ClaudeEvent {
+    let current = memory::load(home);
+    match (ok, memory::parse_reply(&reply, &current)) {
+        (true, Some(facts)) => match memory::save(home, &facts) {
+            Ok(()) => ClaudeEvent::MemorySaved { ok: true, facts: facts.len(), error: None },
+            Err(e) => ClaudeEvent::MemorySaved { ok: false, facts: current.len(), error: Some(e.to_string()) },
+        },
+        (true, None) => ClaudeEvent::MemorySaved {
+            ok: false,
+            facts: current.len(),
+            error: Some("unusable memory reply; kept the old memory".into()),
+        },
+        (false, _) => ClaudeEvent::MemorySaved { ok: false, facts: current.len(), error: Some(reply) },
+    }
 }
 
 async fn actor<F>(cfg: ClaudeConfig, home: PathBuf, mut rx: mpsc::UnboundedReceiver<Req>, emit: F)
@@ -161,35 +216,43 @@ where
                     ask(&mut proc, &mut turn, &mut dirty, &cfg, &home, &text, &emit).await;
                 }
                 Some(Req::Interrupt) => {
-                    if let (Some(p), true) = (proc.as_mut(), turn.active && !turn.internal) {
-                        req_id += 1;
-                        let msg = json!({
-                            "type": "control_request",
-                            "request_id": format!("fsc_{req_id}"),
-                            "request": { "subtype": "interrupt" },
-                        });
-                        if write_line(&mut p.stdin, &msg).await.is_ok() {
-                            turn.interrupted = true;
-                        }
+                    if let (Some(p), true) = (proc.as_mut(), turn.active && !turn.internal)
+                        && send_interrupt(p, &mut req_id).await.is_ok()
+                    {
+                        turn.interrupted = true;
                     }
                 }
                 Some(Req::Rotate { save }) => {
                     if turn.active && turn.internal {
                         continue; // already rotating
                     }
+                    let save = save && cfg.memory;
                     if turn.active {
                         emit(ClaudeEvent::TurnDone { ok: true, interrupted: true, error: None });
-                        turn = Turn::default();
-                    }
-                    if save && cfg.memory && dirty && proc.is_some() {
-                        let prompt = memory::update_prompt(&memory::load(&home));
-                        match send_user(&mut proc, &prompt).await {
-                            Ok(()) => {
-                                eprintln!("fsc: saving memory before starting a new session");
-                                turn = Turn { active: true, internal: true, ..Default::default() };
+                        if save && dirty && let Some(p) = proc.as_mut() {
+                            // The CLI is still producing that reply: stop it and
+                            // ask for the memory update once it has ended, so
+                            // its output isn't mistaken for the update.
+                            let stopping = turn.interrupted || send_interrupt(p, &mut req_id).await.is_ok();
+                            if stopping {
+                                turn = Turn { active: true, internal: true, draining: true, ..Default::default() };
                                 continue;
                             }
-                            Err(e) => emit(ClaudeEvent::MemorySaved { ok: false, facts: 0, error: Some(e.to_string()) }),
+                        }
+                        turn = Turn::default();
+                    }
+                    if save {
+                        if dirty && proc.is_some() {
+                            if begin_save(&mut proc, &mut turn, &home, &emit).await {
+                                continue;
+                            }
+                        } else {
+                            // Still answer, so a quit waiting on the save goes ahead.
+                            emit(ClaudeEvent::MemorySaved {
+                                ok: false,
+                                facts: memory::load(&home).len(),
+                                error: Some("this session had nothing to save".into()),
+                            });
                         }
                     }
                     restart(&mut proc, &cfg, &home).await;
@@ -215,23 +278,18 @@ where
             },
             line = next_line(&mut proc) => match line {
                 Ok(Some(l)) => {
-                    if let Some((ok, reply)) = handle_line(&l, &mut turn, &emit) {
-                        // The memory update finished: store it, then start the new session.
-                        let current = memory::load(&home);
-                        let event = match (ok, memory::parse_reply(&reply, &current)) {
-                            (true, Some(facts)) => match memory::save(&home, &facts) {
-                                Ok(()) => ClaudeEvent::MemorySaved { ok: true, facts: facts.len(), error: None },
-                                Err(e) => ClaudeEvent::MemorySaved { ok: false, facts: current.len(), error: Some(e.to_string()) },
-                            },
-                            (true, None) => ClaudeEvent::MemorySaved {
-                                ok: false,
-                                facts: current.len(),
-                                error: Some("unusable memory reply; kept the old memory".into()),
-                            },
-                            (false, _) => ClaudeEvent::MemorySaved { ok: false, facts: current.len(), error: Some(reply) },
-                        };
-                        eprintln!("fsc: {event:?}");
-                        emit(event);
+                    let Some(done) = handle_line(&l, &mut turn, &emit) else { continue };
+                    let saving = match done {
+                        Internal::Drained => begin_save(&mut proc, &mut turn, &home, &emit).await,
+                        Internal::Memory { ok, reply } => {
+                            // The memory update finished: store it, then start the new session.
+                            let event = finish_save(&home, ok, reply);
+                            eprintln!("fsc: {event:?}");
+                            emit(event);
+                            false
+                        }
+                    };
+                    if !saving {
                         restart(&mut proc, &cfg, &home).await;
                         dirty = false;
                         for text in queued.drain(..) {
@@ -251,7 +309,11 @@ where
                         }
                     }
                     if turn.active && turn.internal {
-                        emit(ClaudeEvent::MemorySaved { ok: false, facts: 0, error: Some(reason.clone()) });
+                        emit(ClaudeEvent::MemorySaved {
+                            ok: false,
+                            facts: memory::load(&home).len(),
+                            error: Some(reason.clone()),
+                        });
                     } else if turn.active {
                         emit(ClaudeEvent::TurnDone { ok: false, interrupted: false, error: Some(reason.clone()) });
                     }
@@ -322,7 +384,9 @@ fn start(cfg: &ClaudeConfig, home: &Path) -> Option<Proc> {
         "--setting-sources",
         &cfg.setting_sources,
     ]);
-    if let Some(prompt) = write_session_prompt(cfg, home) {
+    // Fall back to the bare persona if the combined prompt can't be written.
+    let persona = home.join("persona.md");
+    if let Some(prompt) = write_session_prompt(cfg, home).or_else(|| persona.exists().then_some(persona)) {
         cmd.arg("--append-system-prompt-file").arg(prompt);
     }
     cmd.args(&cfg.extra_args)
@@ -377,9 +441,9 @@ async fn write_line(stdin: &mut ChildStdin, v: &Value) -> std::io::Result<()> {
     stdin.flush().await
 }
 
-/// Process one line of CLI output. Returns `Some((ok, text))` when the
-/// hidden memory-update turn completes, so the caller can store it.
-fn handle_line<F: Fn(ClaudeEvent)>(line: &str, turn: &mut Turn, emit: &F) -> Option<(bool, String)> {
+/// Process one line of CLI output. Returns `Some` when a hidden turn ends,
+/// so the caller can carry on with the memory update.
+fn handle_line<F: Fn(ClaudeEvent)>(line: &str, turn: &mut Turn, emit: &F) -> Option<Internal> {
     let Ok(v) = serde_json::from_str::<Value>(line) else { return None };
     let s = |v: &Value| v.as_str().unwrap_or_default().to_string();
 
@@ -395,11 +459,13 @@ fn handle_line<F: Fn(ClaudeEvent)>(line: &str, turn: &mut Turn, emit: &F) -> Opt
             }
             let ev = &v["event"];
             match ev["type"].as_str() {
-                Some("content_block_start") if !turn.internal => {
+                Some("content_block_start") => {
                     let block = &ev["content_block"];
                     match block["type"].as_str() {
-                        Some("text") if turn.has_text => emit(ClaudeEvent::TextDelta("\n\n".into())),
-                        Some("tool_use") => emit(ClaudeEvent::ToolUse { name: s(&block["name"]) }),
+                        // Keep separate text blocks on separate lines.
+                        Some("text") if turn.internal && !turn.buf.is_empty() => turn.buf.push('\n'),
+                        Some("text") if !turn.internal && turn.has_text => emit(ClaudeEvent::TextDelta("\n\n".into())),
+                        Some("tool_use") if !turn.internal => emit(ClaudeEvent::ToolUse { name: s(&block["name"]) }),
                         _ => {}
                     }
                 }
@@ -421,13 +487,16 @@ fn handle_line<F: Fn(ClaudeEvent)>(line: &str, turn: &mut Turn, emit: &F) -> Opt
             }
             let success = v["subtype"] == "success" && !v["is_error"].as_bool().unwrap_or(false);
             if turn.internal {
-                let text = if success {
-                    std::mem::take(&mut turn.buf)
+                let done = if turn.draining {
+                    Internal::Drained
+                } else if success {
+                    Internal::Memory { ok: true, reply: std::mem::take(&mut turn.buf) }
                 } else {
-                    v["result"].as_str().map(str::to_string).unwrap_or_else(|| s(&v["subtype"]))
+                    let reply = v["result"].as_str().map(str::to_string).unwrap_or_else(|| s(&v["subtype"]));
+                    Internal::Memory { ok: false, reply }
                 };
                 *turn = Turn::default();
-                return Some((success, text));
+                return Some(done);
             }
             let ok = success || turn.interrupted;
             let error = (!ok).then(|| {
@@ -471,6 +540,37 @@ mod tests {
         assert_eq!(pretty_model("claude-sonnet-5-5"), "SONNET 5.5");
         assert_eq!(pretty_model("sonnet"), "SONNET");
         assert_eq!(pretty_model("claude-haiku-5-5-20261001"), "HAIKU 5.5");
+    }
+
+    #[test]
+    fn hidden_turns_stay_hidden() {
+        let shown = std::cell::RefCell::new(Vec::new());
+        let emit = |e: ClaudeEvent| shown.borrow_mut().push(format!("{e:?}"));
+        let delta = |t: &str| {
+            json!({"type": "stream_event", "parent_tool_use_id": null,
+                   "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": t}}})
+            .to_string()
+        };
+        let text_start = json!({"type": "stream_event", "parent_tool_use_id": null,
+            "event": {"type": "content_block_start", "content_block": {"type": "text"}}})
+        .to_string();
+        let result = json!({"type": "result", "subtype": "success", "is_error": false}).to_string();
+
+        // A reply cut short by a rotation: discarded, then reported as drained.
+        let mut turn = Turn { active: true, internal: true, draining: true, ..Default::default() };
+        assert!(handle_line(&delta("- not a memory"), &mut turn, &emit).is_none());
+        assert!(matches!(handle_line(&result, &mut turn, &emit), Some(Internal::Drained)));
+
+        // The memory update: text blocks are kept on separate lines.
+        let mut turn = Turn { active: true, internal: true, ..Default::default() };
+        for l in [text_start.clone(), delta("- a"), text_start, delta("- b")] {
+            assert!(handle_line(&l, &mut turn, &emit).is_none());
+        }
+        match handle_line(&result, &mut turn, &emit) {
+            Some(Internal::Memory { ok: true, reply }) => assert_eq!(reply, "- a\n- b"),
+            _ => panic!("expected the memory reply"),
+        }
+        assert!(shown.borrow().is_empty());
     }
 
     #[test]

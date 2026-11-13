@@ -42,7 +42,8 @@ From this session, add durable facts worth remembering: the user's preferences, 
 devices and setup, ongoing projects or plans, and anything they asked you to remember. Merge with the current \
 memory, removing duplicates and anything now outdated or contradicted. Leave out one-off questions and their \
 answers, small talk, and sensitive details (passwords, keys, financial or health information) unless the user \
-explicitly asked you to remember them.\n\n\
+explicitly asked you to remember them. Don't copy things already stated in your instructions (such as the \
+desktop setup); only what you learned from the user.\n\n\
 Reply with only the complete updated memory as a Markdown bullet list, one fact per bullet, at most {MAX_FACTS} \
 bullets. If there is nothing worth remembering at all, reply with exactly: {NONE}"
     )

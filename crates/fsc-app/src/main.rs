@@ -127,7 +127,7 @@ fn main() -> Result<()> {
             );
             *ui_cell.borrow_mut() = Some(ui.clone());
 
-            {
+            if cfg.claude.session_idle_minutes > 0 {
                 let ui = ui.clone();
                 glib::timeout_add_seconds_local(60, move || {
                     ui.tick_idle();
