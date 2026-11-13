@@ -6,6 +6,8 @@ model = "sonnet"              # alias or full id, e.g. "haiku", "opus", "claude-
 # home = "~/.local/share/fsc/home"   # persona.md + .claude/settings.json live here
 setting_sources = "project"   # keep your personal Claude Code settings/hooks out of the assistant
 extra_args = []
+session_idle_minutes = 20     # start a fresh session after this long idle (0 = never)
+memory = true                 # remember durable facts across sessions (fsc memory / fsc forget)
 
 [ui]
 position = "top"              # "top" or "center"

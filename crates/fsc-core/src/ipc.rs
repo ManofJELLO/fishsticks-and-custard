@@ -28,6 +28,10 @@ pub enum Command {
     /// Mute the wake word. `None` toggles.
     Mute { on: Option<bool> },
     Status,
+    /// Print what the assistant remembers between sessions.
+    Memory,
+    /// Delete long-term memory and start a fresh session.
+    Forget,
     Quit,
 }
 

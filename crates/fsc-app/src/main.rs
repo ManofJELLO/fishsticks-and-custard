@@ -127,6 +127,14 @@ fn main() -> Result<()> {
             );
             *ui_cell.borrow_mut() = Some(ui.clone());
 
+            {
+                let ui = ui.clone();
+                glib::timeout_add_seconds_local(60, move || {
+                    ui.tick_idle();
+                    glib::ControlFlow::Continue
+                });
+            }
+
             let rx = ev_rx.borrow_mut().take().expect("activate runs once");
             glib::spawn_future_local(async move {
                 while let Ok(ev) = rx.recv().await {

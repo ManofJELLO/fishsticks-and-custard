@@ -92,6 +92,12 @@ pub struct ClaudeConfig {
     pub setting_sources: String,
     /// Extra CLI arguments appended verbatim.
     pub extra_args: Vec<String>,
+    /// Start a fresh Claude session when this many minutes have passed since
+    /// the last exchange, so context doesn't grow forever. 0 = never.
+    pub session_idle_minutes: u32,
+    /// Before a session ends, save durable facts about the user to
+    /// `<home>/memory.md` and load them into new sessions.
+    pub memory: bool,
 }
 
 impl Default for ClaudeConfig {
@@ -102,6 +108,8 @@ impl Default for ClaudeConfig {
             home: None,
             setting_sources: "project".into(),
             extra_args: Vec::new(),
+            session_idle_minutes: 20,
+            memory: true,
         }
     }
 }

@@ -75,6 +75,13 @@ impl ksni::Tray for FscTray {
                 ..Default::default()
             }
             .into(),
+            StandardItem {
+                label: "Forget memories".into(),
+                icon_name: "edit-clear-history-symbolic".into(),
+                activate: Box::new(|t: &mut Self| t.send(Command::Forget)),
+                ..Default::default()
+            }
+            .into(),
             MenuItem::Separator,
             StandardItem {
                 label: "Quit".into(),

@@ -110,6 +110,8 @@ Then paste `packaging/hyprland/fsc.lua` into `~/.config/hypr/hyprland.lua`.
 | *"Fishsticks and custard[, question]"* | wake it by voice; a question in the same breath is sent straight away |
 | `fsc mute [on\|off]` / tray | mute the wake word |
 | `fsc status` | `ready`, `thinking`, `listening`, … |
+| `fsc memory` | show what it remembers between sessions |
+| `fsc forget` / tray **Forget memories** | delete that memory and start a fresh session |
 
 ## Customise
 
@@ -118,6 +120,21 @@ Then paste `packaging/hyprland/fsc.lua` into `~/.config/hypr/hyprland.lua`.
   anything not allowed is denied automatically. Run `fsc new` after editing either file.
 - **Look and model:** `~/.config/fsc/config.toml` (see `packaging/config.example.toml`).
 - Preview the tray icons: `fscd --dump-icons /some/dir`.
+
+## Sessions and memory
+
+One Claude session lasts while you're actively talking to it. After
+`claude.session_idle_minutes` (default 20) without an exchange, or on `fsc new` / Ctrl+N,
+or when `fscd` quits, the session ends and a new one starts, so context doesn't grow
+forever. Older exchanges stay visible in the popup above a **NEW SESSION** divider.
+
+Before a session ends, Claude is asked (hidden) to update a short list of durable facts
+about you: preferences, location, people, setup, ongoing plans, things you asked it to
+remember. It leaves out one-off questions and sensitive details. The list is saved to
+`~/.local/share/fsc/home/memory.md`, a plain file you can read or edit, and is loaded
+into every new session. `fsc memory` shows it, `fsc forget` deletes it, and
+`claude.memory = false` turns the feature off. Saving costs one small extra turn per
+session.
 
 ## Wake phrase
 

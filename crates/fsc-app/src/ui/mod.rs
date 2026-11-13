@@ -78,6 +78,11 @@ struct State {
     follow_up: bool,
     /// Consecutive follow-ups that heard nothing (stops runaway re-listening).
     empty_follow_ups: u32,
+    /// The Claude session has exchanges since it started (worth saving).
+    session_dirty: bool,
+    last_activity: Option<Instant>,
+    /// Quit requested; waiting for the memory save to finish.
+    quitting: bool,
     meta_timer: Option<glib::SourceId>,
 }
 
@@ -233,6 +238,9 @@ impl Ui {
                 speech_pending: false,
                 follow_up: false,
                 empty_follow_ups: 0,
+                session_dirty: false,
+                last_activity: None,
+                quitting: false,
                 meta_timer: None,
             }),
             scroll_pending: Cell::new(false),
@@ -384,7 +392,24 @@ impl Ui {
                 }
                 return Reply::state(s);
             }
-            Command::Quit => self.app.quit(),
+            Command::Memory => {
+                let path = fsc_core::memory::path(&self.cfg.claude_home());
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let facts: Vec<&str> = text.lines().filter(|l| l.starts_with("- ")).collect();
+                return Reply::state(if facts.is_empty() {
+                    "(nothing remembered yet)".to_string()
+                } else {
+                    format!("{}\n({})", facts.join("\n"), path.display())
+                });
+            }
+            Command::Forget => {
+                self.claude.forget();
+                self.add_divider("MEMORY CLEARED");
+                let mut st = self.st.borrow_mut();
+                st.session_dirty = false;
+                st.last_activity = None;
+            }
+            Command::Quit => self.quit(),
         }
         Reply::ok()
     }
@@ -452,6 +477,11 @@ impl Ui {
                     }
                 }
                 self.set_claude(if ok { Phase::Idle } else { Phase::Error });
+                {
+                    let mut st = self.st.borrow_mut();
+                    st.session_dirty = true;
+                    st.last_activity = Some(Instant::now());
+                }
                 self.scroll_to_end();
 
                 let spoken = self.st.borrow().voice_turn && self.should_speak();
@@ -472,6 +502,18 @@ impl Ui {
             ClaudeEvent::Exited { reason } => {
                 eprintln!("fsc: {reason}");
             }
+            ClaudeEvent::MemorySaved { ok, facts, error } => {
+                if ok {
+                    self.flash_meta(&format!("MEMORY UPDATED · {facts} FACTS"));
+                } else {
+                    eprintln!("fsc: memory not updated: {}", error.unwrap_or_default());
+                    self.flash_meta("MEMORY NOT UPDATED");
+                }
+                if self.st.borrow().quitting {
+                    self.app.quit();
+                }
+            }
+            ClaudeEvent::Forgotten => self.flash_meta("MEMORY CLEARED"),
         }
     }
 
@@ -562,6 +604,11 @@ impl Ui {
             return false;
         }
         self.audio.stop_speaking();
+        // Been a while? Start a fresh session (saving memory) before this
+        // prompt; the session actor holds the prompt until it's ready.
+        if self.session_idle() {
+            self.rotate_session();
+        }
 
         let ex = gtk::Box::new(gtk::Orientation::Vertical, 6);
         let prefix = if voice { "󰍬" } else { "›" };
@@ -595,6 +642,64 @@ impl Ui {
                 SpeakMode::Always => true,
                 SpeakMode::Never => false,
             }
+    }
+
+    fn session_idle(&self) -> bool {
+        let mins = self.cfg.claude.session_idle_minutes;
+        let st = self.st.borrow();
+        mins > 0
+            && st.session_dirty
+            && st.last_activity.is_some_and(|t| t.elapsed() >= Duration::from_secs(mins as u64 * 60))
+    }
+
+    /// End the Claude session (saving memory) and mark it in the history.
+    fn rotate_session(&self) {
+        eprintln!("fsc: session idle, rotating");
+        self.claude.rotate(true);
+        self.add_divider("NEW SESSION");
+        let mut st = self.st.borrow_mut();
+        st.session_dirty = false;
+        st.last_activity = None;
+    }
+
+    /// Called every minute: rotate an idle session in the background so the
+    /// next question doesn't wait for the memory save.
+    pub fn tick_idle(&self) {
+        let quiet = {
+            let st = self.st.borrow();
+            !st.claude.busy() && !st.conversation && st.listening.is_none() && !st.speaking && !st.transcribing
+        };
+        if quiet && self.session_idle() {
+            self.rotate_session();
+        }
+    }
+
+    fn add_divider(&self, text: &str) {
+        if self.history.first_child().is_none() {
+            return;
+        }
+        let time = glib::DateTime::now_local().ok().and_then(|t| t.format("%H:%M").ok()).unwrap_or_default();
+        self.history.append(&label(&format!("— {text} · {time} —"), "note"));
+        self.trim_history();
+    }
+
+    /// Quit, saving memory first if this session had any exchanges.
+    fn quit(self: &Rc<Self>) {
+        let save = {
+            let mut st = self.st.borrow_mut();
+            let save = self.cfg.claude.memory && st.session_dirty && !st.quitting;
+            st.quitting = true;
+            save
+        };
+        if !save {
+            self.app.quit();
+            return;
+        }
+        self.claude.rotate(true);
+        self.flash_meta_for("SAVING MEMORY…", Duration::from_secs(30));
+        // Don't hang forever if the save stalls.
+        let app = self.app.clone();
+        glib::timeout_add_local_once(Duration::from_secs(30), move || app.quit());
     }
 
     /// "Fishsticks and custard[, <command>]" was heard.
@@ -733,7 +838,12 @@ impl Ui {
     fn new_conversation(self: &Rc<Self>) {
         self.cancel_listen();
         self.audio.stop_speaking();
-        self.claude.restart();
+        self.claude.rotate(true);
+        {
+            let mut st = self.st.borrow_mut();
+            st.session_dirty = false;
+            st.last_activity = None;
+        }
         while let Some(child) = self.history.first_child() {
             self.history.remove(&child);
         }

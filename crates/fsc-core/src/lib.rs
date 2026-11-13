@@ -3,6 +3,7 @@
 pub mod claude;
 pub mod config;
 pub mod ipc;
+pub mod memory;
 pub mod models;
 pub mod phase;
 
