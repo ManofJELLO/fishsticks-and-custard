@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/fsc-core", "crates/fsc-audio", "crates/fsc-app", "crates/fsc-cli"]
 
 [workspace.package]
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 license = "MIT"
 

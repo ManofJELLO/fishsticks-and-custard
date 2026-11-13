@@ -1,6 +1,6 @@
 pkgbase = fishsticks-and-custard
 	pkgdesc = Voice-activated Claude desktop assistant for Hyprland (wake word, push-to-talk, tray)
-	pkgver = 0.4.3
+	pkgver = 0.4.4
 	pkgrel = 1
 	url = https://github.com/ManofJELLO/fishsticks-and-custard
 	install = fishsticks-and-custard.install
@@ -29,7 +29,7 @@ pkgbase = fishsticks-and-custard
 	optdepends = libnotify: desktop notifications when a reply finishes while the popup is hidden
 	options = !lto
 	options = !debug
-	source = fishsticks-and-custard::git+https://github.com/ManofJELLO/fishsticks-and-custard.git#tag=v0.4.3
+	source = fishsticks-and-custard::git+https://github.com/ManofJELLO/fishsticks-and-custard.git#tag=v0.4.4
 	sha256sums = SKIP
 
 pkgname = fishsticks-and-custard

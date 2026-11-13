@@ -162,8 +162,8 @@ headset quality. An always-on wake word (step 3) works better with a separate mi
 **Conversation mode** (`voice.conversation`, on by default): after a spoken reply it
 listens again automatically, like a phone call, keeping the mic and a warm output
 stream open (with inaudible dither so earbuds don't sleep and clip the next reply).
-Closing the popup (Esc) hangs up and releases the headset, and so does a minute with
-nobody speaking (`voice.hang_up_after_secs`). While a conversation is open, everything
+Closing the popup (Esc) hangs up and releases the headset. A minute with nobody
+speaking (`voice.hang_up_after_secs`) hangs up too, and the popup closes itself. While a conversation is open, everything
 it hears is sent to Claude; the red LISTENING status shows the line is live.
 
 **Talking over a reply:** say the wake phrase while Claude is thinking or speaking

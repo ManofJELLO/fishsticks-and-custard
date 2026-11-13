@@ -40,6 +40,8 @@ const STATUS_DOT: f64 = 1.15;
 const TAP: Duration = Duration::from_millis(350);
 /// Follow-ups in a row that hear nothing before a conversation hangs up.
 const MAX_EMPTY_FOLLOW_UPS: u32 = 3;
+/// How long "CONVERSATION ENDED" shows before the popup closes itself.
+const HANG_UP_CLOSE: Duration = Duration::from_secs(3);
 
 struct Exchange {
     reply: gtk::Label,
@@ -584,8 +586,7 @@ impl Ui {
                     };
                     if gave_up {
                         // Nobody's talking: hang up so the wake word works again.
-                        self.end_conversation();
-                        self.flash_meta("CONVERSATION ENDED");
+                        self.hang_up();
                     } else {
                         self.flash_meta("DIDN'T CATCH THAT");
                         self.maybe_follow_up();
@@ -602,9 +603,8 @@ impl Ui {
                     st.transcribing = false;
                     st.viz.set_spectrum(None);
                 }
-                self.end_conversation();
                 self.refresh();
-                self.flash_meta("CONVERSATION ENDED");
+                self.hang_up();
             }
             AudioEvent::SpeakingStarted => {
                 self.st.borrow_mut().speaking = true;
@@ -946,6 +946,29 @@ impl Ui {
         self.end_conversation();
         self.window.set_visible(false);
         self.st.borrow_mut().last_frame = None;
+    }
+
+    /// Nobody spoke: end the conversation and, like ending a call, put the
+    /// popup away shortly after, unless you've started something meanwhile.
+    fn hang_up(self: &Rc<Self>) {
+        self.end_conversation();
+        self.flash_meta_for("CONVERSATION ENDED", HANG_UP_CLOSE);
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(HANG_UP_CLOSE, move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let idle = {
+                let st = ui.st.borrow();
+                !st.conversation
+                    && st.listening.is_none()
+                    && !st.transcribing
+                    && !st.claude.busy()
+                    && !st.speaking
+                    && !st.speech_pending
+            };
+            if idle && ui.entry.text().is_empty() && ui.window.is_visible() {
+                ui.hide();
+            }
+        });
     }
 
     /// "Hang up": stop speaking and release the mic so the headset can go
