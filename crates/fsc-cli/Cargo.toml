@@ -1,0 +1,15 @@
+[package]
+name = "fsc-cli"
+description = "Control the Fishsticks & Custard assistant (for Hyprland binds and scripts)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fsc"
+path = "src/main.rs"
+
+[dependencies]
+fsc-core.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }

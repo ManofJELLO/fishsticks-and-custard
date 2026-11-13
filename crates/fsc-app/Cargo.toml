@@ -1,0 +1,23 @@
+[package]
+name = "fsc-app"
+description = "Fishsticks & Custard: tray icon, popup UI and assistant daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fscd"
+path = "src/main.rs"
+
+[dependencies]
+fsc-core.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+gtk4-layer-shell = "0.8"
+ksni = "0.3"
+ashpd = { version = "0.14", default-features = false, features = ["tokio", "settings"] }
+async-channel = "2"
+futures-util = "0.3"
+tiny-skia = "0.12"

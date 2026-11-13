@@ -1,0 +1,19 @@
+# ~/.config/fsc/config.toml. Every key is optional; these are the defaults.
+
+[claude]
+bin = "claude"
+model = "sonnet"              # alias or full id, e.g. "haiku", "opus", "claude-sonnet-5-5"
+# home = "~/.local/share/fsc/home"   # persona.md + .claude/settings.json live here
+setting_sources = "project"   # keep your personal Claude Code settings/hooks out of the assistant
+extra_args = []
+
+[ui]
+position = "top"              # "top" or "center"
+margin = 80                   # px from the top edge (added below Waybar)
+width = 680
+max_height = 360              # conversation area before it scrolls
+font = "0xProto Nerd Font"
+accent = "#D71921"
+theme = "auto"                # "auto" follows the desktop portal; or "dark" / "light"
+glow = "contrast"             # tray glow while recording: "contrast", "accent", "none"
+notify_when_hidden = true

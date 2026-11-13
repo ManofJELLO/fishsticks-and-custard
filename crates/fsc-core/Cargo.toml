@@ -1,0 +1,14 @@
+[package]
+name = "fsc-core"
+description = "Shared types for Fishsticks & Custard: IPC protocol, config, Claude session client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml = "1"
+directories = "6"

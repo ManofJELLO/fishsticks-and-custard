@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "WebSearch",
+      "WebFetch",
+      "Bash(date:*)",
+      "Bash(cal:*)",
+      "Bash(uptime:*)",
+      "Bash(free:*)",
+      "Bash(df:*)",
+      "Bash(sensors:*)",
+      "Bash(hyprctl clients:*)",
+      "Bash(hyprctl activewindow:*)",
+      "Bash(hyprctl activeworkspace:*)",
+      "Bash(hyprctl workspaces:*)",
+      "Bash(hyprctl monitors:*)",
+      "Bash(playerctl:*)",
+      "Bash(wpctl get-volume:*)",
+      "Bash(wpctl set-volume:*)",
+      "Bash(wpctl set-mute:*)",
+      "Bash(notify-send:*)",
+      "Bash(checkupdates:*)",
+      "Bash(pacman -Q:*)",
+      "Bash(systemctl --user status:*)",
+      "mcp__claude_ai_Google_Calendar__list_events",
+      "mcp__claude_ai_Google_Calendar__search_events",
+      "mcp__claude_ai_Google_Calendar__get_event"
+    ],
+    "deny": [
+      "Bash(sudo:*)",
+      "Bash(rm:*)",
+      "Bash(hyprctl dispatch exit:*)",
+      "Edit",
+      "Write",
+      "NotebookEdit"
+    ]
+  }
+}
