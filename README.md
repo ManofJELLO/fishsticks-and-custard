@@ -22,10 +22,38 @@ crates/fsc-audio  mic/speaker (cpal), Silero VAD + Piper (ONNX Runtime), whisper
 crates/fsc-app    `fscd`: GTK4 layer-shell popup, ksni tray, portal theme watcher, socket server
 crates/fsc-cli    `fsc`: control CLI for Hyprland binds and scripts
 voice-home/       defaults seeded into ~/.local/share/fsc/home (persona + tool allow-list)
-packaging/        Hyprland snippet, example config
+packaging/        Hyprland snippet, example config, Arch PKGBUILD + signing key
+.github/workflows CI: build, sign and publish the pacman repository
 ```
 
-## Install
+## Install (pacman repository)
+
+Signed packages are built by GitHub Actions for every release and published to this
+repo's [`repo` release](https://github.com/ManofJELLO/fishsticks-and-custard/releases/tag/repo).
+Updates then arrive with a normal `pacman -Syu`.
+
+1. Trust the packaging key:
+
+   ```sh
+   curl -sL https://raw.githubusercontent.com/ManofJELLO/fishsticks-and-custard/main/packaging/arch/fishsticks-and-custard.asc \
+     | sudo pacman-key --add -
+   sudo pacman-key --lsign-key 3286286EB33C3D8E9B47D6EF0A83688698B6FA30
+   ```
+
+2. Add the repository to `/etc/pacman.conf`:
+
+   ```ini
+   [fishsticks-and-custard]
+   Server = https://github.com/ManofJELLO/fishsticks-and-custard/releases/download/repo
+   ```
+
+3. Install: `sudo pacman -Sy fishsticks-and-custard`, then follow the printed setup steps
+   (Claude Code login, `fsc fetch-models`, Hyprland lines).
+
+You also need the [Claude Code](https://claude.com/claude-code) CLI, logged in with your
+Claude account. It isn't a pacman package, so it isn't a declared dependency.
+
+## Build from source
 
 Build dependencies (Arch):
 
@@ -42,6 +70,14 @@ all-core load, limit it: `CMAKE_BUILD_PARALLEL_LEVEL=4 cargo build -j 4`.
 cargo install --locked --root ~/.local --path crates/fsc-app
 cargo install --locked --root ~/.local --path crates/fsc-cli
 ```
+
+Or build the same package the repository ships: `cd packaging/arch && makepkg -si`.
+
+### Releasing
+
+Bump `version` in `Cargo.toml` and `pkgver` in `packaging/arch/PKGBUILD` (they must match),
+commit, then `git tag vX.Y.Z && git push --tags`. The `package` workflow builds, signs and
+publishes it.
 
 Download the speech models (~640 MB into `~/.local/share/fsc/models`), then check them:
 

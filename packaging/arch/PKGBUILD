@@ -1,0 +1,59 @@
+# Maintainer: ManofJELLO <4743336+ManofJELLO@users.noreply.github.com>
+#
+# Built and published by .github/workflows/package.yml into the pacman repo
+# hosted on this project's "repo" GitHub release. To build locally instead:
+#   cd packaging/arch && makepkg -si
+
+pkgname=fishsticks-and-custard
+pkgver=0.3.0
+pkgrel=1
+pkgdesc="Voice-activated Claude desktop assistant for Hyprland (wake word, push-to-talk, tray)"
+arch=(x86_64)
+url="https://github.com/ManofJELLO/fishsticks-and-custard"
+license=(MIT)
+depends=(
+  gcc-libs glibc glib2 cairo pango gtk4 gtk4-layer-shell
+  pipewire alsa-lib vulkan-icd-loader
+  espeak-ng pcaudiolib sonic
+)
+makedepends=(git cargo clang cmake vulkan-headers shaderc)
+optdepends=(
+  'hyprland: the compositor this is designed for (any wlroots-style layer-shell compositor works)'
+  'libnotify: desktop notifications when a reply finishes while the popup is hidden'
+)
+install=fishsticks-and-custard.install
+# whisper.cpp and onnxruntime are linked statically; makepkg's LTO flags break them.
+options=(!lto !debug)
+source=("$pkgname::git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # The whisper.cpp + Vulkan shader build is heavy; keep it gentle by default.
+  export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-4}"
+  # --locked, not --frozen: the ort crate downloads its ONNX Runtime build here.
+  cargo build --locked --release -p fsc-app -p fsc-cli
+}
+
+check() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --locked --release -p fsc-core
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 target/release/fscd target/release/fsc -t "$pkgdir/usr/bin/"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 packaging/config.example.toml "$pkgdir/usr/share/$pkgname/config.example.toml"
+  install -Dm644 packaging/hyprland/fsc.lua "$pkgdir/usr/share/$pkgname/hyprland/fsc.lua"
+}

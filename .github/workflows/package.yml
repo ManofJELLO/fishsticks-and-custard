@@ -1,0 +1,100 @@
+# Build the Arch package for a version tag, sign it, and publish it to a
+# pacman repository hosted on the "repo" GitHub release:
+#
+#   [fishsticks-and-custard]
+#   Server = https://github.com/ManofJELLO/fishsticks-and-custard/releases/download/repo
+#
+# Release flow: bump `version` in Cargo.toml and `pkgver` in packaging/arch/PKGBUILD,
+# commit, then `git tag vX.Y.Z && git push --tags`.
+
+name: package
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.3.0"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pacman-repo
+  cancel-in-progress: false
+
+env:
+  REPO_NAME: fishsticks-and-custard
+  RELEASE_TAG: repo
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install build tools
+        run: |
+          pacman -Syu --noconfirm --needed git github-cli rust clang cmake vulkan-headers shaderc \
+            gtk4 gtk4-layer-shell pipewire alsa-lib vulkan-icd-loader espeak-ng pcaudiolib sonic
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Check tag matches versions
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          pkgver=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
+          cargo_ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "tag=$tag pkgver=$pkgver cargo=$cargo_ver"
+          [ "$tag" = "v$pkgver" ] && [ "$pkgver" = "$cargo_ver" ] || { echo "::error::tag, PKGBUILD pkgver and Cargo version must match"; exit 1; }
+
+      - name: Import signing key
+        shell: bash
+        env:
+          KEY: ${{ secrets.PACKAGER_GPG_KEY }}
+        run: |
+          useradd -m builder
+          chown -R builder .
+          echo "$KEY" | sudo -u builder gpg --batch --import
+          echo "FPR=$(cat packaging/arch/signing-key.fpr)" >> "$GITHUB_ENV"
+
+      - name: Build and sign package
+        shell: bash
+        run: |
+          cd packaging/arch
+          sudo -u builder env CMAKE_BUILD_PARALLEL_LEVEL=4 makepkg --noconfirm --sign --key "$FPR"
+          ls -l *.pkg.tar.zst*
+
+      - name: Build repository database
+        shell: bash
+        run: |
+          mkdir -p out
+          cp packaging/arch/*.pkg.tar.zst packaging/arch/*.pkg.tar.zst.sig out/
+          chown -R builder out
+          cd out
+          # One package, latest version only: a fresh database each release.
+          sudo -u builder repo-add --sign --key "$FPR" "$REPO_NAME.db.tar.gz" ./*.pkg.tar.zst
+          # Release assets can't be symlinks: replace repo-add's links with copies.
+          for f in "$REPO_NAME.db" "$REPO_NAME.files" "$REPO_NAME.db.sig" "$REPO_NAME.files.sig"; do
+            [ -L "$f" ] && cp --remove-destination "$(readlink "$f")" "$f"
+          done
+          ls -l
+
+      - name: Publish to the "repo" release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --title "pacman repository" --latest=false \
+              --notes "Signed pacman repository. See the README's install section. Assets here are replaced on every release."
+          # Drop packages from previous versions, then upload the new set.
+          for a in $(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name'); do
+            case "$a" in *.pkg.tar.zst|*.pkg.tar.zst.sig) gh release delete-asset "$RELEASE_TAG" "$a" --yes ;; esac
+          done
+          gh release upload "$RELEASE_TAG" out/* --clobber

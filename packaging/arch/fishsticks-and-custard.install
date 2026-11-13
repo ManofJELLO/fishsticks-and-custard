@@ -1,0 +1,19 @@
+post_install() {
+  cat <<'MSG'
+==> Fishsticks & Custard installed. To finish setting up (as your user):
+    1. Install and log in to the Claude Code CLI (`claude`) if you haven't.
+    2. Download the speech models (~640 MB):     fsc fetch-models
+       and check them:                            fscd --self-test
+    3. Let the assistant use its tools: run `claude` once in
+       ~/.local/share/fsc/home (created on first fscd start) and accept the trust prompt.
+    4. Add the Hyprland lines from /usr/share/fishsticks-and-custard/hyprland/fsc.lua
+       to your config, including `hl.exec_cmd("fscd")` in your startup block.
+    5. Optional settings: /usr/share/fishsticks-and-custard/config.example.toml
+       -> ~/.config/fsc/config.toml
+MSG
+}
+
+post_upgrade() {
+  echo "==> Fishsticks & Custard updated. Restart it to use the new version: fsc quit; fscd &"
+  echo "    New models may be needed after some updates: fsc fetch-models"
+}
