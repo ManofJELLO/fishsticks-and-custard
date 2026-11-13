@@ -595,6 +595,17 @@ impl Ui {
                     self.ask_or_queue(text, true);
                 }
             }
+            AudioEvent::NobodySpoke => {
+                {
+                    let mut st = self.st.borrow_mut();
+                    st.listening = None;
+                    st.transcribing = false;
+                    st.viz.set_spectrum(None);
+                }
+                self.end_conversation();
+                self.refresh();
+                self.flash_meta("CONVERSATION ENDED");
+            }
             AudioEvent::SpeakingStarted => {
                 self.st.borrow_mut().speaking = true;
                 self.refresh();
@@ -772,6 +783,9 @@ impl Ui {
             self.interrupt();
             self.flash_meta("STOPPING · THEN ASKING");
         } else {
+            // The reply may still be being spoken: stop it, and forget any
+            // speech still owed to it.
+            self.interrupt();
             self.ask(&text, voice);
         }
     }

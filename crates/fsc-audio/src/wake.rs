@@ -12,6 +12,16 @@ const MAX_LEADING_WORDS: usize = 2;
 /// If `text` starts with the wake phrase, returns whatever follows it
 /// (possibly empty). `None` if it doesn't.
 pub fn match_wake(text: &str, phrase: &str) -> Option<String> {
+    match_after(text, phrase, MAX_LEADING_WORDS)
+}
+
+/// Whether the phrase appears anywhere in `text`. Used to recognise our
+/// own voice saying it, picked up by the mic.
+pub fn mentions(text: &str, phrase: &str) -> bool {
+    match_after(text, phrase, usize::MAX).is_some()
+}
+
+fn match_after(text: &str, phrase: &str, max_leading: usize) -> Option<String> {
     let target: String = normalize(phrase).split_whitespace().collect();
     if target.is_empty() {
         return None;
@@ -26,7 +36,7 @@ pub fn match_wake(text: &str, phrase: &str) -> Option<String> {
         .flat_map(|(i, w)| normalize(w).split_whitespace().map(move |n| (n.to_string(), i)).collect::<Vec<_>>())
         .collect();
 
-    for start in 0..=MAX_LEADING_WORDS.min(words.len()) {
+    for start in 0..=max_leading.min(words.len()) {
         let mut best: Option<(usize, usize)> = None; // (edits, end)
         let mut joined = String::new();
         for (end, (w, _)) in words.iter().enumerate().skip(start).take(6) {
@@ -82,7 +92,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::match_wake;
+    use super::{match_wake, mentions};
 
     const P: &str = "fishsticks and custard";
 
@@ -116,5 +126,12 @@ mod tests {
         assert_eq!(match_wake("", P), None);
         // Mentioned mid-sentence: not a wake-up.
         assert_eq!(match_wake("My kids were laughing about the Doctor eating fish sticks and custard.", P), None);
+    }
+
+    #[test]
+    fn mentioned_anywhere() {
+        assert!(mentions("Sure. As Fishsticks and Custard, I can help with that.", P));
+        assert!(mentions("Fish sticks & custard here.", P));
+        assert!(!mentions("It's sunny and twelve degrees.", P));
     }
 }

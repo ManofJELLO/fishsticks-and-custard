@@ -50,6 +50,9 @@ pub struct VoiceConfig {
     /// After a spoken reply, listen again automatically and keep the mic
     /// open (headset in two-way mode) until the popup is closed.
     pub conversation: bool,
+    /// In a conversation, hang up after this long with nobody speaking
+    /// (0 = wait until the popup is closed).
+    pub hang_up_after_secs: u32,
     /// Listen for the wake phrase whenever the mic isn't otherwise in use.
     pub wake_word: bool,
     pub wake_phrase: String,
@@ -70,6 +73,7 @@ impl Default for VoiceConfig {
             max_utterance_secs: 30,
             hold_mic_while_speaking: true,
             conversation: true,
+            hang_up_after_secs: 60,
             wake_word: true,
             wake_phrase: "fishsticks and custard".into(),
         }

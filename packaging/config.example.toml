@@ -33,5 +33,6 @@ no_speech_timeout_ms = 6000
 max_utterance_secs = 30
 hold_mic_while_speaking = true           # needed for Bluetooth headsets
 conversation = true                      # keep listening after spoken replies until the popup closes
-wake_word = true                         # watch for the wake phrase when the mic is idle
+hang_up_after_secs = 60                  # end a conversation after this much silence (0 = never)
+wake_word = true                         # watch for the wake phrase (also talks over a reply)
 wake_phrase = "fishsticks and custard"

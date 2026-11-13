@@ -12,7 +12,8 @@
 //!
 //! There is one microphone, handed between three owners: `Watching` (idle,
 //! waiting for the wake phrase), `Listening` (capturing a prompt) and `Held`
-//! (open but ignored while a reply is pending or a conversation is open).
+//! (open while a reply is pending or a conversation is open; it only
+//! listens for the wake phrase, so you can talk over a reply).
 //! `take_mic` and `park_mic` move it between them.
 
 mod io;
@@ -54,6 +55,9 @@ pub enum AudioEvent {
     Transcribing,
     /// Final text. Empty if nothing intelligible was heard.
     Transcript(String),
+    /// A conversation follow-up waited `hang_up_after_secs` and nobody
+    /// spoke. The mic is held until the UI ends the conversation.
+    NobodySpoke,
     SpeakingStarted,
     SpeakingDone,
     /// The wake phrase was heard. `command` is anything said right after it
@@ -156,21 +160,39 @@ struct Listening {
     started: Instant,
 }
 
-/// The mic kept open (and ignored) after an utterance until the spoken
-/// reply has finished. On Bluetooth headsets, closing the mic flips the
-/// headset back to its playback-only profile, which removes the audio
-/// device the reply is about to play on. Holding the mic also makes a
-/// follow-up question start instantly.
+/// The mic kept open after an utterance until the spoken reply has
+/// finished. On Bluetooth headsets, closing the mic flips the headset back
+/// to its playback-only profile, which removes the audio device the reply
+/// is about to play on. Holding the mic also makes a follow-up question
+/// start instantly. Meanwhile it listens for the wake phrase (barge-in).
 struct Held {
     mic: Mic,
     since: Instant,
-    spoke: bool,
+    det: WakeDetector,
 }
 
-/// Idle mic, listening for the wake phrase. Speech is cut into segments by
-/// the VAD; each segment is transcribed and checked for the phrase.
+impl Held {
+    fn new(mic: Mic) -> Self {
+        Self { mic, since: Instant::now(), det: WakeDetector::default() }
+    }
+}
+
+/// Idle mic, listening for the wake phrase.
 struct Watching {
     mic: Mic,
+    det: WakeDetector,
+}
+
+impl Watching {
+    fn new(mic: Mic) -> Self {
+        Self { mic, det: WakeDetector::default() }
+    }
+}
+
+/// Cuts mic audio into speech segments with the VAD; each segment is
+/// transcribed and checked for the wake phrase.
+#[derive(Default)]
+struct WakeDetector {
     /// Recent audio before speech starts, so the first syllable isn't lost.
     preroll: VecDeque<f32>,
     pending: Vec<f32>,
@@ -183,17 +205,85 @@ struct Watching {
     checked_early: bool,
 }
 
-impl Watching {
-    fn new(mic: Mic) -> Self {
-        Self {
-            mic,
-            preroll: VecDeque::new(),
-            pending: Vec::new(),
-            seg: None,
-            run: 0,
-            silence: 0,
-            rejected: false,
-            checked_early: false,
+enum Segment {
+    /// The first `EARLY_CHECK` of a segment still in progress.
+    Early(Vec<f32>),
+    /// A finished segment.
+    Done(Vec<f32>),
+}
+
+impl WakeDetector {
+    fn feed(&mut self, fresh: &[f32], vad: &mut Vad, end_silence: usize, max_len: usize) -> Option<Segment> {
+        self.pending.extend_from_slice(fresh);
+        while self.pending.len() >= CHUNK {
+            let chunk: Vec<f32> = self.pending.drain(..CHUNK).collect();
+            let p = vad.prob(&chunk).unwrap_or(0.0);
+            match self.seg.as_mut() {
+                None => {
+                    self.preroll.extend(&chunk);
+                    let excess = self.preroll.len().saturating_sub(PREROLL);
+                    self.preroll.drain(..excess);
+                    if p >= VAD_ON {
+                        self.run += 1;
+                    } else if p < VAD_OFF {
+                        self.run = 0;
+                    }
+                    if self.run >= 3 {
+                        self.seg = Some(self.preroll.drain(..).collect());
+                        self.silence = 0;
+                        self.rejected = false;
+                        self.checked_early = false;
+                    }
+                }
+                Some(seg) => {
+                    if !self.rejected {
+                        seg.extend_from_slice(&chunk);
+                    }
+                    if p >= VAD_ON {
+                        self.silence = 0;
+                    } else if p < VAD_OFF {
+                        self.silence += CHUNK;
+                    }
+                    if self.silence >= end_silence || seg.len() >= max_len {
+                        let seg = self.seg.take().unwrap_or_default();
+                        self.run = 0;
+                        if !self.rejected {
+                            return Some(Segment::Done(seg));
+                        }
+                    } else if !self.rejected && !self.checked_early && seg.len() >= EARLY_CHECK {
+                        self.checked_early = true;
+                        return Some(Segment::Early(seg.clone()));
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Feed fresh mic audio to `det`. Returns (what was heard, what followed the
+/// phrase) once a finished segment starts with the wake phrase.
+fn detect_wake(
+    det: &mut WakeDetector,
+    fresh: &[f32],
+    vad: &mut Vad,
+    stt: &Stt,
+    cfg: &VoiceConfig,
+) -> Option<(String, String)> {
+    let end_silence = cfg.end_silence_ms as usize * MIC_RATE as usize / 1000;
+    let max_len = cfg.max_utterance_secs as usize * MIC_RATE as usize;
+    match det.feed(fresh, vad, end_silence, max_len)? {
+        Segment::Early(audio) => {
+            let heard = stt.transcribe(&audio).unwrap_or_default();
+            if wake::match_wake(&heard, &cfg.wake_phrase).is_none() {
+                det.rejected = true;
+            }
+            None
+        }
+        Segment::Done(audio) => {
+            let heard = stt.transcribe(&audio).unwrap_or_default();
+            let rest = wake::match_wake(&heard, &cfg.wake_phrase)?;
+            Some((heard, rest))
         }
     }
 }
@@ -213,6 +303,9 @@ const SPEECH_TAIL: Duration = Duration::from_millis(400);
 /// and its speech are finished. This is only the safety net if that never
 /// comes: no activity (speech) for this long.
 const HOLD_MAX_WAIT: Duration = Duration::from_secs(120);
+/// A wake phrase heard this soon after we said it ourselves is probably our
+/// own voice coming back through the mic (speakers, not headphones).
+const OWN_VOICE_WINDOW: Duration = Duration::from_secs(30);
 
 struct Speaking {
     player: Player,
@@ -234,6 +327,8 @@ struct Engine<F> {
     watch_failed_at: Option<Instant>,
     conversation: bool,
     speaking: Option<Speaking>,
+    /// When a spoken sentence last contained the wake phrase.
+    said_phrase_at: Option<Instant>,
     analyzer: Analyzer,
     last_spectrum: Instant,
 }
@@ -260,6 +355,7 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             watch_failed_at: None,
             conversation: false,
             speaking: None,
+            said_phrase_at: None,
             analyzer: Analyzer::default(),
             last_spectrum: Instant::now(),
         }
@@ -311,6 +407,7 @@ impl<F: Fn(AudioEvent)> Engine<F> {
         loop {
             let busy = self.listening.is_some()
                 || self.watching.is_some()
+                || self.held.is_some()
                 || self.speaking.as_ref().is_some_and(|s| s.active);
             let wait = if busy { Duration::from_millis(15) } else { Duration::from_millis(250) };
             match rx.recv_timeout(wait) {
@@ -472,9 +569,15 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                 silence > self.cfg.end_silence_ms as usize * rate / 1000
                     || l.pcm.len() - start > self.cfg.max_utterance_secs as usize * rate
             }
+            // A follow-up waits for the other side of the "call" to speak,
+            // but not forever.
             None => {
-                !l.follow_up
-                    && l.live.is_some_and(|t| t.elapsed() > Duration::from_millis(self.cfg.no_speech_timeout_ms as u64))
+                let limit = if l.follow_up {
+                    (self.cfg.hang_up_after_secs > 0).then(|| Duration::from_secs(self.cfg.hang_up_after_secs as u64))
+                } else {
+                    Some(Duration::from_millis(self.cfg.no_speech_timeout_ms as u64))
+                };
+                limit.is_some_and(|d| l.live.is_some_and(|t| t.elapsed() > d))
             }
         };
         if l.speech_start.is_none() && l.pcm.len() > 2 * PREROLL {
@@ -485,7 +588,17 @@ impl<F: Fn(AudioEvent)> Engine<F> {
         }
 
         if done && let Some(l) = self.listening.take() {
-            self.finish(l);
+            if l.follow_up && l.speech_start.is_none() {
+                eprintln!("fsc: nobody spoke for {}s, hanging up", self.cfg.hang_up_after_secs);
+                if self.conversation {
+                    self.held = Some(Held::new(l.mic));
+                } else {
+                    self.park_mic(l.mic);
+                }
+                (self.emit)(AudioEvent::NobodySpoke);
+            } else {
+                self.finish(l);
+            }
         }
     }
 
@@ -493,7 +606,7 @@ impl<F: Fn(AudioEvent)> Engine<F> {
         let Listening { mic, mut pcm, speech_start, last_speech, .. } = l;
         pcm.extend(mic.drain());
         if self.conversation || (self.cfg.hold_mic_while_speaking && speech_start.is_some()) {
-            self.held = Some(Held { mic, since: Instant::now(), spoke: false });
+            self.held = Some(Held::new(mic));
             if speech_start.is_some() {
                 // Open the output now, while the headset is already in its
                 // two-way profile, so the reply doesn't wait for it.
@@ -576,93 +689,27 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             }
         }
         let Some(w) = self.watching.as_mut() else { return };
-        if self.speaking.as_ref().is_some_and(|s| s.active || !s.queue.is_empty()) {
-            // Our own voice would be transcribed (and could wake us) and would
-            // block speech synthesis on this thread. Ignore the mic meanwhile.
-            w.mic.drain();
-            w.pending.clear();
-            w.seg = None;
-            w.run = 0;
-            return;
-        }
-        let Some(vad) = self.vad.as_mut() else { return };
         let fresh = w.mic.drain();
-        w.pending.extend_from_slice(&fresh);
-
-        let end_silence = self.cfg.end_silence_ms as usize * MIC_RATE as usize / 1000;
-        let max_len = self.cfg.max_utterance_secs as usize * MIC_RATE as usize;
-        let mut ready: Option<Vec<f32>> = None;
-        let mut early: Option<Vec<f32>> = None;
-
-        while w.pending.len() >= CHUNK {
-            let chunk: Vec<f32> = w.pending.drain(..CHUNK).collect();
-            let p = vad.prob(&chunk).unwrap_or(0.0);
-            match w.seg.as_mut() {
-                None => {
-                    w.preroll.extend(&chunk);
-                    let excess = w.preroll.len().saturating_sub(PREROLL);
-                    w.preroll.drain(..excess);
-                    if p >= VAD_ON {
-                        w.run += 1;
-                    } else if p < VAD_OFF {
-                        w.run = 0;
-                    }
-                    if w.run >= 3 {
-                        w.seg = Some(w.preroll.drain(..).collect());
-                        w.silence = 0;
-                        w.rejected = false;
-                        w.checked_early = false;
-                    }
-                }
-                Some(seg) => {
-                    if !w.rejected {
-                        seg.extend_from_slice(&chunk);
-                    }
-                    if p >= VAD_ON {
-                        w.silence = 0;
-                    } else if p < VAD_OFF {
-                        w.silence += CHUNK;
-                    }
-                    if !w.rejected && !w.checked_early && seg.len() >= EARLY_CHECK {
-                        w.checked_early = true;
-                        early = Some(seg.clone());
-                    }
-                    if w.silence >= end_silence || seg.len() >= max_len {
-                        let seg = w.seg.take().unwrap_or_default();
-                        w.run = 0;
-                        if !w.rejected {
-                            ready = Some(seg);
-                        }
-                        break;
-                    }
-                }
+        let (Some(vad), Some(stt)) = (self.vad.as_mut(), self.stt.as_ref()) else { return };
+        let Some(hit) = detect_wake(&mut w.det, &fresh, vad, stt, &self.cfg) else { return };
+        if self.wake_heard(hit) {
+            // Keep the mic for what comes next, like after any utterance.
+            if let Some(w) = self.watching.take() {
+                self.held = Some(Held::new(w.mic));
             }
-            if early.is_some() {
-                break;
-            }
+            self.open_player();
         }
+    }
 
-        if let Some(audio) = early {
-            let heard = self.stt.as_ref().and_then(|s| s.transcribe(&audio).ok()).unwrap_or_default();
-            if wake::match_wake(&heard, &self.cfg.wake_phrase).is_none()
-                && let Some(w) = self.watching.as_mut()
-            {
-                w.rejected = true;
-            }
+    /// The wake phrase was heard: tell the UI, unless it was our own voice.
+    fn wake_heard(&mut self, (heard, rest): (String, String)) -> bool {
+        if self.said_phrase_at.is_some_and(|t| t.elapsed() < OWN_VOICE_WINDOW) {
+            eprintln!("fsc: ignored wake phrase (probably our own voice): {heard:?}");
+            return false;
         }
-        if let Some(audio) = ready {
-            let t0 = Instant::now();
-            let heard = self.stt.as_ref().and_then(|s| s.transcribe(&audio).ok()).unwrap_or_default();
-            if let Some(rest) = wake::match_wake(&heard, &self.cfg.wake_phrase) {
-                eprintln!("fsc: wake phrase heard in {:.2}s: {heard:?}", t0.elapsed().as_secs_f32());
-                // Keep the mic for what comes next, like after any utterance.
-                if let Some(w) = self.watching.take() {
-                    self.held = Some(Held { mic: w.mic, since: Instant::now(), spoke: false });
-                }
-                self.open_player();
-                (self.emit)(AudioEvent::Wake { command: (!rest.is_empty()).then_some(rest) });
-            }
-        }
+        eprintln!("fsc: wake phrase heard: {heard:?}");
+        (self.emit)(AudioEvent::Wake { command: (!rest.is_empty()).then_some(rest) });
+        true
     }
 
     /// Start the idle countdown on an open-but-silent player.
@@ -677,8 +724,23 @@ impl<F: Fn(AudioEvent)> Engine<F> {
     }
 
     fn step_hold(&mut self) {
+        let wake = self.wake_active();
         let Some(h) = self.held.as_mut() else { return };
-        h.mic.drain();
+        let fresh = h.mic.drain();
+        // Talking over a reply: the UI stops it and takes the mic.
+        let hit = match (wake, self.vad.as_mut(), self.stt.as_ref()) {
+            (true, Some(vad), Some(stt)) => detect_wake(&mut h.det, &fresh, vad, stt, &self.cfg),
+            _ => None,
+        };
+        if let Some(hit) = hit
+            && self.wake_heard(hit)
+        {
+            if let Some(h) = self.held.as_mut() {
+                h.since = Instant::now();
+            }
+            return;
+        }
+        let Some(h) = self.held.as_mut() else { return };
         if self.conversation {
             return; // the line stays open until the conversation ends
         }
@@ -733,6 +795,9 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             && let Some(text) = s.queue.pop_front()
             && let Some(tts) = self.tts.as_mut()
         {
+            if wake::mentions(&text, &self.cfg.wake_phrase) {
+                self.said_phrase_at = Some(Instant::now());
+            }
             match tts.synth(&text) {
                 Ok(pcm) => {
                     s.player.enqueue(&pcm);
@@ -779,7 +844,6 @@ impl<F: Fn(AudioEvent)> Engine<F> {
         // the reply that needs it hasn't started yet.
         let was_speaking = self.speaking.as_ref().is_some_and(|s| s.active || !s.queue.is_empty());
         if was_speaking && let Some(h) = self.held.as_mut() {
-            h.spoke = true;
             h.since = Instant::now();
         }
         if let Some(s) = self.speaking.as_mut() {
