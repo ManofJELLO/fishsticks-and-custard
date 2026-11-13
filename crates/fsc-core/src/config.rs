@@ -9,6 +9,66 @@ use std::path::PathBuf;
 pub struct Config {
     pub claude: ClaudeConfig,
     pub ui: UiConfig,
+    pub voice: VoiceConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SpeakMode {
+    /// Speak replies to spoken prompts; typed prompts stay silent.
+    #[default]
+    Voice,
+    Always,
+    Never,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct VoiceConfig {
+    /// whisper.cpp model name: the file is `ggml-<name>.bin`.
+    pub whisper_model: String,
+    /// Spoken language for recognition ("en", "auto", ...).
+    pub language: String,
+    /// Run whisper on the GPU (Vulkan).
+    pub gpu: bool,
+    /// Piper voice, e.g. "en_GB-alan-medium".
+    pub piper_voice: String,
+    /// >1 speaks faster, <1 slower.
+    pub speech_rate: f32,
+    pub speak: SpeakMode,
+    /// Substring of the input device name. Empty = system default.
+    pub input_device: String,
+    /// Silence after speech that ends an utterance.
+    pub end_silence_ms: u32,
+    /// Give up if no speech starts within this long.
+    pub no_speech_timeout_ms: u32,
+    /// Hard cap on one utterance.
+    pub max_utterance_secs: u32,
+    /// Keep the mic open until the spoken reply finishes. Needed for
+    /// Bluetooth headsets, whose output device changes when the mic closes.
+    pub hold_mic_while_speaking: bool,
+    /// After a spoken reply, listen again automatically and keep the mic
+    /// open (headset in two-way mode) until the popup is closed.
+    pub conversation: bool,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            whisper_model: "large-v3-turbo-q5_0".into(),
+            language: "en".into(),
+            gpu: true,
+            piper_voice: "en_GB-alan-medium".into(),
+            speech_rate: 1.0,
+            speak: SpeakMode::Voice,
+            input_device: String::new(),
+            end_silence_ms: 800,
+            no_speech_timeout_ms: 6000,
+            max_utterance_secs: 30,
+            hold_mic_while_speaking: true,
+            conversation: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

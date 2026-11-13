@@ -17,3 +17,17 @@ accent = "#D71921"
 theme = "auto"                # "auto" follows the desktop portal; or "dark" / "light"
 glow = "contrast"             # tray glow while recording: "contrast", "accent", "none"
 notify_when_hidden = true
+
+[voice]
+whisper_model = "large-v3-turbo-q5_0"   # file ggml-<name>.bin; e.g. "small.en-q5_1" is smaller
+language = "en"                          # or "auto"
+gpu = true                               # whisper on Vulkan
+piper_voice = "en_GB-alan-medium"        # any voice from huggingface.co/rhasspy/piper-voices
+speech_rate = 1.0
+speak = "voice"                          # speak replies to spoken prompts: "voice", "always", "never"
+input_device = ""                        # substring of the mic name; empty = system default
+end_silence_ms = 800                     # pause that ends an utterance
+no_speech_timeout_ms = 6000
+max_utterance_secs = 30
+hold_mic_while_speaking = true           # needed for Bluetooth headsets
+conversation = true                      # keep listening after spoken replies until the popup closes

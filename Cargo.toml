@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/fsc-core", "crates/fsc-app", "crates/fsc-cli"]
+members = ["crates/fsc-core", "crates/fsc-audio", "crates/fsc-app", "crates/fsc-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,6 +9,7 @@ license = "MIT"
 
 [workspace.dependencies]
 fsc-core = { path = "crates/fsc-core" }
+fsc-audio = { path = "crates/fsc-audio" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,8 +1,14 @@
-//! The popup: a layer-shell surface with a fluted-glass panel, dot-matrix
+//! The popup: a layer-shell surface with a translucent panel, dot-matrix
 //! status and visualiser, the conversation, and a text field.
+//!
+//! What the popup shows comes from three independent activities, combined by
+//! `State::phase()`: voice capture (listening, then transcribing), the
+//! Claude turn (thinking, working, responding), and speech playback
+//! (speaking).
 
 mod dotfont;
-mod glass;
+mod panel;
+mod speech_text;
 mod viz;
 
 use gtk::prelude::*;
@@ -10,48 +16,93 @@ use gtk::{gdk, glib, pango};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+use fsc_audio::{AudioEvent, AudioHandle};
 use fsc_core::Phase;
 use fsc_core::claude::{ClaudeEvent, ClaudeHandle, pretty_model, pretty_tool};
-use fsc_core::config::{Config, Position};
+use fsc_core::config::{Config, Position, SpeakMode};
 use fsc_core::ipc::{Command, Reply};
 
 use crate::AppEvent;
 use crate::icon::IconState;
 use crate::style::{Palette, ThemeMode};
+use speech_text::SentenceBuffer;
 use viz::Viz;
 
 const MAX_EXCHANGES: usize = 20;
 const PAD_X: i32 = 24;
 const STATUS_PITCH: f64 = 3.0;
 const STATUS_DOT: f64 = 1.15;
+/// A push-to-talk release sooner than this after the press counts as a
+/// tap: keep listening and let the VAD decide when you've finished.
+const TAP: Duration = Duration::from_millis(350);
 
 struct Exchange {
     reply: gtk::Label,
     text: String,
 }
 
+#[derive(Default, Clone, Copy)]
+struct Voice {
+    stt: bool,
+    tts: bool,
+    loaded: bool,
+}
+
 struct State {
-    phase: Phase,
+    /// The Claude side: Idle / Thinking / Working / Responding / Error.
+    claude: Phase,
+    listening: Option<Instant>,
+    transcribing: bool,
+    speaking: bool,
+
     palette: Palette,
     muted: bool,
     model: String,
+    voice: Voice,
     viz: Viz,
     last_frame: Option<i64>,
     current: Option<Exchange>,
-    listen_timer: Option<glib::SourceId>,
+    /// The current prompt was spoken, so the reply should be too.
+    voice_turn: bool,
+    sentences: SentenceBuffer,
+    /// A two-way voice conversation is open: the mic stays live (headset in
+    /// its two-way profile) and we listen again after each reply, until the
+    /// popup is closed.
+    conversation: bool,
+    /// Speech handed to the engine that hasn't finished playing yet.
+    speech_pending: bool,
+    /// The current listen was started automatically after a reply.
+    follow_up: bool,
+    /// Consecutive follow-ups that heard nothing (stops runaway re-listening).
+    empty_follow_ups: u32,
     meta_timer: Option<glib::SourceId>,
+}
+
+impl State {
+    fn phase(&self) -> Phase {
+        if self.listening.is_some() {
+            Phase::Listening
+        } else if self.transcribing {
+            Phase::Transcribing
+        } else if self.speaking {
+            Phase::Speaking
+        } else {
+            self.claude
+        }
+    }
 }
 
 pub struct Ui {
     cfg: Config,
     claude: ClaudeHandle,
+    audio: AudioHandle,
     tray_tx: mpsc::UnboundedSender<IconState>,
     app: gtk::Application,
     window: gtk::ApplicationWindow,
-    glass: gtk::DrawingArea,
+    panel: gtk::DrawingArea,
     status: gtk::DrawingArea,
     viz_area: gtk::DrawingArea,
     meta: gtk::Label,
@@ -69,6 +120,7 @@ impl Ui {
         cfg: Config,
         palette: Palette,
         claude: ClaudeHandle,
+        audio: AudioHandle,
         tray_tx: mpsc::UnboundedSender<IconState>,
     ) -> Rc<Self> {
         let window = gtk::ApplicationWindow::builder()
@@ -89,7 +141,7 @@ impl Ui {
         }
 
         // --- widgets ------------------------------------------------------
-        let glass = gtk::DrawingArea::new();
+        let panel = gtk::DrawingArea::new();
 
         let status = gtk::DrawingArea::new();
         status.set_content_height((dotfont::ROWS as f64 * STATUS_PITCH).ceil() as i32 + 2);
@@ -130,7 +182,7 @@ impl Ui {
 
         let overlay = gtk::Overlay::new();
         overlay.set_size_request(cfg.ui.width, -1);
-        overlay.set_child(Some(&glass));
+        overlay.set_child(Some(&panel));
         overlay.add_overlay(&content);
         overlay.set_measure_overlay(&content, true);
         window.set_child(Some(&overlay));
@@ -141,17 +193,21 @@ impl Ui {
         gtk::style_context_add_provider_for_display(
             &gdk::Display::default().expect("a display"),
             &css,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            // Above USER: ~/.config/gtk-4.0/gtk.css is often the full desktop
+            // theme (focus rings etc.). Every rule is scoped to `.fsc`, so this
+            // only affects the popup.
+            gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
         );
 
         let model = pretty_model(&cfg.claude.model);
         let ui = Rc::new(Ui {
             cfg,
             claude,
+            audio,
             tray_tx,
             app: app.clone(),
             window,
-            glass,
+            panel,
             status,
             viz_area,
             meta,
@@ -160,14 +216,23 @@ impl Ui {
             entry,
             css,
             st: RefCell::new(State {
-                phase: Phase::Idle,
+                claude: Phase::Idle,
+                listening: None,
+                transcribing: false,
+                speaking: false,
                 palette,
                 muted: false,
                 model,
+                voice: Voice::default(),
                 viz: Viz::default(),
                 last_frame: None,
                 current: None,
-                listen_timer: None,
+                voice_turn: false,
+                sentences: SentenceBuffer::default(),
+                conversation: false,
+                speech_pending: false,
+                follow_up: false,
+                empty_follow_ups: 0,
                 meta_timer: None,
             }),
             scroll_pending: Cell::new(false),
@@ -179,9 +244,10 @@ impl Ui {
 
     fn wire(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
-        self.glass.set_draw_func(move |_, cr, w, h| {
+        self.panel.set_draw_func(move |_, cr, w, h| {
             if let Some(ui) = weak.upgrade() {
-                glass::draw(cr, w as f64, h as f64, &ui.st.borrow().palette);
+                let regions = ui.panel_regions(h as f64);
+                panel::draw(cr, w as f64, h as f64, &ui.st.borrow().palette, regions);
             }
         });
 
@@ -198,18 +264,20 @@ impl Ui {
             let Some(ui) = weak.upgrade() else { return };
             let st = ui.st.borrow();
             let p = &st.palette;
+            let phase = st.phase();
             let y = (h as f64 - (dotfont::ROWS - 1) as f64 * STATUS_PITCH) / 2.0;
             let mut x = STATUS_DOT;
-            if st.phase == Phase::Listening {
+            if phase == Phase::Listening {
                 // Blinking record dot.
-                let a = 0.55 + 0.45 * (st.viz_time() * 4.0).sin().abs();
+                let t = st.last_frame.map(|t| t as f64 / 1e6).unwrap_or(0.0);
+                let a = 0.55 + 0.45 * (t * 4.0).sin().abs();
                 cr.set_source_rgba(p.accent.0, p.accent.1, p.accent.2, a);
                 cr.arc(4.0, h as f64 / 2.0, 4.0, 0.0, std::f64::consts::TAU);
                 cr.fill().ok();
                 x += 14.0;
             }
-            let on = if st.phase == Phase::Error { p.accent } else { p.fg };
-            dotfont::draw(cr, st.phase.label(), x, y, STATUS_PITCH, STATUS_DOT, (on, 1.0), (p.fg, 0.07));
+            let on = if phase == Phase::Error { p.accent } else { p.fg };
+            dotfont::draw(cr, phase.label(), x, y, STATUS_PITCH, STATUS_DOT, (on, 1.0), (p.fg, 0.10), Some((p.bg, 0.5)));
         });
 
         // Animation: only runs while the popup is mapped.
@@ -233,7 +301,7 @@ impl Ui {
         self.entry.connect_activate(move |e| {
             if let Some(ui) = weak.upgrade() {
                 let text = e.text().to_string();
-                if ui.ask(&text) {
+                if ui.ask(&text, false) {
                     e.set_text("");
                 }
             }
@@ -250,9 +318,10 @@ impl Ui {
                     ui.hide();
                     glib::Propagation::Stop
                 }
-                // Ctrl+C with nothing selected stops, like a terminal.
+                // Ctrl+C with nothing selected stops everything, like a terminal.
                 gdk::Key::c if ctrl && ui.entry.selection_bounds().is_none() => {
-                    ui.stop();
+                    ui.cancel_listen();
+                    ui.interrupt();
                     glib::Propagation::Stop
                 }
                 gdk::Key::n if ctrl => {
@@ -276,6 +345,7 @@ impl Ui {
                 }
             }
             AppEvent::Claude(e) => self.claude_event(e),
+            AppEvent::Audio(e) => self.audio_event(e),
             AppEvent::Theme(mode) => self.set_theme(mode),
         }
     }
@@ -291,7 +361,7 @@ impl Ui {
             Command::Listen => self.listen(),
             Command::Stop => self.stop(),
             Command::Ask { text } => {
-                if !self.ask(&text) {
+                if !self.ask(&text, false) {
                     return Reply::err("busy: a reply is still in progress (fsc stop to interrupt)");
                 }
             }
@@ -307,7 +377,7 @@ impl Ui {
             }
             Command::Status => {
                 let st = self.st.borrow();
-                let mut s = st.phase.label().to_lowercase();
+                let mut s = st.phase().label().to_lowercase();
                 if st.muted {
                     s.push_str(" (muted)");
                 }
@@ -327,9 +397,10 @@ impl Ui {
                 }
             }
             ClaudeEvent::TextDelta(t) => {
-                if self.phase() != Phase::Responding {
-                    self.set_phase(Phase::Responding);
+                if self.st.borrow().claude != Phase::Responding {
+                    self.set_claude(Phase::Responding);
                 }
+                let speak = self.should_speak();
                 let mut st = self.st.borrow_mut();
                 st.viz.kick(0.25 + t.len() as f32 * 0.03);
                 if let Some(cur) = st.current.as_mut() {
@@ -337,11 +408,15 @@ impl Ui {
                     cur.reply.set_text(cur.text.trim_start());
                     cur.reply.set_visible(true);
                 }
+                let ready = if speak { st.sentences.push(&t) } else { Vec::new() };
                 drop(st);
+                for s in ready {
+                    self.speak(s);
+                }
                 self.scroll_to_end();
             }
             ClaudeEvent::ToolUse { name } => {
-                self.set_phase(Phase::Working);
+                self.set_claude(Phase::Working);
                 if let Some(cur) = self.st.borrow().current.as_ref() {
                     let l = label(&format!("󰒓  {}", pretty_tool(&name).to_uppercase()), "tool");
                     if let Some(parent) = cur.reply.parent() {
@@ -351,13 +426,22 @@ impl Ui {
                 self.scroll_to_end();
             }
             ClaudeEvent::TurnDone { ok, interrupted, error } => {
-                let cur = self.st.borrow_mut().current.take();
+                let (cur, rest) = {
+                    let mut st = self.st.borrow_mut();
+                    let rest = if ok && !interrupted { st.sentences.flush() } else { None };
+                    st.sentences.clear();
+                    (st.current.take(), rest)
+                };
+                if let Some(rest) = rest
+                    && self.should_speak()
+                {
+                    self.speak(rest);
+                }
                 if let Some(cur) = &cur {
-                    let parent = cur.reply.parent().and_downcast::<gtk::Box>();
                     if cur.text.trim().is_empty() {
                         cur.reply.set_visible(false);
                     }
-                    if let Some(parent) = parent {
+                    if let Some(parent) = cur.reply.parent().and_downcast::<gtk::Box>() {
                         if interrupted {
                             parent.append(&label("— STOPPED", "note"));
                         }
@@ -366,17 +450,23 @@ impl Ui {
                         }
                     }
                 }
-                self.set_phase(if ok { Phase::Idle } else { Phase::Error });
+                self.set_claude(if ok { Phase::Idle } else { Phase::Error });
                 self.scroll_to_end();
 
+                let spoken = self.st.borrow().voice_turn && self.should_speak();
+                if !spoken || !ok || interrupted {
+                    self.audio.release_mic();
+                }
                 if ok
                     && !interrupted
+                    && !spoken
                     && !self.window.is_visible()
                     && self.cfg.ui.notify_when_hidden
                     && let Some(cur) = cur
                 {
                     notify(&cur.text);
                 }
+                self.maybe_follow_up();
             }
             ClaudeEvent::Exited { reason } => {
                 eprintln!("fsc: {reason}");
@@ -384,21 +474,96 @@ impl Ui {
         }
     }
 
+    fn audio_event(self: &Rc<Self>, e: AudioEvent) {
+        match e {
+            AudioEvent::Ready { stt, tts, missing_models } => {
+                self.st.borrow_mut().voice = Voice { stt, tts, loaded: true };
+                if missing_models {
+                    self.flash_meta("MODELS MISSING · FSC FETCH-MODELS");
+                }
+            }
+            AudioEvent::Spectrum(bands) => {
+                self.st.borrow_mut().viz.set_spectrum(Some(bands));
+            }
+            AudioEvent::MicWaiting => self.flash_meta_for("WAITING FOR MIC…", Duration::from_secs(15)),
+            AudioEvent::MicLive => {
+                if self.st.borrow().follow_up {
+                    self.flash_meta_for("GO AHEAD · ESC ENDS CONVERSATION", Duration::from_secs(5));
+                } else {
+                    self.flash_meta("SPEAK NOW");
+                }
+            }
+            AudioEvent::SpeechStarted => {}
+            AudioEvent::Transcribing => {
+                {
+                    let mut st = self.st.borrow_mut();
+                    st.listening = None;
+                    st.transcribing = true;
+                    st.viz.set_spectrum(None);
+                }
+                self.refresh();
+            }
+            AudioEvent::Transcript(text) => {
+                let was_capturing = {
+                    let mut st = self.st.borrow_mut();
+                    let was = st.listening.is_some() || st.transcribing;
+                    st.listening = None;
+                    st.transcribing = false;
+                    st.viz.set_spectrum(None);
+                    was
+                };
+                self.refresh();
+                if !was_capturing {
+                    return; // cancelled meanwhile
+                }
+                if text.trim().is_empty() {
+                    self.st.borrow_mut().empty_follow_ups += 1;
+                    self.flash_meta("DIDN'T CATCH THAT");
+                    self.maybe_follow_up();
+                } else {
+                    self.st.borrow_mut().empty_follow_ups = 0;
+                    self.ask(&text, true);
+                }
+            }
+            AudioEvent::SpeakingStarted => {
+                self.st.borrow_mut().speaking = true;
+                self.refresh();
+            }
+            AudioEvent::SpeakingDone => {
+                {
+                    let mut st = self.st.borrow_mut();
+                    st.speaking = false;
+                    st.speech_pending = false;
+                    st.viz.set_spectrum(None);
+                }
+                self.refresh();
+                self.maybe_follow_up();
+            }
+            AudioEvent::Error(err) => {
+                eprintln!("fsc: {err}");
+                let short: String = err.to_uppercase().chars().take(44).collect();
+                self.flash_meta(&short);
+            }
+        }
+    }
+
     // --- actions ----------------------------------------------------------
 
-    fn ask(self: &Rc<Self>, text: &str) -> bool {
+    /// Send a prompt. `voice`: it came from speech, so speak the reply.
+    fn ask(self: &Rc<Self>, text: &str, voice: bool) -> bool {
         let text = text.trim();
         if text.is_empty() {
             return true;
         }
-        if self.phase().busy() {
+        if self.st.borrow().claude.busy() {
             self.flash_meta("BUSY · CTRL+C TO STOP");
             return false;
         }
-        self.cancel_listen();
+        self.audio.stop_speaking();
 
         let ex = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        ex.append(&label(&format!("› {text}"), "prompt"));
+        let prefix = if voice { "󰍬" } else { "›" };
+        ex.append(&label(&format!("{prefix} {text}"), "prompt"));
         let reply = label("", "reply");
         reply.set_selectable(true);
         reply.set_focusable(false);
@@ -408,55 +573,137 @@ impl Ui {
         self.trim_history();
         self.scroller.set_visible(true);
 
-        self.st.borrow_mut().current = Some(Exchange { reply, text: String::new() });
-        self.set_phase(Phase::Thinking);
+        {
+            let mut st = self.st.borrow_mut();
+            st.current = Some(Exchange { reply, text: String::new() });
+            st.voice_turn = voice;
+            st.sentences.clear();
+        }
+        self.set_claude(Phase::Thinking);
         self.claude.ask(text);
         self.scroll_to_end();
         true
     }
 
-    fn listen(self: &Rc<Self>) {
-        if self.phase().busy() {
-            self.claude.interrupt();
-        }
-        self.show(false);
-        self.set_phase(Phase::Listening);
-        self.flash_meta("VOICE INPUT ARRIVES IN STEP 2");
-        // Demo only: until audio exists, stop "listening" after a few seconds.
-        let weak = Rc::downgrade(self);
-        let id = glib::timeout_add_local_once(Duration::from_secs(6), move || {
-            if let Some(ui) = weak.upgrade() {
-                ui.st.borrow_mut().listen_timer = None;
-                if ui.phase() == Phase::Listening {
-                    ui.set_phase(Phase::Idle);
-                }
+    fn should_speak(&self) -> bool {
+        let st = self.st.borrow();
+        st.voice.tts
+            && match self.cfg.voice.speak {
+                SpeakMode::Voice => st.voice_turn,
+                SpeakMode::Always => true,
+                SpeakMode::Never => false,
             }
-        });
-        if let Some(old) = self.st.borrow_mut().listen_timer.replace(id) {
-            old.remove();
+    }
+
+    fn speak(&self, text: String) {
+        self.st.borrow_mut().speech_pending = true;
+        self.audio.speak(text);
+    }
+
+    /// In a conversation, start listening again once the reply is fully
+    /// done: Claude's turn finished and nothing left to say.
+    fn maybe_follow_up(self: &Rc<Self>) {
+        let ready = {
+            let st = self.st.borrow();
+            st.conversation
+                && !st.claude.busy()
+                && !st.speaking
+                && !st.speech_pending
+                && st.listening.is_none()
+                && !st.transcribing
+                && st.empty_follow_ups < 3
+        };
+        if ready && self.window.is_visible() {
+            self.listen_inner(true);
+        }
+    }
+
+    /// User-initiated listening (hotkey, tray, `fsc listen`).
+    fn listen(self: &Rc<Self>) {
+        self.st.borrow_mut().empty_follow_ups = 0;
+        self.listen_inner(false);
+    }
+
+    fn listen_inner(self: &Rc<Self>, follow_up: bool) {
+        let voice = self.st.borrow().voice;
+        self.show(false);
+        if !voice.loaded {
+            self.flash_meta("VOICE MODELS STILL LOADING");
+            return;
+        }
+        if !voice.stt {
+            self.flash_meta("NO SPEECH MODEL · FSC FETCH-MODELS");
+            return;
+        }
+        if self.st.borrow().listening.is_some() {
+            return;
+        }
+        // Barge-in: talking over a reply stops it.
+        if !follow_up {
+            self.interrupt();
+        }
+        let start_conversation = self.cfg.voice.conversation && !self.st.borrow().conversation;
+        {
+            let mut st = self.st.borrow_mut();
+            st.listening = Some(Instant::now());
+            st.transcribing = false;
+            st.follow_up = follow_up;
+            st.viz.set_spectrum(None);
+            if start_conversation {
+                st.conversation = true;
+            }
+        }
+        if start_conversation {
+            self.audio.set_conversation(true);
+        }
+        if follow_up {
+            self.audio.listen_follow_up();
+        } else {
+            self.audio.listen();
+        }
+        self.refresh();
+    }
+
+    /// `fsc stop` / push-to-talk release.
+    fn stop(self: &Rc<Self>) {
+        let listening = self.st.borrow().listening;
+        match listening {
+            // A quick tap: keep listening, the VAD ends the utterance.
+            Some(t) if t.elapsed() < TAP => {}
+            Some(_) => self.audio.finish(),
+            None => self.interrupt(),
+        }
+    }
+
+    /// Stop the reply: Claude's turn and any speech.
+    fn interrupt(&self) {
+        self.audio.stop_speaking();
+        let mut st = self.st.borrow_mut();
+        st.sentences.clear();
+        st.speech_pending = false;
+        if st.claude.busy() {
+            self.claude.interrupt();
         }
     }
 
     fn cancel_listen(&self) {
-        if let Some(id) = self.st.borrow_mut().listen_timer.take() {
-            id.remove();
-        }
-        if self.phase() == Phase::Listening {
-            self.set_phase(Phase::Idle);
-        }
-    }
-
-    fn stop(self: &Rc<Self>) {
-        let phase = self.phase();
-        if phase == Phase::Listening {
-            self.cancel_listen();
-        } else if phase.busy() {
-            self.claude.interrupt();
+        let was = {
+            let mut st = self.st.borrow_mut();
+            let was = st.listening.take().is_some();
+            if was {
+                st.viz.set_spectrum(None);
+            }
+            was
+        };
+        if was {
+            self.audio.cancel();
+            self.refresh();
         }
     }
 
     fn new_conversation(self: &Rc<Self>) {
         self.cancel_listen();
+        self.audio.stop_speaking();
         self.claude.restart();
         while let Some(child) = self.history.first_child() {
             self.history.remove(&child);
@@ -475,21 +722,57 @@ impl Ui {
 
     fn hide(&self) {
         self.cancel_listen();
+        self.end_conversation();
         self.window.set_visible(false);
         self.st.borrow_mut().last_frame = None;
     }
 
-    // --- state helpers --------------------------------------------------------
-
-    fn phase(&self) -> Phase {
-        self.st.borrow().phase
+    /// "Hang up": stop speaking and release the mic so the headset can go
+    /// back to its high-quality playback profile. A reply still streaming
+    /// finishes as text (with a notification, since the popup is hidden).
+    fn end_conversation(&self) {
+        let was = {
+            let mut st = self.st.borrow_mut();
+            let was = st.conversation;
+            st.conversation = false;
+            st.follow_up = false;
+            if was {
+                st.voice_turn = false;
+                st.speech_pending = false;
+                st.sentences.clear();
+            }
+            was
+        };
+        if was {
+            self.audio.stop_speaking();
+            self.audio.set_conversation(false);
+        }
     }
 
-    fn set_phase(&self, p: Phase) {
+    // --- state helpers --------------------------------------------------------
+
+    /// Where the header, visualiser and text sit, in panel coordinates.
+    fn panel_regions(&self, h: f64) -> panel::Regions {
+        let bounds = |w: &gtk::Widget| w.compute_bounds(&self.panel).map(|b| (b.y() as f64, (b.y() + b.height()) as f64));
+        let (_, header_bottom) = bounds(self.status.upcast_ref()).unwrap_or((0.0, 40.0));
+        let (graphic_top, graphic_bottom) =
+            bounds(self.viz_area.upcast_ref()).unwrap_or((header_bottom + 16.0, header_bottom + 104.0));
+        let text_widget: &gtk::Widget =
+            if self.scroller.is_visible() { self.scroller.upcast_ref() } else { self.entry.upcast_ref() };
+        let (text_top, _) = bounds(text_widget).unwrap_or((graphic_bottom + 16.0, h));
+        panel::Regions { header_bottom, graphic_top, graphic_bottom, text_top }
+    }
+
+    fn set_claude(&self, p: Phase) {
+        self.st.borrow_mut().claude = p;
+        self.refresh();
+    }
+
+    /// Re-derive the displayed phase and push it everywhere.
+    fn refresh(&self) {
         {
             let mut st = self.st.borrow_mut();
-            st.phase = p;
-            st.viz.phase = p;
+            st.viz.phase = st.phase();
         }
         self.status.queue_draw();
         self.push_tray();
@@ -502,7 +785,7 @@ impl Ui {
             st.palette
         };
         self.css.load_from_string(&palette.css(&self.cfg.ui.font));
-        self.glass.queue_draw();
+        self.panel.queue_draw();
         self.viz_area.queue_draw();
         self.status.queue_draw();
         self.push_tray();
@@ -511,7 +794,7 @@ impl Ui {
     fn push_tray(&self) {
         let st = self.st.borrow();
         let _ = self.tray_tx.send(IconState {
-            phase: st.phase,
+            phase: st.phase(),
             theme: st.palette.mode,
             muted: st.muted,
             accent: st.palette.accent,
@@ -525,9 +808,13 @@ impl Ui {
     }
 
     fn flash_meta(self: &Rc<Self>, text: &str) {
+        self.flash_meta_for(text, Duration::from_millis(3000));
+    }
+
+    fn flash_meta_for(self: &Rc<Self>, text: &str, dur: Duration) {
         self.meta.set_text(text);
         let weak = Rc::downgrade(self);
-        let id = glib::timeout_add_local_once(Duration::from_millis(2500), move || {
+        let id = glib::timeout_add_local_once(dur, move || {
             if let Some(ui) = weak.upgrade() {
                 ui.st.borrow_mut().meta_timer = None;
                 ui.restore_meta();
@@ -565,12 +852,6 @@ impl Ui {
                 adj.set_value(adj.upper() - adj.page_size());
             }
         });
-    }
-}
-
-impl State {
-    fn viz_time(&self) -> f64 {
-        self.last_frame.map(|t| t as f64 / 1e6).unwrap_or(0.0)
     }
 }
 

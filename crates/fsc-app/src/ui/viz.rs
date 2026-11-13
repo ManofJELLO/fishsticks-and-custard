@@ -3,9 +3,9 @@
 //! Each column is one frequency band, mirrored above and below a centre
 //! baseline. Peaks hold briefly in the accent colour.
 //!
-//! Step 1 has no audio yet, so `tick` makes up plausible motion for each
-//! phase. Step 2 feeds real FFT magnitudes through `set_spectrum`: mic input
-//! while listening, TTS output while speaking.
+//! Real FFT band levels arrive through `set_spectrum`: mic input while
+//! listening, synthesized speech while speaking. Phases without audio get
+//! made-up motion (a sweep while thinking, a babble while text streams in).
 
 use gtk::cairo::Context;
 use std::f64::consts::TAU;
@@ -76,7 +76,6 @@ impl Viz {
 
     /// Feed real FFT magnitudes (0..1, low to high). `None` reverts to the
     /// built-in animation.
-    #[allow(dead_code)] // used from step 2
     pub fn set_spectrum(&mut self, bins: Option<Vec<f32>>) {
         self.spectrum = bins;
     }
@@ -90,7 +89,7 @@ impl Viz {
 
         for c in 0..n {
             let x = if n > 1 { c as f32 / (n - 1) as f32 } else { 0.0 };
-            let target = if let (Some(s), Phase::Listening | Phase::Responding) = (&self.spectrum, self.phase) {
+            let target = if let (Some(s), Phase::Listening | Phase::Speaking) = (&self.spectrum, self.phase) {
                 sample(s, x)
             } else {
                 match self.phase {
@@ -103,14 +102,18 @@ impl Viz {
                         let n = self.rand();
                         env * (0.30 + 0.70 * syl) * (0.45 + 0.55 * n)
                     }
-                    Phase::Thinking | Phase::Working => {
+                    Phase::Thinking | Phase::Working | Phase::Transcribing => {
                         // A soft blob sweeping left to right.
-                        let speed = if self.phase == Phase::Working { 1.4 } else { 0.8 };
+                        let speed = match self.phase {
+                            Phase::Working => 1.4,
+                            Phase::Transcribing => 2.0,
+                            _ => 0.8,
+                        };
                         let pos = (t * speed).fract() * 1.5 - 0.25;
                         let d = (x - pos) / 0.07;
                         0.70 * (-d * d).exp() + 0.05
                     }
-                    Phase::Responding => {
+                    Phase::Responding | Phase::Speaking => {
                         let env = speech_envelope(x, 0.36);
                         let n = self.rand();
                         self.energy * env * (0.35 + 0.65 * n)
@@ -157,8 +160,15 @@ impl Viz {
                 } else if dist == 0 {
                     (p.fg, 0.22)
                 } else {
-                    (p.fg, 0.07)
+                    (p.fg, 0.10)
                 };
+                if a > 0.5 {
+                    // Halo in the panel colour keeps lit dots readable over
+                    // whatever shows through the translucent panel.
+                    cr.set_source_rgba(p.bg.0, p.bg.1, p.bg.2, 0.55);
+                    cr.arc(x, y, DOT + 1.6, 0.0, TAU);
+                    cr.fill().ok();
+                }
                 cr.set_source_rgba(col.0, col.1, col.2, a);
                 cr.arc(x, y, DOT, 0.0, TAU);
                 cr.fill().ok();

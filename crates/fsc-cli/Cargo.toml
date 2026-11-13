@@ -13,3 +13,4 @@ path = "src/main.rs"
 fsc-core.workspace = true
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
+ureq = "3"

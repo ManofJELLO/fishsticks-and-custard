@@ -45,9 +45,8 @@ pub struct Palette {
     pub mode: ThemeMode,
     /// Text, lit dots, icon.
     pub fg: Rgb,
-    /// Glass tint.
+    /// Panel tint (opacity is decided per region by the panel).
     pub bg: Rgb,
-    pub bg_alpha: f64,
     pub accent: Rgb,
 }
 
@@ -58,14 +57,12 @@ impl Palette {
                 mode,
                 fg: Rgb(0.96, 0.96, 0.96),
                 bg: Rgb(0.03, 0.03, 0.03),
-                bg_alpha: 0.58,
                 accent,
             },
             ThemeMode::Light => Palette {
                 mode,
                 fg: Rgb(0.05, 0.05, 0.05),
                 bg: Rgb(0.95, 0.95, 0.94),
-                bg_alpha: 0.66,
                 accent,
             },
         }
@@ -87,6 +84,7 @@ window.fsc * {{
     color: {meta};
     font-size: 10px;
     letter-spacing: 2px;
+    text-shadow: 0 0 3px {halo};
 }}
 .fsc .prompt {{
     color: {dim};
@@ -143,10 +141,16 @@ window.fsc * {{
     outline: none;
     font-size: 14px;
 }}
+.fsc entry:focus-within,
+.fsc entry:hover,
+.fsc entry:hover:not(:focus-within) {{
+    background-color: {field};
+    box-shadow: none;
+    outline: 0 solid transparent;
+    outline-offset: 0;
+}}
 .fsc entry:focus-within {{
     border-color: {border_focus};
-    box-shadow: none;
-    outline: none;
 }}
 .fsc entry > text > placeholder {{
     color: {placeholder};
@@ -155,7 +159,8 @@ window.fsc * {{
     background-color: {sel};
 }}
 "#,
-            meta = fg(0.55),
+            meta = fg(0.72),
+            halo = self.bg.css(0.85),
             dim = fg(0.55),
             text = fg(0.95),
             red = accent(1.0),

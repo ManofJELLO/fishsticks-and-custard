@@ -6,12 +6,16 @@ pub enum Phase {
     Idle,
     /// Capturing the user's voice (red everywhere).
     Listening,
+    /// Speech captured, whisper is turning it into text.
+    Transcribing,
     /// Prompt sent, waiting for the first token.
     Thinking,
     /// Claude is running a tool.
     Working,
-    /// Reply text is streaming in (later: being spoken).
+    /// Reply text is streaming in.
     Responding,
+    /// Reply is being read aloud.
+    Speaking,
     Error,
 }
 
@@ -20,9 +24,11 @@ impl Phase {
         match self {
             Phase::Idle => "READY",
             Phase::Listening => "LISTENING",
+            Phase::Transcribing => "HEARING",
             Phase::Thinking => "THINKING",
             Phase::Working => "WORKING",
             Phase::Responding => "RESPONDING",
+            Phase::Speaking => "SPEAKING",
             Phase::Error => "ERROR",
         }
     }

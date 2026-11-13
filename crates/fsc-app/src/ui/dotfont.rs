@@ -62,7 +62,17 @@ fn glyph(c: char) -> [u8; ROWS] {
 
 #[allow(clippy::too_many_arguments)]
 /// Draw `text` with its top-left dot centre at (x, y).
-pub fn draw(cr: &Context, text: &str, x: f64, y: f64, pitch: f64, radius: f64, on: (Rgb, f64), off: (Rgb, f64)) {
+pub fn draw(
+    cr: &Context,
+    text: &str,
+    x: f64,
+    y: f64,
+    pitch: f64,
+    radius: f64,
+    on: (Rgb, f64),
+    off: (Rgb, f64),
+    halo: Option<(Rgb, f64)>,
+) {
     for (i, ch) in text.chars().enumerate() {
         let g = glyph(ch);
         let gx = x + (i * (COLS + 1)) as f64 * pitch;
@@ -72,6 +82,11 @@ pub fn draw(cr: &Context, text: &str, x: f64, y: f64, pitch: f64, radius: f64, o
                 let (col, a) = if lit { on } else { off };
                 if a <= 0.0 {
                     continue;
+                }
+                if let (true, Some((h, ha))) = (lit, halo) {
+                    cr.set_source_rgba(h.0, h.1, h.2, ha);
+                    cr.arc(gx + c as f64 * pitch, y + r as f64 * pitch, radius + 1.0, 0.0, TAU);
+                    let _ = cr.fill();
                 }
                 cr.set_source_rgba(col.0, col.1, col.2, a);
                 cr.arc(gx + c as f64 * pitch, y + r as f64 * pitch, radius, 0.0, TAU);

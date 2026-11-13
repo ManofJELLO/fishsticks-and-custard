@@ -28,13 +28,28 @@ use crate::style::{Palette, Rgb, ThemeMode};
 pub enum AppEvent {
     Command(Command, Option<oneshot::Sender<Reply>>),
     Claude(ClaudeEvent),
+    Audio(fsc_audio::AudioEvent),
     Theme(ThemeMode),
 }
 
 const APP_ID: &str = "dev.fsc.FishsticksAndCustard";
 
 fn main() -> Result<()> {
+    // Before any threads exist (these set environment variables).
+    fsc_audio::prepare_env();
+    // Wayland only: the popup is a layer-shell surface, which has no X11
+    // equivalent, and the session's GDK_BACKEND may list x11 as a fallback.
+    // SAFETY: no other threads exist yet.
+    unsafe { std::env::set_var("GDK_BACKEND", "wayland") };
+    gtk::gdk::set_allowed_backends("wayland");
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        anyhow::bail!("fscd needs a Wayland session (WAYLAND_DISPLAY is not set)");
+    }
+
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--self-test") {
+        return fsc_audio::self_test(&Config::load()?.voice);
+    }
     if let Some(i) = args.iter().position(|a| a == "--dump-icons") {
         let dir = args.get(i + 1).map(String::as_str).unwrap_or(".");
         return dump_icons(dir);
@@ -80,6 +95,13 @@ fn main() -> Result<()> {
         })
     };
 
+    let audio = {
+        let tx = ev_tx.clone();
+        fsc_audio::spawn(cfg.voice.clone(), move |e| {
+            let _ = tx.try_send(AppEvent::Audio(e));
+        })
+    };
+
     let app = gtk::Application::builder().application_id(APP_ID).build();
     let ui_cell: Rc<RefCell<Option<Rc<ui::Ui>>>> = Rc::default();
     let ev_rx = RefCell::new(Some(ev_rx));
@@ -100,6 +122,7 @@ fn main() -> Result<()> {
                 cfg.clone(),
                 Palette::new(initial_theme, accent),
                 claude.clone(),
+                audio.clone(),
                 tray_tx.clone(),
             );
             *ui_cell.borrow_mut() = Some(ui.clone());

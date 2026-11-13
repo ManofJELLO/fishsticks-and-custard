@@ -2,6 +2,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use fsc_core::ipc::{self, Command};
 use std::process::ExitCode;
 
+mod fetch;
+
 /// Control the Fishsticks & Custard assistant daemon (fscd).
 #[derive(Parser)]
 #[command(name = "fsc", version)]
@@ -40,6 +42,8 @@ enum Cmd {
     Status,
     /// Quit the daemon
     Quit,
+    /// Download any missing speech models (whisper, silero VAD, piper voice)
+    FetchModels,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -51,6 +55,7 @@ enum MuteMode {
 
 fn main() -> ExitCode {
     let cmd = match Cli::parse().cmd {
+        Cmd::FetchModels => return fetch::run(),
         Cmd::Toggle => Command::Toggle,
         Cmd::Show => Command::Show,
         Cmd::Hide => Command::Hide,

@@ -3,6 +3,7 @@
 pub mod claude;
 pub mod config;
 pub mod ipc;
+pub mod models;
 pub mod phase;
 
 pub use phase::Phase;

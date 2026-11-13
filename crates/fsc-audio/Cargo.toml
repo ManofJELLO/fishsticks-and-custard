@@ -1,0 +1,17 @@
+[package]
+name = "fsc-audio"
+description = "Fishsticks & Custard voice pipeline: mic, VAD, whisper STT, piper TTS, spectrum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fsc-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+cpal = { version = "0.18", features = ["pipewire"] }
+ort = "=2.0.0-rc.15"
+whisper-rs = { version = "0.16", features = ["vulkan"] }
+espeak-rs = "0.2"
+rustfft = "6"
