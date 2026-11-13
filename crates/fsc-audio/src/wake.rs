@@ -40,8 +40,16 @@ pub fn match_wake(text: &str, phrase: &str) -> Option<String> {
             }
         }
         if let Some((_, end)) = best {
-            let rest_from = words.get(end).map(|(_, i)| *i).unwrap_or(original.len());
-            let rest = original[rest_from..].join(" ");
+            // The phrase can end inside an original word ("custard...what"
+            // normalizes to two words). Keep only that word's unmatched part,
+            // then the original text after it.
+            let last_orig = words[end - 1].1;
+            let tail_of_word: Vec<&str> =
+                words[end..].iter().take_while(|(_, i)| *i == last_orig).map(|(w, _)| w.as_str()).collect();
+            let rest_from = words[end..].iter().map(|(_, i)| *i).find(|i| *i != last_orig).unwrap_or(original.len());
+            let mut parts: Vec<&str> = tail_of_word;
+            parts.extend(&original[rest_from.max(last_orig + 1).min(original.len())..]);
+            let rest = parts.join(" ");
             let rest = rest.trim_start_matches(|c: char| !c.is_alphanumeric()).trim().to_string();
             return Some(rest);
         }
@@ -93,6 +101,12 @@ mod tests {
             Some("what is the weather like today?")
         );
         assert_eq!(match_wake("Hey fish sticks and custard. Open Firefox.", P).as_deref(), Some("Open Firefox."));
+    }
+
+    #[test]
+    fn phrase_glued_to_command() {
+        assert_eq!(match_wake("Fishsticks and custard...what time is it", P).as_deref(), Some("what time is it"));
+        assert_eq!(match_wake("Fishsticks and custard,what's up?", P).as_deref(), Some("what s up?"));
     }
 
     #[test]

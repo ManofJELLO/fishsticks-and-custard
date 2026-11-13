@@ -54,13 +54,12 @@ bullets. If there is nothing worth remembering at all, reply with exactly: {NONE
 /// be kept.
 pub fn parse_reply(reply: &str, current: &[String]) -> Option<Vec<String>> {
     let trimmed = reply.trim();
-    if trimmed.eq_ignore_ascii_case(NONE) {
-        // "Nothing new" must never wipe what we already had.
-        return Some(current.to_vec());
-    }
     let facts = bullets(trimmed);
     if facts.is_empty() {
-        return None;
+        // "NONE", "NONE.", "None - nothing new": nothing to add. That must
+        // never wipe what we already had.
+        let first = trimmed.split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default();
+        return first.eq_ignore_ascii_case(NONE).then(|| current.to_vec());
     }
     Some(facts.into_iter().take(MAX_FACTS).collect())
 }
@@ -119,6 +118,8 @@ mod tests {
         let current = facts(&["- Likes jazz"]);
         assert_eq!(parse_reply("NONE", &current).unwrap(), current);
         assert_eq!(parse_reply(" none \n", &[]).unwrap(), Vec::<String>::new());
+        assert_eq!(parse_reply("NONE.", &current).unwrap(), current);
+        assert_eq!(parse_reply("None - nothing new this time.", &current).unwrap(), current);
     }
 
     #[test]

@@ -105,7 +105,7 @@ Then paste `packaging/hyprland/fsc.lua` into `~/.config/hypr/hyprland.lua`.
 | `Esc` | hide; in a voice conversation this also hangs up (a reply keeps streaming as text, with a notification) |
 | `Ctrl+C` (nothing selected) / `fsc stop` | interrupt the reply |
 | `Ctrl+N` / `fsc new` | new conversation |
-| `SUPER+SHIFT+A` hold / `fsc listen` + `fsc stop` | push-to-talk; a quick tap listens until you stop talking |
+| `SUPER+SHIFT+A` hold / `fsc listen` + `fsc release` | push-to-talk; a quick tap listens until you stop talking |
 | `fsc ask "…"` | send without opening the field |
 | *"Fishsticks and custard[, question]"* | wake it by voice; a question in the same breath is sent straight away |
 | `fsc mute [on\|off]` / tray | mute the wake word |

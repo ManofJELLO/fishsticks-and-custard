@@ -26,6 +26,8 @@ enum Cmd {
     Listen,
     /// Stop listening, or interrupt the current reply
     Stop,
+    /// Push-to-talk key released: finish recording (never interrupts a reply)
+    Release,
     /// Send a prompt
     Ask {
         #[arg(required = true, num_args = 1..)]
@@ -66,6 +68,7 @@ fn main() -> ExitCode {
         Cmd::Type => Command::Type,
         Cmd::Listen => Command::Listen,
         Cmd::Stop => Command::Stop,
+        Cmd::Release => Command::Release,
         Cmd::Ask { text } => Command::Ask { text: text.join(" ") },
         Cmd::New => Command::New,
         Cmd::Mute { mode } => Command::Mute {

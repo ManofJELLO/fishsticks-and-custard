@@ -42,10 +42,8 @@ fn main() -> Result<()> {
     // SAFETY: no other threads exist yet.
     unsafe { std::env::set_var("GDK_BACKEND", "wayland") };
     gtk::gdk::set_allowed_backends("wayland");
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        anyhow::bail!("fscd needs a Wayland session (WAYLAND_DISPLAY is not set)");
-    }
 
+    // Headless diagnostics: no display needed.
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--self-test") {
         return fsc_audio::self_test(&Config::load()?.voice);
@@ -53,6 +51,17 @@ fn main() -> Result<()> {
     if let Some(i) = args.iter().position(|a| a == "--dump-icons") {
         let dir = args.get(i + 1).map(String::as_str).unwrap_or(".");
         return dump_icons(dir);
+    }
+
+    // Already running? Launching again (e.g. from a launcher) toggles the popup.
+    if fsc_core::ipc::send(&Command::Status).is_ok() {
+        fsc_core::ipc::send(&Command::Toggle)?;
+        println!("fscd is already running; toggled its popup");
+        return Ok(());
+    }
+
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        anyhow::bail!("fscd needs a Wayland session (WAYLAND_DISPLAY is not set)");
     }
 
     let cfg = Config::load()?;
@@ -109,9 +118,9 @@ fn main() -> Result<()> {
     {
         let ui_cell = ui_cell.clone();
         app.connect_activate(move |app| {
-            if let Some(ui) = ui_cell.borrow().as_ref() {
-                // A second launch activates us: treat it as "toggle".
-                ui.command(Command::Toggle);
+            // Activated once at startup; a second fscd toggles us over the
+            // control socket instead (see above).
+            if ui_cell.borrow().is_some() {
                 return;
             }
             // Keep running with no visible window.
@@ -144,7 +153,8 @@ fn main() -> Result<()> {
         });
     }
 
-    // SIGINT/SIGTERM -> clean quit (removes the socket).
+    // SIGINT/SIGTERM: clean quit (saves memory, removes the socket). A second
+    // signal while that's under way exits immediately.
     {
         let tx = ev_tx.clone();
         rt.spawn(async move {
@@ -154,6 +164,10 @@ fn main() -> Result<()> {
             };
             tokio::select! { _ = int.recv() => {}, _ = term.recv() => {} }
             let _ = tx.send(AppEvent::Command(Command::Quit, None)).await;
+            tokio::select! { _ = int.recv() => {}, _ = term.recv() => {} }
+            eprintln!("fsc: second signal, exiting now");
+            server::cleanup();
+            std::process::exit(130);
         });
     }
 

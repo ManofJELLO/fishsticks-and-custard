@@ -12,7 +12,7 @@ use fsc_core::config::GlowStyle;
 
 use crate::style::{Rgb, ThemeMode};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IconState {
     pub phase: Phase,
     pub theme: ThemeMode,

@@ -209,10 +209,10 @@ const WATCH_RETRY: Duration = Duration::from_secs(10);
 /// Extra time after the last sample is due at the speaker before we call
 /// speech finished.
 const SPEECH_TAIL: Duration = Duration::from_millis(400);
-/// Release a held mic this long after the reply finishes speaking...
-const HOLD_AFTER_SPEECH: Duration = Duration::from_millis(1500);
-/// ...or this long after the utterance if no speech ever starts.
-const HOLD_MAX_WAIT: Duration = Duration::from_secs(30);
+/// A held mic is normally released by the UI (`release_mic`) once the reply
+/// and its speech are finished. This is only the safety net if that never
+/// comes: no activity (speech) for this long.
+const HOLD_MAX_WAIT: Duration = Duration::from_secs(120);
 
 struct Speaking {
     player: Player,
@@ -466,12 +466,23 @@ impl<F: Fn(AudioEvent)> Engine<F> {
         let rate = MIC_RATE as usize;
         let silence = l.pcm.len().saturating_sub(l.last_speech);
         let done = match l.speech_start {
-            Some(_) => silence > self.cfg.end_silence_ms as usize * rate / 1000,
+            // The length cap counts from when speech started, not from when
+            // listening started (a follow-up may wait a long time first).
+            Some(start) => {
+                silence > self.cfg.end_silence_ms as usize * rate / 1000
+                    || l.pcm.len() - start > self.cfg.max_utterance_secs as usize * rate
+            }
             None => {
                 !l.follow_up
                     && l.live.is_some_and(|t| t.elapsed() > Duration::from_millis(self.cfg.no_speech_timeout_ms as u64))
             }
-        } || l.pcm.len() > self.cfg.max_utterance_secs as usize * rate;
+        };
+        if l.speech_start.is_none() && l.pcm.len() > 2 * PREROLL {
+            // Waiting (possibly indefinitely) for speech: keep only recent audio.
+            // Safe because no index into `pcm` is held until speech starts.
+            let drop = l.pcm.len() - PREROLL;
+            l.pcm.drain(..drop);
+        }
 
         if done && let Some(l) = self.listening.take() {
             self.finish(l);
@@ -565,6 +576,15 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             }
         }
         let Some(w) = self.watching.as_mut() else { return };
+        if self.speaking.as_ref().is_some_and(|s| s.active || !s.queue.is_empty()) {
+            // Our own voice would be transcribed (and could wake us) and would
+            // block speech synthesis on this thread. Ignore the mic meanwhile.
+            w.mic.drain();
+            w.pending.clear();
+            w.seg = None;
+            w.run = 0;
+            return;
+        }
         let Some(vad) = self.vad.as_mut() else { return };
         let fresh = w.mic.drain();
         w.pending.extend_from_slice(&fresh);
@@ -663,12 +683,10 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             return; // the line stays open until the conversation ends
         }
         if self.speaking.as_ref().is_some_and(|s| s.active || !s.queue.is_empty()) {
-            h.spoke = true;
             h.since = Instant::now();
         }
-        let limit = if h.spoke { HOLD_AFTER_SPEECH } else { HOLD_MAX_WAIT };
-        if h.since.elapsed() > limit {
-            eprintln!("fsc: released held mic ({})", if h.spoke { "reply finished" } else { "no reply to speak" });
+        if h.since.elapsed() > HOLD_MAX_WAIT {
+            eprintln!("fsc: released held mic (nothing happened for {}s)", HOLD_MAX_WAIT.as_secs());
             if let Some(h) = self.held.take() {
                 self.park_mic(h.mic);
             }
@@ -692,15 +710,18 @@ impl<F: Fn(AudioEvent)> Engine<F> {
     }
 
     fn queue_speech(&mut self, text: String) {
-        if self.tts.is_none() || text.trim().is_empty() {
-            return;
+        if self.tts.is_some() && !text.trim().is_empty() {
+            self.open_player();
+            if let Some(s) = self.speaking.as_mut() {
+                s.idle_since = None;
+                s.queue.push_back(text);
+                return;
+            }
         }
-        self.open_player();
-        if let Some(s) = self.speaking.as_mut() {
-            s.idle_since = None;
-        }
-        if let Some(s) = self.speaking.as_mut() {
-            s.queue.push_back(text);
+        // Couldn't take it (no voice, no output, nothing to say). Still
+        // answer, so the UI isn't left waiting for speech that never comes.
+        if !self.speaking.as_ref().is_some_and(|s| s.active || !s.queue.is_empty()) {
+            (self.emit)(AudioEvent::SpeakingDone);
         }
     }
 
@@ -727,7 +748,14 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                         (self.emit)(AudioEvent::SpeakingStarted);
                     }
                 }
-                Err(e) => (self.emit)(AudioEvent::Error(format!("speech: {e:#}"))),
+                Err(e) => {
+                    (self.emit)(AudioEvent::Error(format!("speech: {e:#}")));
+                    // Nothing playing and nothing left: report done so the UI moves on.
+                    if !s.active && s.queue.is_empty() {
+                        s.idle_since = Some(Instant::now());
+                        (self.emit)(AudioEvent::SpeakingDone);
+                    }
+                }
             }
         }
         if s.active && s.queue.is_empty() && !s.player.busy(SPEECH_TAIL) {

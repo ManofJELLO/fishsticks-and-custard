@@ -26,7 +26,7 @@ fn fetch_all() -> Result<()> {
     }
     std::fs::create_dir_all(models::models_dir())?;
     for m in &missing {
-        fetch(m).with_context(|| format!("downloading {}", m.url))?;
+        fetch(m).with_context(|| format!("downloading {}", m.url.as_deref().unwrap_or(m.label)))?;
     }
     println!("done. Restart fscd to load them.");
     Ok(())
@@ -34,7 +34,13 @@ fn fetch_all() -> Result<()> {
 
 fn fetch(m: &ModelFile) -> Result<()> {
     let name = m.path.file_name().unwrap_or_default().to_string_lossy();
-    let resp = ureq::get(&m.url).call()?;
+    let Some(url) = m.url.as_deref() else {
+        bail!(
+            "can't download the {}: `voice.piper_voice` must look like locale-name-quality, e.g. \"en_GB-alan-medium\"",
+            m.label
+        );
+    };
+    let resp = ureq::get(url).call()?;
     if resp.status() != 200 {
         bail!("HTTP {}", resp.status());
     }

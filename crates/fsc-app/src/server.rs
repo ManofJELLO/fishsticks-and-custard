@@ -13,6 +13,12 @@ use crate::AppEvent;
 /// Bind the socket, refusing to start if another fscd is already listening.
 pub async fn bind() -> Result<UnixListener> {
     let path = socket_path();
+    if let Some(dir) = path.parent()
+        && !dir.exists()
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
     if path.exists() {
         if UnixStream::connect(&path).await.is_ok() {
             bail!("fscd is already running ({})", path.display());
@@ -46,6 +52,14 @@ async fn handle(stream: UnixStream, tx: async_channel::Sender<AppEvent>) -> Resu
     let mut lines = BufReader::new(r).lines();
     while let Some(line) = lines.next_line().await? {
         let reply = match serde_json::from_str::<Command>(&line) {
+            Ok(Command::Quit) => {
+                // Answer before handing over: once the UI quits, the runtime
+                // (and this task) may be gone before a reply could be written.
+                w.write_all(b"{\"ok\":true}\n").await?;
+                w.flush().await?;
+                tx.send(AppEvent::Command(Command::Quit, None)).await?;
+                return Ok(());
+            }
             Ok(cmd) => {
                 let (otx, orx) = oneshot::channel();
                 tx.send(AppEvent::Command(cmd, Some(otx))).await?;

@@ -11,9 +11,9 @@ hl.layer_rule({
 
 -- SUPER+A: type to Claude.
 hl.bind("SUPER + A", hl.dsp.exec_cmd("fsc type"))
--- SUPER+SHIFT+A: hold to talk (voice arrives in step 2; for now it previews the listening state).
+-- SUPER+SHIFT+A: hold to talk. A quick tap also works: it listens until you stop talking.
 hl.bind("SUPER + SHIFT + A", hl.dsp.exec_cmd("fsc listen"))
-hl.bind("SUPER + SHIFT + A", hl.dsp.exec_cmd("fsc stop"), { release = true })
+hl.bind("SUPER + SHIFT + A", hl.dsp.exec_cmd("fsc release"), { release = true })
 
 -- Autostart: add this line inside your existing hl.on("hyprland.start", ...) block:
 --     hl.exec_cmd("fscd")

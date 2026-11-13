@@ -202,9 +202,31 @@ where
     let mut dirty = false;
     // Prompts that arrived while the memory update was running.
     let mut queued: VecDeque<String> = VecDeque::new();
+    // A hidden (drain + memory update) turn must finish by this time, or it's
+    // abandoned so a queued prompt can't hang behind it.
+    let mut internal_deadline: Option<tokio::time::Instant> = None;
 
     loop {
+        if turn.active && turn.internal {
+            internal_deadline.get_or_insert_with(|| tokio::time::Instant::now() + INTERNAL_TURN_TIMEOUT);
+        } else {
+            internal_deadline = None;
+        }
         tokio::select! {
+            _ = sleep_until_opt(internal_deadline) => {
+                eprintln!("fsc: memory update timed out; starting a new session without it");
+                emit(ClaudeEvent::MemorySaved {
+                    ok: false,
+                    facts: memory::load(&home).len(),
+                    error: Some("memory update timed out".into()),
+                });
+                turn = Turn::default();
+                restart(&mut proc, &cfg, &home).await;
+                dirty = false;
+                for text in queued.drain(..) {
+                    ask(&mut proc, &mut turn, &mut dirty, &cfg, &home, &text, &emit).await;
+                }
+            }
             req = rx.recv() => match req {
                 None => break,
                 Some(Req::Ask(text)) => {
@@ -263,7 +285,10 @@ where
                     if let Err(e) = memory::forget(&home) {
                         eprintln!("fsc: could not delete memory: {e}");
                     }
-                    if turn.active && !turn.internal {
+                    if turn.active && turn.internal {
+                        // A save was in flight: say it's cancelled (a quit may be waiting on it).
+                        emit(ClaudeEvent::MemorySaved { ok: false, facts: 0, error: Some("cancelled by forget".into()) });
+                    } else if turn.active {
                         emit(ClaudeEvent::TurnDone { ok: true, interrupted: true, error: None });
                     }
                     turn = Turn::default();
@@ -300,6 +325,9 @@ where
                 Ok(None) | Err(_) => {
                     let mut reason = "claude exited".to_string();
                     if let Some(mut p) = proc.take() {
+                        // A read error (e.g. invalid UTF-8) can happen with the CLI still
+                        // running; make sure it's gone before waiting on it.
+                        let _ = p.child.start_kill();
                         if let Ok(status) = p.child.wait().await {
                             reason = format!("claude exited ({status})");
                         }
@@ -427,6 +455,16 @@ fn start(cfg: &ClaudeConfig, home: &Path) -> Option<Proc> {
     Some(Proc { child, stdin, lines: BufReader::new(stdout).lines(), stderr: stderr_buf })
 }
 
+/// Longest a hidden end-of-session turn (drain + memory update) may take.
+const INTERNAL_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn next_line(proc: &mut Option<Proc>) -> std::io::Result<Option<String>> {
     match proc {
         Some(p) => p.lines.next_line().await,
@@ -486,22 +524,20 @@ fn handle_line<F: Fn(ClaudeEvent)>(line: &str, turn: &mut Turn, emit: &F) -> Opt
                 return None;
             }
             let success = v["subtype"] == "success" && !v["is_error"].as_bool().unwrap_or(false);
+            let error_text = || v["result"].as_str().map(str::to_string).unwrap_or_else(|| s(&v["subtype"]));
             if turn.internal {
                 let done = if turn.draining {
                     Internal::Drained
                 } else if success {
                     Internal::Memory { ok: true, reply: std::mem::take(&mut turn.buf) }
                 } else {
-                    let reply = v["result"].as_str().map(str::to_string).unwrap_or_else(|| s(&v["subtype"]));
-                    Internal::Memory { ok: false, reply }
+                    Internal::Memory { ok: false, reply: error_text() }
                 };
                 *turn = Turn::default();
                 return Some(done);
             }
             let ok = success || turn.interrupted;
-            let error = (!ok).then(|| {
-                v["result"].as_str().map(str::to_string).unwrap_or_else(|| s(&v["subtype"]))
-            });
+            let error = (!ok).then(error_text);
             emit(ClaudeEvent::TurnDone { ok, interrupted: turn.interrupted, error });
             *turn = Turn::default();
         }
@@ -510,12 +546,17 @@ fn handle_line<F: Fn(ClaudeEvent)>(line: &str, turn: &mut Turn, emit: &F) -> Opt
     None
 }
 
-/// "claude-sonnet-5-5" -> "SONNET 5.5", "sonnet" -> "SONNET".
+/// "claude-sonnet-5-5" -> "SONNET 5.5", "claude-3-5-sonnet-20241022" -> "SONNET 3.5",
+/// "sonnet" -> "SONNET".
 pub fn pretty_model(model: &str) -> String {
     let m = model.strip_prefix("claude-").unwrap_or(model);
-    let mut parts = m.split('-');
-    let name = parts.next().unwrap_or_default().to_uppercase();
-    let ver: Vec<&str> = parts.take_while(|p| p.chars().all(|c| c.is_ascii_digit()) && p.len() <= 2).collect();
+    let parts: Vec<&str> = m.split('-').collect();
+    let name = parts.iter().find(|p| p.chars().next().is_some_and(|c| c.is_ascii_alphabetic()));
+    let Some(name) = name else { return model.to_uppercase() };
+    // Version numbers are short numeric parts; long ones are dates.
+    let ver: Vec<&str> =
+        parts.iter().copied().filter(|p| !p.is_empty() && p.len() <= 2 && p.chars().all(|c| c.is_ascii_digit())).collect();
+    let name = name.to_uppercase();
     if ver.is_empty() { name } else { format!("{name} {}", ver.join(".")) }
 }
 
@@ -540,6 +581,8 @@ mod tests {
         assert_eq!(pretty_model("claude-sonnet-5-5"), "SONNET 5.5");
         assert_eq!(pretty_model("sonnet"), "SONNET");
         assert_eq!(pretty_model("claude-haiku-5-5-20261001"), "HAIKU 5.5");
+        assert_eq!(pretty_model("claude-3-5-sonnet-20241022"), "SONNET 3.5");
+        assert_eq!(pretty_model("opus"), "OPUS");
     }
 
     #[test]

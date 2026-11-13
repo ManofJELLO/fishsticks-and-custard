@@ -8,7 +8,8 @@ use crate::config::VoiceConfig;
 pub struct ModelFile {
     /// What it's for, shown while downloading.
     pub label: &'static str,
-    pub url: String,
+    /// `None` when the configured name can't be turned into a download.
+    pub url: Option<String>,
     pub path: PathBuf,
 }
 
@@ -48,27 +49,30 @@ pub fn required(v: &VoiceConfig) -> Vec<ModelFile> {
     let mut out = vec![
         ModelFile {
             label: "speech recognition (whisper)",
-            url: format!(
+            url: Some(format!(
                 "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{}.bin",
                 v.whisper_model
-            ),
+            )),
             path: whisper_path(v),
         },
         ModelFile {
             label: "voice activity detection (silero)",
-            url: "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx"
-                .into(),
+            url: Some(
+                "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx"
+                    .into(),
+            ),
             path: vad_path(),
         },
     ];
-    if let Some(base) = piper_base_url(&v.piper_voice) {
-        out.push(ModelFile { label: "voice (piper)", url: format!("{base}.onnx"), path: piper_path(v) });
-        out.push(ModelFile {
-            label: "voice config (piper)",
-            url: format!("{base}.onnx.json"),
-            path: piper_config_path(v),
-        });
-    }
+    // Always listed, so a malformed name shows up as missing (with a clear
+    // error from fetch-models) instead of silently disabling speech.
+    let base = piper_base_url(&v.piper_voice);
+    out.push(ModelFile { label: "voice (piper)", url: base.as_ref().map(|b| format!("{b}.onnx")), path: piper_path(v) });
+    out.push(ModelFile {
+        label: "voice config (piper)",
+        url: base.map(|b| format!("{b}.onnx.json")),
+        path: piper_config_path(v),
+    });
     out
 }
 
@@ -78,6 +82,14 @@ pub fn missing(v: &VoiceConfig) -> Vec<ModelFile> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bad_voice_name_is_reported_not_skipped() {
+        let v = crate::config::VoiceConfig { piper_voice: "alan".into(), ..Default::default() };
+        let piper: Vec<_> = super::required(&v).into_iter().filter(|m| m.label.contains("piper")).collect();
+        assert_eq!(piper.len(), 2);
+        assert!(piper.iter().all(|m| m.url.is_none()));
+    }
+
     #[test]
     fn piper_url() {
         assert_eq!(

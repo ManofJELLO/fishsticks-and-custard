@@ -38,6 +38,8 @@ const STATUS_DOT: f64 = 1.15;
 /// A push-to-talk release sooner than this after the press counts as a
 /// tap: keep listening and let the VAD decide when you've finished.
 const TAP: Duration = Duration::from_millis(350);
+/// Follow-ups in a row that hear nothing before a conversation hangs up.
+const MAX_EMPTY_FOLLOW_UPS: u32 = 3;
 
 struct Exchange {
     reply: gtk::Label,
@@ -85,6 +87,11 @@ struct State {
     memory_saving: bool,
     /// Quit requested; waiting for the memory save to finish.
     quitting: bool,
+    /// A prompt that arrived while Claude was still busy (e.g. you spoke over
+    /// a reply that hadn't finished stopping). Sent when the turn ends.
+    pending_prompt: Option<(String, bool)>,
+    /// Last state sent to the tray, to skip redundant re-renders.
+    tray_sent: Option<IconState>,
     meta_timer: Option<glib::SourceId>,
 }
 
@@ -244,6 +251,8 @@ impl Ui {
                 last_activity: None,
                 memory_saving: false,
                 quitting: false,
+                pending_prompt: None,
+                tray_sent: None,
                 meta_timer: None,
             }),
             scroll_pending: Cell::new(false),
@@ -371,6 +380,7 @@ impl Ui {
             Command::Type => self.show(true),
             Command::Listen => self.listen(),
             Command::Stop => self.stop(),
+            Command::Release => self.release(),
             Command::Ask { text } => {
                 if !self.ask(&text, false) {
                     return Reply::err("busy: a reply is still in progress (fsc stop to interrupt)");
@@ -487,10 +497,13 @@ impl Ui {
                 self.st.borrow_mut().last_activity = Some(Instant::now());
                 self.scroll_to_end();
 
-                let spoken = self.st.borrow().voice_turn && self.should_speak();
-                if !spoken || !ok || interrupted {
-                    self.audio.release_mic();
+                let pending = self.st.borrow_mut().pending_prompt.take();
+                if let Some((text, voice)) = pending {
+                    self.ask(&text, voice);
+                    return;
                 }
+                let spoken = self.st.borrow().voice_turn && self.should_speak();
+                self.maybe_release_mic();
                 if ok
                     && !interrupted
                     && !spoken
@@ -564,12 +577,22 @@ impl Ui {
                     return; // cancelled meanwhile
                 }
                 if text.trim().is_empty() {
-                    self.st.borrow_mut().empty_follow_ups += 1;
-                    self.flash_meta("DIDN'T CATCH THAT");
-                    self.maybe_follow_up();
+                    let gave_up = {
+                        let mut st = self.st.borrow_mut();
+                        st.empty_follow_ups += 1;
+                        st.conversation && st.empty_follow_ups >= MAX_EMPTY_FOLLOW_UPS
+                    };
+                    if gave_up {
+                        // Nobody's talking: hang up so the wake word works again.
+                        self.end_conversation();
+                        self.flash_meta("CONVERSATION ENDED");
+                    } else {
+                        self.flash_meta("DIDN'T CATCH THAT");
+                        self.maybe_follow_up();
+                    }
                 } else {
                     self.st.borrow_mut().empty_follow_ups = 0;
-                    self.ask(&text, true);
+                    self.ask_or_queue(text, true);
                 }
             }
             AudioEvent::SpeakingStarted => {
@@ -584,6 +607,7 @@ impl Ui {
                     st.viz.set_spectrum(None);
                 }
                 self.refresh();
+                self.maybe_release_mic();
                 self.maybe_follow_up();
             }
             AudioEvent::Wake { command } => self.on_wake(command),
@@ -720,11 +744,6 @@ impl Ui {
 
     /// "Fishsticks and custard[, <command>]" was heard.
     fn on_wake(self: &Rc<Self>, command: Option<String>) {
-        if self.st.borrow().claude.busy() {
-            self.show(false);
-            self.flash_meta("BUSY · CTRL+C TO STOP");
-            return;
-        }
         self.show(false);
         let start_conversation = self.cfg.voice.conversation && !self.st.borrow().conversation;
         {
@@ -738,10 +757,34 @@ impl Ui {
             self.audio.set_conversation(true);
         }
         match command {
-            Some(c) => {
-                self.ask(&c, true);
-            }
+            // Busy? Saying the name is talking over the reply: stop it and
+            // send this once it has stopped.
+            Some(c) => self.ask_or_queue(c, true),
             None => self.listen_inner(false),
+        }
+    }
+
+    /// Send now, or, if a turn is still winding down, interrupt it and send
+    /// when it ends. Spoken prompts are never thrown away as "busy".
+    fn ask_or_queue(self: &Rc<Self>, text: String, voice: bool) {
+        if self.st.borrow().claude.busy() {
+            self.st.borrow_mut().pending_prompt = Some((text, voice));
+            self.interrupt();
+            self.flash_meta("STOPPING · THEN ASKING");
+        } else {
+            self.ask(&text, voice);
+        }
+    }
+
+    /// Without a conversation, the mic was only held for this reply: let it
+    /// go once the turn and its speech are both finished.
+    fn maybe_release_mic(&self) {
+        let done = {
+            let st = self.st.borrow();
+            !st.conversation && !st.claude.busy() && !st.speaking && !st.speech_pending && st.listening.is_none()
+        };
+        if done {
+            self.audio.release_mic();
         }
     }
 
@@ -761,7 +804,7 @@ impl Ui {
                 && !st.speech_pending
                 && st.listening.is_none()
                 && !st.transcribing
-                && st.empty_follow_ups < 3
+                && st.empty_follow_ups < MAX_EMPTY_FOLLOW_UPS
         };
         if ready && self.window.is_visible() {
             self.listen_inner(true);
@@ -825,6 +868,18 @@ impl Ui {
         }
     }
 
+    /// Push-to-talk released. Only ends a recording: if the VAD already ended
+    /// it (you paused before letting go), the question is on its way and must
+    /// not be interrupted.
+    fn release(self: &Rc<Self>) {
+        let listening = self.st.borrow().listening;
+        if let Some(t) = listening
+            && t.elapsed() >= TAP
+        {
+            self.audio.finish();
+        }
+    }
+
     /// Stop the reply: Claude's turn and any speech.
     fn interrupt(&self) {
         self.audio.stop_speaking();
@@ -839,7 +894,9 @@ impl Ui {
     fn cancel_listen(&self) {
         let was = {
             let mut st = self.st.borrow_mut();
-            let was = st.listening.take().is_some();
+            // Also abandon a transcription in progress: its transcript is then
+            // dropped when it arrives instead of being sent.
+            let was = st.listening.take().is_some() | std::mem::take(&mut st.transcribing);
             if was {
                 st.viz.set_spectrum(None);
             }
@@ -942,14 +999,19 @@ impl Ui {
     }
 
     fn push_tray(&self) {
-        let st = self.st.borrow();
-        let _ = self.tray_tx.send(IconState {
+        let mut st = self.st.borrow_mut();
+        let state = IconState {
             phase: st.phase(),
             theme: st.palette.mode,
             muted: st.muted,
             accent: st.palette.accent,
             glow: self.cfg.ui.glow,
-        });
+        };
+        // Each update re-renders the icon at 6 sizes and signals the tray host.
+        if st.tray_sent != Some(state) {
+            st.tray_sent = Some(state);
+            let _ = self.tray_tx.send(state);
+        }
     }
 
     fn restore_meta(&self) {

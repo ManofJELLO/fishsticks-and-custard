@@ -21,6 +21,9 @@ pub enum Command {
     Listen,
     /// Stop listening, or interrupt the reply in progress.
     Stop,
+    /// Push-to-talk key released: end the recording if one is running (a
+    /// quick tap keeps listening). Never interrupts a reply.
+    Release,
     /// Send a prompt without opening the text field.
     Ask { text: String },
     /// Throw away the conversation and start a fresh Claude session.
@@ -56,10 +59,16 @@ impl Reply {
     }
 }
 
+/// `$XDG_RUNTIME_DIR/fsc.sock`, or a private directory in the user's home
+/// when there's no runtime dir. Never a shared path like /tmp, where another
+/// user could squat the name.
 pub fn socket_path() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir).join("fsc.sock");
+    }
+    directories::BaseDirs::new()
+        .map(|d| d.data_local_dir().join("fsc").join("run"))
+        .unwrap_or_else(|| PathBuf::from(".fsc-run"))
         .join("fsc.sock")
 }
 
