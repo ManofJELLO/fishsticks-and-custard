@@ -243,7 +243,9 @@ fn build_output(
         }
     };
 
-    let wanted = StreamConfig { channels: 1, sample_rate: rate, buffer_size: BufferSize::Default };
+    // Stereo with the same signal in both channels: a 1-channel stream gets
+    // positioned front-left by PipeWire, i.e. only the left ear.
+    let wanted = StreamConfig { channels: 2, sample_rate: rate, buffer_size: BufferSize::Default };
     let shared = st.clone();
     let alive = keep_alive.clone();
     let mut seed = 0x1234_5678u32;
@@ -253,8 +255,8 @@ fn build_output(
             let mut s = shared.lock().unwrap();
             let keep = alive.load(Ordering::Relaxed);
             let mut real = 0;
-            for o in out.iter_mut() {
-                *o = match s.queue.pop_front() {
+            for frame in out.chunks_mut(2) {
+                let v = match s.queue.pop_front() {
                     Some(v) => {
                         real += 1;
                         v
@@ -262,7 +264,8 @@ fn build_output(
                     None if keep => dither(&mut seed),
                     None => 0.0,
                 };
-                s.recent.push_back(*o);
+                frame.iter_mut().for_each(|o| *o = v);
+                s.recent.push_back(v);
             }
             s.played(info, real, rate);
         },
@@ -273,7 +276,7 @@ fn build_output(
     let stream = match direct {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("fsc: output refused {rate} Hz mono ({e}); converting locally");
+            eprintln!("fsc: output refused {rate} Hz stereo ({e}); converting locally");
             let def = dev.default_output_config().context("output default config")?;
             let ch = def.channels() as usize;
             let step = rate as f64 / def.sample_rate() as f64;

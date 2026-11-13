@@ -372,6 +372,7 @@ impl Ui {
                     st.muted = on.unwrap_or(!st.muted);
                     st.muted
                 };
+                self.audio.set_wake_enabled(!muted);
                 self.flash_meta(if muted { "WAKE WORD MUTED" } else { "WAKE WORD ON" });
                 self.push_tray();
             }
@@ -539,6 +540,7 @@ impl Ui {
                 self.refresh();
                 self.maybe_follow_up();
             }
+            AudioEvent::Wake { command } => self.on_wake(command),
             AudioEvent::Error(err) => {
                 eprintln!("fsc: {err}");
                 let short: String = err.to_uppercase().chars().take(44).collect();
@@ -593,6 +595,33 @@ impl Ui {
                 SpeakMode::Always => true,
                 SpeakMode::Never => false,
             }
+    }
+
+    /// "Fishsticks and custard[, <command>]" was heard.
+    fn on_wake(self: &Rc<Self>, command: Option<String>) {
+        if self.st.borrow().claude.busy() {
+            self.show(false);
+            self.flash_meta("BUSY · CTRL+C TO STOP");
+            return;
+        }
+        self.show(false);
+        let start_conversation = self.cfg.voice.conversation && !self.st.borrow().conversation;
+        {
+            let mut st = self.st.borrow_mut();
+            st.empty_follow_ups = 0;
+            if start_conversation {
+                st.conversation = true;
+            }
+        }
+        if start_conversation {
+            self.audio.set_conversation(true);
+        }
+        match command {
+            Some(c) => {
+                self.ask(&c, true);
+            }
+            None => self.listen_inner(false),
+        }
     }
 
     fn speak(&self, text: String) {

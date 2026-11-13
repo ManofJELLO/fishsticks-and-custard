@@ -1,6 +1,7 @@
 //! The voice pipeline, run on one dedicated thread:
 //!
 //! ```text
+//! watch:   mic ─► VAD segments ─► whisper ─► wake phrase? ─► Wake
 //! listen:  mic (16 kHz) ─► Silero VAD endpointing ─► whisper ─► Transcript
 //! speak:   sentence ─► espeak-ng + Piper ─► speaker
 //! both:    recent samples ─► FFT ─► Spectrum (for the visualiser)
@@ -8,12 +9,18 @@
 //!
 //! The UI talks to it through `AudioHandle` and hears back through the
 //! `emit` callback.
+//!
+//! There is one microphone, handed between three owners: `Watching` (idle,
+//! waiting for the wake phrase), `Listening` (capturing a prompt) and `Held`
+//! (open but ignored while a reply is pending or a conversation is open).
+//! `take_mic` and `park_mic` move it between them.
 
 mod io;
 mod spectrum;
 mod stt;
 mod tts;
 mod vad;
+mod wake;
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -49,6 +56,9 @@ pub enum AudioEvent {
     Transcript(String),
     SpeakingStarted,
     SpeakingDone,
+    /// The wake phrase was heard. `command` is anything said right after it
+    /// in the same breath ("fishsticks and custard, what time is it?").
+    Wake { command: Option<String> },
     Error(String),
 }
 
@@ -67,6 +77,8 @@ enum Cmd {
     StopSpeaking,
     /// The reply won't be spoken; don't keep the mic open for it.
     ReleaseMic,
+    /// Enable/disable wake-phrase watching (the tray's mute).
+    WakeEnabled(bool),
 }
 
 #[derive(Clone)]
@@ -98,6 +110,9 @@ impl AudioHandle {
     }
     pub fn release_mic(&self) {
         let _ = self.tx.send(Cmd::ReleaseMic);
+    }
+    pub fn set_wake_enabled(&self, on: bool) {
+        let _ = self.tx.send(Cmd::WakeEnabled(on));
     }
 }
 
@@ -152,6 +167,45 @@ struct Held {
     spoke: bool,
 }
 
+/// Idle mic, listening for the wake phrase. Speech is cut into segments by
+/// the VAD; each segment is transcribed and checked for the phrase.
+struct Watching {
+    mic: Mic,
+    /// Recent audio before speech starts, so the first syllable isn't lost.
+    preroll: VecDeque<f32>,
+    pending: Vec<f32>,
+    /// The current speech segment, if one is in progress.
+    seg: Option<Vec<f32>>,
+    run: u32,
+    silence: usize,
+    /// Early check said "not the wake phrase": ignore the rest of this segment.
+    rejected: bool,
+    checked_early: bool,
+}
+
+impl Watching {
+    fn new(mic: Mic) -> Self {
+        Self {
+            mic,
+            preroll: VecDeque::new(),
+            pending: Vec::new(),
+            seg: None,
+            run: 0,
+            silence: 0,
+            rejected: false,
+            checked_early: false,
+        }
+    }
+}
+
+/// Audio kept from before speech starts.
+const PREROLL: usize = MIC_RATE as usize / 2;
+/// Transcribe a long segment's first part this early to reject non-wake
+/// speech (a TV, a conversation) without transcribing all of it.
+const EARLY_CHECK: usize = MIC_RATE as usize * 5 / 2;
+/// Don't retry opening a failing mic more often than this.
+const WATCH_RETRY: Duration = Duration::from_secs(10);
+
 /// Extra time after the last sample is due at the speaker before we call
 /// speech finished.
 const SPEECH_TAIL: Duration = Duration::from_millis(400);
@@ -175,6 +229,9 @@ struct Engine<F> {
     tts: Option<Tts>,
     listening: Option<Listening>,
     held: Option<Held>,
+    watching: Option<Watching>,
+    wake_enabled: bool,
+    watch_failed_at: Option<Instant>,
     conversation: bool,
     speaking: Option<Speaking>,
     analyzer: Analyzer,
@@ -198,6 +255,9 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             tts: None,
             listening: None,
             held: None,
+            watching: None,
+            wake_enabled: true,
+            watch_failed_at: None,
             conversation: false,
             speaking: None,
             analyzer: Analyzer::default(),
@@ -249,13 +309,16 @@ impl<F: Fn(AudioEvent)> Engine<F> {
     fn run(mut self, rx: mpsc::Receiver<Cmd>) {
         self.load();
         loop {
-            let busy = self.listening.is_some() || self.speaking.as_ref().is_some_and(|s| s.active);
+            let busy = self.listening.is_some()
+                || self.watching.is_some()
+                || self.speaking.as_ref().is_some_and(|s| s.active);
             let wait = if busy { Duration::from_millis(15) } else { Duration::from_millis(250) };
             match rx.recv_timeout(wait) {
                 Ok(cmd) => self.command(cmd),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
+            self.step_watch();
             self.step_listen();
             self.step_hold();
             self.step_speak();
@@ -275,8 +338,11 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                     s.player.set_keep_alive(on);
                 }
                 if !on {
-                    if self.listening.is_none() && self.held.take().is_some() {
-                        eprintln!("fsc: conversation ended, mic released");
+                    if self.listening.is_none()
+                        && let Some(h) = self.held.take()
+                    {
+                        eprintln!("fsc: conversation ended");
+                        self.park_mic(h.mic);
                     }
                     self.idle_player();
                 }
@@ -291,11 +357,8 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                     (self.emit)(AudioEvent::Transcript(String::new()));
                     return;
                 }
-                // Reuse a held mic: it's already live, no Bluetooth switch wait.
-                let held = self.held.take().map(|h| {
-                    h.mic.drain();
-                    h.mic
-                });
+                // Reuse an open mic: it's already live (no Bluetooth switch wait).
+                let held = self.take_mic();
                 let reused = held.is_some();
                 match held.map(Ok).unwrap_or_else(|| Mic::open(&self.cfg.input_device)) {
                     Ok(mic) => {
@@ -328,20 +391,29 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                 }
             }
             Cmd::Cancel => {
-                let l = self.listening.take();
-                if self.conversation {
-                    // Keep the line open; just stop listening.
-                    if let Some(l) = l {
-                        self.held = Some(Held { mic: l.mic, since: Instant::now(), spoke: false });
-                    }
-                } else {
-                    self.held = None;
+                if let Some(l) = self.listening.take() {
+                    self.park_mic(l.mic);
+                } else if !self.conversation
+                    && let Some(h) = self.held.take()
+                {
+                    self.park_mic(h.mic);
+                }
+            }
+            Cmd::WakeEnabled(on) => {
+                self.wake_enabled = on;
+                eprintln!("fsc: wake word {}", if on { "on" } else { "muted" });
+                if !on {
+                    self.watching = None;
                 }
             }
             Cmd::ReleaseMic => {
-                if !self.conversation && self.held.is_some() && self.speaking.as_ref().is_none_or(|s| !s.active && s.queue.is_empty()) {
+                if !self.conversation
+                    && self.held.is_some()
+                    && self.speaking.as_ref().is_none_or(|s| !s.active && s.queue.is_empty())
+                    && let Some(h) = self.held.take()
+                {
                     eprintln!("fsc: released held mic (reply not spoken)");
-                    self.held = None;
+                    self.park_mic(h.mic);
                     self.idle_player();
                 }
             }
@@ -410,15 +482,14 @@ impl<F: Fn(AudioEvent)> Engine<F> {
         let Listening { mic, mut pcm, speech_start, last_speech, .. } = l;
         pcm.extend(mic.drain());
         if self.conversation || (self.cfg.hold_mic_while_speaking && speech_start.is_some()) {
-            if self.held.is_none() {
-                eprintln!("fsc: holding mic open{}", if self.conversation { " (conversation)" } else { " for the reply" });
-            }
             self.held = Some(Held { mic, since: Instant::now(), spoke: false });
             if speech_start.is_some() {
                 // Open the output now, while the headset is already in its
                 // two-way profile, so the reply doesn't wait for it.
                 self.open_player();
             }
+        } else {
+            self.park_mic(mic);
         }
         let Some(start) = speech_start else {
             (self.emit)(AudioEvent::Transcript(String::new()));
@@ -441,6 +512,135 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             Err(e) => {
                 (self.emit)(AudioEvent::Error(format!("transcription: {e:#}")));
                 (self.emit)(AudioEvent::Transcript(String::new()));
+            }
+        }
+    }
+
+    fn wake_active(&self) -> bool {
+        self.cfg.wake_word && self.wake_enabled && self.vad.is_some() && self.stt.is_some()
+    }
+
+    /// Take the open mic from whoever is idling with it.
+    fn take_mic(&mut self) -> Option<Mic> {
+        let mic = self.held.take().map(|h| h.mic).or_else(|| self.watching.take().map(|w| w.mic))?;
+        mic.drain();
+        Some(mic)
+    }
+
+    /// A mode is done with the mic: watch for the wake phrase with it, or close it.
+    fn park_mic(&mut self, mic: Mic) {
+        if self.wake_active() {
+            mic.drain();
+            if let Some(v) = self.vad.as_mut() {
+                v.reset();
+            }
+            self.watching = Some(Watching::new(mic));
+        }
+    }
+
+    /// Keep a mic open for the wake phrase whenever nothing else is using it.
+    fn step_watch(&mut self) {
+        if !self.wake_active() {
+            self.watching = None;
+            return;
+        }
+        if self.watching.is_none() && self.listening.is_none() && self.held.is_none() {
+            if self.watch_failed_at.is_some_and(|t| t.elapsed() < WATCH_RETRY) {
+                return;
+            }
+            match Mic::open(&self.cfg.input_device) {
+                Ok(mic) => {
+                    eprintln!("fsc: watching for the wake phrase");
+                    self.watch_failed_at = None;
+                    if let Some(v) = self.vad.as_mut() {
+                        v.reset();
+                    }
+                    self.watching = Some(Watching::new(mic));
+                }
+                Err(e) => {
+                    eprintln!("fsc: wake word mic unavailable: {e:#}");
+                    self.watch_failed_at = Some(Instant::now());
+                    return;
+                }
+            }
+        }
+        let Some(w) = self.watching.as_mut() else { return };
+        let Some(vad) = self.vad.as_mut() else { return };
+        let fresh = w.mic.drain();
+        w.pending.extend_from_slice(&fresh);
+
+        let end_silence = self.cfg.end_silence_ms as usize * MIC_RATE as usize / 1000;
+        let max_len = self.cfg.max_utterance_secs as usize * MIC_RATE as usize;
+        let mut ready: Option<Vec<f32>> = None;
+        let mut early: Option<Vec<f32>> = None;
+
+        while w.pending.len() >= CHUNK {
+            let chunk: Vec<f32> = w.pending.drain(..CHUNK).collect();
+            let p = vad.prob(&chunk).unwrap_or(0.0);
+            match w.seg.as_mut() {
+                None => {
+                    w.preroll.extend(&chunk);
+                    let excess = w.preroll.len().saturating_sub(PREROLL);
+                    w.preroll.drain(..excess);
+                    if p >= VAD_ON {
+                        w.run += 1;
+                    } else if p < VAD_OFF {
+                        w.run = 0;
+                    }
+                    if w.run >= 3 {
+                        w.seg = Some(w.preroll.drain(..).collect());
+                        w.silence = 0;
+                        w.rejected = false;
+                        w.checked_early = false;
+                    }
+                }
+                Some(seg) => {
+                    if !w.rejected {
+                        seg.extend_from_slice(&chunk);
+                    }
+                    if p >= VAD_ON {
+                        w.silence = 0;
+                    } else if p < VAD_OFF {
+                        w.silence += CHUNK;
+                    }
+                    if !w.rejected && !w.checked_early && seg.len() >= EARLY_CHECK {
+                        w.checked_early = true;
+                        early = Some(seg.clone());
+                    }
+                    if w.silence >= end_silence || seg.len() >= max_len {
+                        let seg = w.seg.take().unwrap_or_default();
+                        w.run = 0;
+                        if !w.rejected {
+                            ready = Some(seg);
+                        }
+                        break;
+                    }
+                }
+            }
+            if early.is_some() {
+                break;
+            }
+        }
+
+        if let Some(audio) = early {
+            let heard = self.stt.as_ref().and_then(|s| s.transcribe(&audio).ok()).unwrap_or_default();
+            if wake::match_wake(&heard, &self.cfg.wake_phrase).is_none()
+                && let Some(w) = self.watching.as_mut()
+            {
+                w.rejected = true;
+            }
+        }
+        if let Some(audio) = ready {
+            let t0 = Instant::now();
+            let heard = self.stt.as_ref().and_then(|s| s.transcribe(&audio).ok()).unwrap_or_default();
+            if let Some(rest) = wake::match_wake(&heard, &self.cfg.wake_phrase) {
+                eprintln!("fsc: wake phrase heard in {:.2}s: {heard:?}", t0.elapsed().as_secs_f32());
+                // Keep the mic for what comes next, like after any utterance.
+                if let Some(w) = self.watching.take() {
+                    self.held = Some(Held { mic: w.mic, since: Instant::now(), spoke: false });
+                }
+                self.open_player();
+                (self.emit)(AudioEvent::Wake { command: (!rest.is_empty()).then_some(rest) });
             }
         }
     }
@@ -469,7 +669,9 @@ impl<F: Fn(AudioEvent)> Engine<F> {
         let limit = if h.spoke { HOLD_AFTER_SPEECH } else { HOLD_MAX_WAIT };
         if h.since.elapsed() > limit {
             eprintln!("fsc: released held mic ({})", if h.spoke { "reply finished" } else { "no reply to speak" });
-            self.held = None;
+            if let Some(h) = self.held.take() {
+                self.park_mic(h.mic);
+            }
             self.idle_player();
         }
     }
@@ -641,5 +843,26 @@ pub fn self_test(cfg: &VoiceConfig) -> anyhow::Result<()> {
     println!("whisper  transcribed in {:.2}s", t.elapsed().as_secs_f32());
     println!("said:    {sentence}");
     println!("heard:   {text}");
+
+    // Wake phrase: a hit with a command, a bare hit, and two decoys.
+    for line in [
+        "Fishsticks and custard, what time is it?",
+        "Fishsticks and custard.",
+        "I had fish and chips for dinner.",
+        "The fish sticks were good with custard.",
+    ] {
+        let pcm = tts.synth(line)?;
+        let mut rs = io::Resampler::new(tts.sample_rate(), MIC_RATE);
+        let mut pcm16 = Vec::new();
+        rs.push(&pcm, &mut pcm16);
+        let t = Instant::now();
+        let heard = stt.transcribe(&pcm16)?;
+        let verdict = match wake::match_wake(&heard, &cfg.wake_phrase) {
+            Some(rest) if rest.is_empty() => "WAKE".to_string(),
+            Some(rest) => format!("WAKE + command {rest:?}"),
+            None => "no wake".to_string(),
+        };
+        println!("wake     {:.2}s  {heard:?} -> {verdict}", t.elapsed().as_secs_f32());
+    }
     Ok(())
 }

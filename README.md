@@ -1,7 +1,7 @@
 # Fishsticks & Custard
 
 A Claude desktop assistant for Arch + Hyprland, written in Rust. You summon it with the
-wake phrase *"fishsticks and custard"* (step 3), a hotkey, or the tray icon.
+wake phrase *"fishsticks and custard"*, a hotkey, or the tray icon.
 It runs on your Claude subscription through Claude Code's headless stream-json mode.
 
 ## Status
@@ -10,9 +10,9 @@ It runs on your Claude subscription through Claude Code's headless stream-json m
 |---|---|---|
 | 1 | Tray icon, popup (translucent panel, dot-matrix status and visualiser), text input, `fsc` CLI, Claude session | **done** |
 | 2 | Push-to-talk: cpal (PipeWire) → Silero VAD → whisper-rs (Vulkan) → Claude → Piper, spoken sentence by sentence; real FFT in the visualiser | **done** |
-| 3 | PipeWire echo-cancel + openWakeWord "fishsticks and custard" | next |
-| 4 | Safe system control: permission prompts routed to the popup | |
-| 5 | Polish: barge-in, conversation memory, overlay tweaks | |
+| 3 | Wake phrase "fishsticks and custard" (VAD-gated whisper, say a command in the same breath) | **done** |
+| 4 | Safe system control: permission prompts routed to the popup | next |
+| 5 | Polish: wake chime, echo cancel + barge-in, openWakeWord first stage, visuals | |
 
 ## Layout
 
@@ -71,7 +71,8 @@ Then paste `packaging/hyprland/fsc.lua` into `~/.config/hypr/hyprland.lua`.
 | `Ctrl+N` / `fsc new` | new conversation |
 | `SUPER+SHIFT+A` hold / `fsc listen` + `fsc stop` | push-to-talk; a quick tap listens until you stop talking |
 | `fsc ask "…"` | send without opening the field |
-| `fsc mute [on\|off]` | mute the wake word (step 3) |
+| *"Fishsticks and custard[, question]"* | wake it by voice; a question in the same breath is sent straight away |
+| `fsc mute [on\|off]` / tray | mute the wake word |
 | `fsc status` | `ready`, `thinking`, `listening`, … |
 
 ## Customise
@@ -81,6 +82,20 @@ Then paste `packaging/hyprland/fsc.lua` into `~/.config/hypr/hyprland.lua`.
   anything not allowed is denied automatically. Run `fsc new` after editing either file.
 - **Look and model:** `~/.config/fsc/config.toml` (see `packaging/config.example.toml`).
 - Preview the tray icons: `fscd --dump-icons /some/dir`.
+
+## Wake phrase
+
+When nothing else is using the mic, `fscd` keeps it open and watches for the phrase:
+Silero VAD cuts speech into segments, each segment is transcribed locally by whisper on
+the GPU (~0.25 s), and a fuzzy match checks whether it *starts* with the phrase. Nothing
+is sent anywhere unless it does. Long segments are checked after 2.5 s and dropped early
+if they don't start with the phrase. Mute it from the tray or with `fsc mute`.
+
+This means the GPU does a little work whenever someone speaks nearby. A trained
+openWakeWord model can be added later as a cheaper first stage.
+
+Pick the mic with `voice.input_device` (a substring of its name, e.g. `"C920"`). A wired
+or USB mic is best for an always-on wake word; see below for Bluetooth headsets.
 
 ## Bluetooth headsets
 
