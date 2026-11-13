@@ -1,6 +1,6 @@
 pkgbase = fishsticks-and-custard
 	pkgdesc = Voice-activated Claude desktop assistant for Hyprland (wake word, push-to-talk, tray)
-	pkgver = 0.3.0
+	pkgver = 0.3.1
 	pkgrel = 1
 	url = https://github.com/ManofJELLO/fishsticks-and-custard
 	install = fishsticks-and-custard.install
@@ -24,12 +24,12 @@ pkgbase = fishsticks-and-custard
 	depends = vulkan-icd-loader
 	depends = espeak-ng
 	depends = pcaudiolib
-	depends = sonic
+	depends = libsonic
 	optdepends = hyprland: the compositor this is designed for (any wlroots-style layer-shell compositor works)
 	optdepends = libnotify: desktop notifications when a reply finishes while the popup is hidden
 	options = !lto
 	options = !debug
-	source = fishsticks-and-custard::git+https://github.com/ManofJELLO/fishsticks-and-custard.git#tag=v0.3.0
+	source = fishsticks-and-custard::git+https://github.com/ManofJELLO/fishsticks-and-custard.git#tag=v0.3.1
 	sha256sums = SKIP
 
 pkgname = fishsticks-and-custard

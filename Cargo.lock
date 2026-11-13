@@ -716,7 +716,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsc-app"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "fsc-audio"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "cpal",
@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "fsc-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "fsc-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "directories",

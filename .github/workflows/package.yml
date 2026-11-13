@@ -37,7 +37,7 @@ jobs:
       - name: Install build tools
         run: |
           pacman -Syu --noconfirm --needed git github-cli rust clang cmake vulkan-headers shaderc \
-            gtk4 gtk4-layer-shell pipewire alsa-lib vulkan-icd-loader espeak-ng pcaudiolib sonic
+            gtk4 gtk4-layer-shell pipewire alsa-lib vulkan-icd-loader espeak-ng pcaudiolib libsonic
 
       - uses: actions/checkout@v4
         with:
@@ -90,11 +90,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           git config --global --add safe.directory "$PWD"
-          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
-            gh release create "$RELEASE_TAG" --title "pacman repository" --latest=false \
+          gh release view -R "$GITHUB_REPOSITORY" "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create -R "$GITHUB_REPOSITORY" "$RELEASE_TAG" --title "pacman repository" --latest=false \
               --notes "Signed pacman repository. See the README's install section. Assets here are replaced on every release."
           # Drop packages from previous versions, then upload the new set.
-          for a in $(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name'); do
-            case "$a" in *.pkg.tar.zst|*.pkg.tar.zst.sig) gh release delete-asset "$RELEASE_TAG" "$a" --yes ;; esac
+          for a in $(gh release view -R "$GITHUB_REPOSITORY" "$RELEASE_TAG" --json assets --jq '.assets[].name'); do
+            case "$a" in *.pkg.tar.zst|*.pkg.tar.zst.sig) gh release delete-asset -R "$GITHUB_REPOSITORY" "$RELEASE_TAG" "$a" --yes ;; esac
           done
-          gh release upload "$RELEASE_TAG" out/* --clobber
+          gh release upload -R "$GITHUB_REPOSITORY" "$RELEASE_TAG" out/* --clobber
