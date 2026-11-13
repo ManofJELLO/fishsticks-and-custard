@@ -13,5 +13,7 @@ serde_json.workspace = true
 cpal = { version = "0.18", features = ["pipewire"] }
 ort = "=2.0.0-rc.15"
 whisper-rs = { version = "0.16", features = ["vulkan"] }
-espeak-rs = "0.2"
+# No default features: skip compiling espeak's phoneme data (we use the
+# system espeak-ng-data), which also fails in clean release builds.
+espeak-rs = { version = "0.2", default-features = false }
 rustfft = "6"
