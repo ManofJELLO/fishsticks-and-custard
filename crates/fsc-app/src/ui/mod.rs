@@ -22,13 +22,13 @@ use tokio::sync::mpsc;
 use fsc_audio::{AudioEvent, AudioHandle};
 use fsc_core::Phase;
 use fsc_core::claude::{ClaudeEvent, ClaudeHandle, pretty_model, pretty_tool};
-use fsc_core::config::{Config, Position, SpeakMode};
+use fsc_core::config::{Config, SpeakMode, Surface};
 use fsc_core::ipc::{Command, Reply};
 use fsc_core::permission::{self, Answer, PermissionAsk};
 
 use crate::AppEvent;
 use crate::icon::IconState;
-use crate::style::{Palette, ThemeMode};
+use crate::style::{self, Palette, Rgb, ThemeMode};
 use speech_text::SentenceBuffer;
 use viz::Viz;
 
@@ -77,6 +77,10 @@ struct State {
     speaking: bool,
 
     palette: Palette,
+    /// Light/dark from the desktop (tray icon, and the palette fallback).
+    theme: ThemeMode,
+    /// The desktop's accent colour, when it sets one.
+    desktop_accent: Option<Rgb>,
     muted: bool,
     model: String,
     voice: Voice,
@@ -146,6 +150,10 @@ pub struct Ui {
     css: gtk::CssProvider,
     st: RefCell<State>,
     scroll_pending: Cell<bool>,
+    /// The accent pinned in the config (hex), overriding the desktop's.
+    accent_pin: Option<Rgb>,
+    /// Headless: a voice session is "open" though nothing is shown.
+    open: Cell<bool>,
 }
 
 impl Ui {
@@ -153,6 +161,7 @@ impl Ui {
         app: &gtk::Application,
         cfg: Config,
         palette: Palette,
+        accent_pin: Option<Rgb>,
         claude: ClaudeHandle,
         audio: AudioHandle,
         tray_tx: mpsc::UnboundedSender<IconState>,
@@ -165,13 +174,37 @@ impl Ui {
             .build();
         window.add_css_class("fsc");
 
-        window.init_layer_shell();
-        window.set_namespace(Some("fsc"));
-        window.set_layer(Layer::Overlay);
-        window.set_keyboard_mode(KeyboardMode::Exclusive);
-        if cfg.ui.position == Position::Top {
-            window.set_anchor(Edge::Top, true);
-            window.set_margin(Edge::Top, cfg.ui.margin);
+        if cfg.ui.surface == Surface::Layer {
+            window.init_layer_shell();
+            window.set_namespace(Some("fsc"));
+            window.set_layer(Layer::Overlay);
+            // On demand, not exclusive: other windows stay usable while it's up.
+            window.set_keyboard_mode(KeyboardMode::OnDemand);
+            let (top, bottom, left, right) = cfg.ui.anchor.edges();
+            for (edge, on, margin) in [
+                (Edge::Top, top, cfg.ui.margin),
+                (Edge::Bottom, bottom, cfg.ui.margin),
+                (Edge::Left, left, cfg.ui.margin_x),
+                (Edge::Right, right, cfg.ui.margin_x),
+            ] {
+                window.set_anchor(edge, on);
+                window.set_margin(edge, if on { margin } else { 0 });
+            }
+            if !cfg.ui.monitor.is_empty() {
+                let display = gdk::Display::default().expect("a display");
+                let monitors = display.monitors();
+                let found = (0..monitors.n_items())
+                    .filter_map(|i| monitors.item(i).and_downcast::<gdk::Monitor>())
+                    .find(|m| m.connector().is_some_and(|c| c == cfg.ui.monitor));
+                match found {
+                    Some(m) => window.set_monitor(Some(&m)),
+                    None => eprintln!("fsc: monitor {:?} not found; using the focused one", cfg.ui.monitor),
+                }
+            }
+        } else {
+            // A normal toplevel: Hyprland matches it by class
+            // (dev.fsc.FishsticksAndCustard) for float, size, opacity, etc.
+            window.set_default_size(cfg.ui.width, -1);
         }
 
         // --- widgets ------------------------------------------------------
@@ -255,7 +288,9 @@ impl Ui {
                 listening: None,
                 transcribing: false,
                 speaking: false,
+                theme: palette.mode,
                 palette,
+                desktop_accent: None,
                 muted: false,
                 model,
                 voice: Voice::default(),
@@ -279,6 +314,8 @@ impl Ui {
                 meta_timer: None,
             }),
             scroll_pending: Cell::new(false),
+            accent_pin,
+            open: Cell::new(false),
         });
         ui.wire();
         ui.restore_meta();
@@ -290,7 +327,7 @@ impl Ui {
         self.panel.set_draw_func(move |_, cr, w, h| {
             if let Some(ui) = weak.upgrade() {
                 let regions = ui.panel_regions(h as f64);
-                panel::draw(cr, w as f64, h as f64, &ui.st.borrow().palette, regions);
+                panel::draw(cr, w as f64, h as f64, &ui.st.borrow().palette, regions, ui.panel_look());
             }
         });
 
@@ -381,6 +418,33 @@ impl Ui {
             }
         });
         self.window.add_controller(keys);
+
+        // Closing the window (e.g. Hyprland's killactive) hides it; the
+        // assistant keeps running in the tray.
+        let weak = Rc::downgrade(self);
+        self.window.connect_close_request(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.hide();
+            }
+            glib::Propagation::Stop
+        });
+
+        // Follow the GTK theme: re-read its colours once styled, and again
+        // whenever GTK's theme settings change.
+        let weak = Rc::downgrade(self);
+        self.window.connect_realize(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.refresh_palette();
+            }
+        });
+        if let Some(settings) = gtk::Settings::default() {
+            let weak = Rc::downgrade(self);
+            settings.connect_notify_local(None, move |_, _| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.refresh_palette_soon();
+                }
+            });
+        }
     }
 
     // --- events -----------------------------------------------------------
@@ -396,16 +460,27 @@ impl Ui {
             AppEvent::Claude(e) => self.claude_event(e),
             AppEvent::Audio(e) => self.audio_event(e),
             AppEvent::Theme(mode) => self.set_theme(mode),
+            AppEvent::Accent(c) => {
+                self.st.borrow_mut().desktop_accent = c;
+                self.refresh_palette();
+            }
         }
     }
 
     pub fn command(self: &Rc<Self>, cmd: Command) -> Reply {
         match cmd {
+            // Headless has nothing to show: the tray click talks or hangs up.
+            Command::Toggle if self.headless() => {
+                if self.is_open() { self.hide() } else { self.listen() }
+            }
             Command::Toggle => {
-                if self.window.is_visible() { self.hide() } else { self.show(true) }
+                if self.is_open() { self.hide() } else { self.show(true) }
             }
             Command::Show => self.show(false),
             Command::Hide => self.hide(),
+            Command::Type if self.headless() => {
+                return Reply::err("headless mode has no text field: use `fsc ask \"…\"` or talk");
+            }
             Command::Type => self.show(true),
             Command::Listen => self.listen(),
             Command::Stop => self.stop(),
@@ -558,7 +633,7 @@ impl Ui {
                 if ok
                     && !interrupted
                     && !spoken
-                    && !self.window.is_visible()
+                    && (!self.is_open() || self.headless())
                     && self.cfg.ui.notify_when_hidden
                     && let Some(cur) = cur
                 {
@@ -877,7 +952,7 @@ impl Ui {
                 && st.listening.is_none()
                 && !st.transcribing
         };
-        if ready && self.window.is_visible() {
+        if ready && self.is_open() {
             self.listen_inner(true);
         }
     }
@@ -990,7 +1065,22 @@ impl Ui {
         self.flash_meta("NEW CONVERSATION");
     }
 
+    fn headless(&self) -> bool {
+        self.cfg.ui.surface == Surface::Headless
+    }
+
+    /// The popup is up, or, headless, a voice session is running.
+    fn is_open(&self) -> bool {
+        if self.headless() { self.open.get() } else { self.window.is_visible() }
+    }
+
     fn show(&self, focus: bool) {
+        self.open.set(true);
+        if self.headless() {
+            self.push_tray();
+            return;
+        }
+        self.refresh_palette();
         self.window.set_visible(true);
         self.window.present();
         if focus {
@@ -1007,6 +1097,7 @@ impl Ui {
         }
         self.cancel_listen();
         self.end_conversation();
+        self.open.set(false);
         self.window.set_visible(false);
         self.st.borrow_mut().last_frame = None;
     }
@@ -1014,9 +1105,10 @@ impl Ui {
     /// Claude wants to use a tool that needs your OK: show a card with
     /// buttons and, in a voice turn, ask out loud and listen for the answer.
     fn on_permission(self: &Rc<Self>, ask: PermissionAsk) {
-        if !self.window.is_visible() {
+        if !self.is_open() || self.headless() {
             self.show(false);
-            notify(&format!("Claude wants to {}.", ask.action));
+            let how = if self.headless() { " (fsc allow / fsc deny)" } else { "" };
+            notify(&format!("Claude wants to {}.{how}", ask.action));
         }
         let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
         card.add_css_class("ask");
@@ -1164,7 +1256,7 @@ impl Ui {
                     && !st.speaking
                     && !st.speech_pending
             };
-            if idle && ui.entry.text().is_empty() && ui.window.is_visible() {
+            if idle && ui.entry.text().is_empty() && ui.is_open() {
                 ui.hide();
             }
         });
@@ -1221,26 +1313,54 @@ impl Ui {
         self.push_tray();
     }
 
-    fn set_theme(&self, mode: ThemeMode) {
+    fn set_theme(self: &Rc<Self>, mode: ThemeMode) {
+        self.st.borrow_mut().theme = mode;
+        self.push_tray();
+        // GTK reloads its theme for the new scheme in its own time.
+        self.refresh_palette_soon();
+    }
+
+    fn panel_look(&self) -> panel::Look {
+        match self.cfg.ui.surface {
+            Surface::Layer => panel::Look { framed: true, opacity: self.cfg.ui.opacity, gradient: self.cfg.ui.gradient },
+            // Opaque: Hyprland's `opacity` window rule makes it see-through.
+            Surface::Window | Surface::Headless => panel::Look { framed: false, opacity: 1.0, gradient: false },
+        }
+    }
+
+    /// Re-read colours from the GTK theme and the desktop accent.
+    fn refresh_palette(&self) {
         let palette = {
-            let mut st = self.st.borrow_mut();
-            st.palette = Palette::new(mode, st.palette.accent);
-            st.palette
+            let st = self.st.borrow();
+            let accent = self.accent_pin.or(st.desktop_accent);
+            Palette::from_theme(self.window.upcast_ref(), accent, st.theme)
         };
+        if self.st.borrow().palette == palette {
+            return;
+        }
+        self.st.borrow_mut().palette = palette;
         self.css.load_from_string(&palette.css(&self.cfg.ui.font));
         self.panel.queue_draw();
         self.viz_area.queue_draw();
         self.status.queue_draw();
-        self.push_tray();
+    }
+
+    fn refresh_palette_soon(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(Duration::from_millis(250), move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.refresh_palette();
+            }
+        });
     }
 
     fn push_tray(&self) {
         let mut st = self.st.borrow_mut();
         let state = IconState {
             phase: st.phase(),
-            theme: st.palette.mode,
+            theme: st.theme,
             muted: st.muted,
-            accent: st.palette.accent,
+            accent: style::NOTHING_RED,
             shape: self.cfg.ui.tray_icon,
         };
         // Each update re-renders the icon at 6 sizes and signals the tray host.

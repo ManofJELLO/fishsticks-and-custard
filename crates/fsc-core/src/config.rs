@@ -120,10 +120,47 @@ impl Default for ClaudeConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum Position {
+pub enum Surface {
+    /// A normal window: Hyprland's window rules place, decorate and animate it.
+    #[default]
+    Window,
+    /// A layer-shell popup pinned to a screen edge or corner (`anchor`).
+    Layer,
+    /// No popup at all: voice only, the tray icon shows the state.
+    Headless,
+}
+
+/// Where a layer popup sits on the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Anchor {
     #[default]
     Top,
+    TopLeft,
+    TopRight,
+    Bottom,
+    BottomLeft,
+    BottomRight,
+    Left,
+    Right,
     Center,
+}
+
+impl Anchor {
+    /// (top, bottom, left, right) edges to pin to.
+    pub fn edges(self) -> (bool, bool, bool, bool) {
+        match self {
+            Anchor::Top => (true, false, false, false),
+            Anchor::TopLeft => (true, false, true, false),
+            Anchor::TopRight => (true, false, false, true),
+            Anchor::Bottom => (false, true, false, false),
+            Anchor::BottomLeft => (false, true, true, false),
+            Anchor::BottomRight => (false, true, false, true),
+            Anchor::Left => (false, false, true, false),
+            Anchor::Right => (false, false, false, true),
+            Anchor::Center => (false, false, false, false),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -157,14 +194,27 @@ pub enum Visualiser {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
-    pub position: Position,
-    /// Distance from the top edge when `position = "top"`.
+    pub surface: Surface,
+    /// Layer only: which edge or corner to pin to. (`position` is the old name.)
+    #[serde(alias = "position")]
+    pub anchor: Anchor,
+    /// Layer only: distance from the top or bottom edge it's pinned to.
     pub margin: i32,
+    /// Layer only: distance from the left or right edge it's pinned to.
+    pub margin_x: i32,
+    /// Layer only: output name ("DP-1"); empty = the focused one.
+    pub monitor: String,
+    /// Layer only: panel opacity, 0..1. (Windows take Hyprland's `opacity` rule.)
+    pub opacity: f64,
+    /// Layer only: fade the panel, most see-through behind the visualiser
+    /// and most solid behind text, scaled by `opacity`.
+    pub gradient: bool,
     pub width: i32,
     /// Max height of the conversation area before it scrolls.
     pub max_height: i32,
     pub font: String,
-    /// The one colour allowed to shout. Hex, e.g. "#D71921".
+    /// The one colour allowed to shout: "system" (the desktop's accent, else
+    /// the GTK theme's selection colour) or hex, e.g. "#D71921".
     pub accent: String,
     pub theme: ThemePref,
     pub tray_icon: TrayIcon,
@@ -180,12 +230,17 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            position: Position::Top,
+            surface: Surface::Window,
+            anchor: Anchor::Top,
             margin: 80,
+            margin_x: 24,
+            monitor: String::new(),
+            opacity: 0.92,
+            gradient: false,
             width: 680,
             max_height: 360,
             font: "0xProto Nerd Font".into(),
-            accent: "#D71921".into(),
+            accent: "system".into(),
             theme: ThemePref::Auto,
             tray_icon: TrayIcon::PoliceBox,
             visualiser: Visualiser::Spectrum,
@@ -216,5 +271,21 @@ impl Config {
                 .map(|d| d.data_dir().join("fsc").join("home"))
                 .unwrap_or_else(|| PathBuf::from(".fsc-home"))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_ui_keys_still_load() {
+        // 0.5.x configs: `position` was renamed `anchor`, `glow` was removed.
+        let c: Config = toml::from_str("[ui]\nposition = \"center\"\nglow = \"accent\"\n").unwrap();
+        assert_eq!(c.ui.anchor, Anchor::Center);
+        assert_eq!(c.ui.surface, Surface::Window);
+        let c: Config = toml::from_str("[ui]\nsurface = \"layer\"\nanchor = \"bottom-right\"\n").unwrap();
+        assert_eq!((c.ui.surface, c.ui.anchor), (Surface::Layer, Anchor::BottomRight));
+        assert_eq!(c.ui.anchor.edges(), (false, true, false, true));
     }
 }

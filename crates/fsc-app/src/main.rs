@@ -30,6 +30,8 @@ pub enum AppEvent {
     Claude(ClaudeEvent),
     Audio(fsc_audio::AudioEvent),
     Theme(ThemeMode),
+    /// The desktop's accent colour changed (`None`: it has none).
+    Accent(Option<Rgb>),
 }
 
 const APP_ID: &str = "dev.fsc.FishsticksAndCustard";
@@ -65,7 +67,8 @@ fn main() -> Result<()> {
     }
 
     let cfg = Config::load()?;
-    let accent = Rgb::from_hex(&cfg.ui.accent).unwrap_or(style::NOTHING_RED);
+    // A hex colour in the config pins the accent; otherwise follow the desktop.
+    let accent = Rgb::from_hex(&cfg.ui.accent);
 
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
     // Keep the runtime entered on the GTK thread so UI code can tokio::spawn.
@@ -83,6 +86,9 @@ fn main() -> Result<()> {
     if cfg.ui.theme == ThemePref::Auto {
         rt.spawn(theme::watch(ev_tx.clone()));
     }
+    if accent.is_none() {
+        rt.spawn(theme::watch_accent(ev_tx.clone()));
+    }
 
     let (tray_tx, tray_rx) = mpsc::unbounded_channel();
     rt.spawn(tray::run(
@@ -90,7 +96,8 @@ fn main() -> Result<()> {
             phase: fsc_core::Phase::Idle,
             theme: initial_theme,
             muted: false,
-            accent,
+            // The recording dot is always red, whatever the theme.
+            accent: style::NOTHING_RED,
             shape: cfg.ui.tray_icon,
         },
         tray_rx,
@@ -129,7 +136,8 @@ fn main() -> Result<()> {
             let ui = ui::Ui::new(
                 app,
                 cfg.clone(),
-                Palette::new(initial_theme, accent),
+                Palette::new(initial_theme, accent.unwrap_or(style::NOTHING_RED)),
+                accent,
                 claude.clone(),
                 audio.clone(),
                 tray_tx.clone(),

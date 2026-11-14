@@ -19,7 +19,7 @@ It runs on your Claude subscription through Claude Code's headless stream-json m
 ```
 crates/fsc-core   IPC protocol, config, model registry, Claude stream-json session (no GTK)
 crates/fsc-audio  mic/speaker (cpal), Silero VAD + Piper (ONNX Runtime), whisper.cpp STT, spectrum
-crates/fsc-app    `fscd`: GTK4 layer-shell popup, ksni tray, portal theme watcher, socket server
+crates/fsc-app    `fscd`: GTK4 popup (window or layer-shell), ksni tray, portal theme/accent watcher, socket server
 crates/fsc-cli    `fsc`: control CLI for Hyprland binds and scripts
 voice-home/       defaults seeded into ~/.local/share/fsc/home (persona + tool allow-list)
 packaging/        Hyprland snippet, example config, Arch PKGBUILD + signing key
@@ -177,12 +177,17 @@ talk shortcut does the same.
 
 ## Design notes
 
-- **Theme:** follows `org.freedesktop.appearance color-scheme` from the XDG settings
-  portal, live. The popup, visualiser and tray icon all switch together.
-- **Panel:** translucent, most see-through behind the visualiser and nearly solid behind
-  text. The Hyprland `layer_rule` blur
-  is optional; it uses your global blur settings.
-- **Wayland only:** the popup is a layer-shell surface, so there is no X11 fallback.
+- **Surface:** `ui.surface = "window"` (default) is a normal window, so Hyprland's
+  window rules give it border, shadow, rounding, blur, opacity and animation (see
+  `packaging/hyprland/fsc.lua`). `"layer"` is a layer-shell popup pinned to an edge or
+  corner (`ui.anchor`, `ui.margin`, `ui.margin_x`, `ui.monitor`), with its own
+  `ui.opacity` and optional `ui.gradient`. `"headless"` shows nothing: talk to it, the
+  tray icon shows the state, permission questions and typed replies arrive as
+  notifications.
+- **Theme:** panel and text colours come from your GTK theme, the accent from the
+  desktop (or the theme's selection colour; `ui.accent` pins one). Light/dark for the
+  tray icon follows `org.freedesktop.appearance color-scheme`, live.
+- **Wayland only:** GDK runs on Wayland only (layer mode needs layer-shell).
 - **Type:** 0xProto Nerd Font for body text. The status label uses a built-in 5×7
   dot-matrix font drawn as circles.
 - **Visualiser:** chunky LED-segment bars rising from the bottom, like an old car-stereo
@@ -190,4 +195,5 @@ talk shortcut does the same.
   scrolling loudness history (`"loudness"`). Red while listening, white for replies.
 - **Tray icon:** a police box (`ui.tray_icon = "police-box"`) or a fishbone at 45°
   (`"fishbone"`). A red dot in the corner means the mic is recording.
-- **Colour:** monochrome. Red (`#D71921`) marks state only: recording, permission questions and errors.
+- **Colour:** the accent marks state only: listening, permission questions. Errors use
+  the theme's error colour.
