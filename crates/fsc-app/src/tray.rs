@@ -95,7 +95,10 @@ impl ksni::Tray for FscTray {
 
 /// Owns the tray and applies state updates sent from the UI thread.
 pub async fn run(initial: IconState, mut updates: mpsc::UnboundedReceiver<IconState>, tx: async_channel::Sender<AppEvent>) {
-    let handle = match (FscTray { st: initial, tx }).spawn().await {
+    // At login fscd can start before the bar's StatusNotifierWatcher is on
+    // the bus. Without this, ksni treats that as fatal and the icon never
+    // appears; with it, ksni waits and registers once the watcher shows up.
+    let handle = match (FscTray { st: initial, tx }).assume_sni_available(true).spawn().await {
         Ok(h) => h,
         Err(e) => {
             eprintln!("fsc: tray icon unavailable: {e}");
