@@ -1,0 +1,29 @@
+[Desktop Entry]
+Type=Application
+Name=Fishsticks & Custard
+GenericName=Voice Assistant
+Comment=Talk or type to Claude
+Exec=fscd
+Icon=dev.fsc.FishsticksAndCustard
+Terminal=false
+Categories=Utility;Accessibility;
+Keywords=claude;assistant;voice;ai;fsc;
+StartupNotify=false
+SingleMainWindow=true
+Actions=type;talk;new;quit;
+
+[Desktop Action type]
+Name=Type to Claude
+Exec=fsc type
+
+[Desktop Action talk]
+Name=Talk to Claude
+Exec=fsc listen
+
+[Desktop Action new]
+Name=New Conversation
+Exec=fsc new
+
+[Desktop Action quit]
+Name=Quit
+Exec=fsc quit

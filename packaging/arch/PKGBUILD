@@ -5,7 +5,7 @@
 #   cd packaging/arch && makepkg -si
 
 pkgname=fishsticks-and-custard
-pkgver=0.6.0
+pkgver=0.6.1
 pkgrel=1
 pkgdesc="Voice-activated Claude desktop assistant for Hyprland (wake word, push-to-talk, tray)"
 arch=(x86_64)
@@ -56,4 +56,6 @@ package() {
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 packaging/config.example.toml "$pkgdir/usr/share/$pkgname/config.example.toml"
   install -Dm644 packaging/hyprland/fsc.lua "$pkgdir/usr/share/$pkgname/hyprland/fsc.lua"
+  install -Dm644 packaging/desktop/dev.fsc.FishsticksAndCustard.desktop -t "$pkgdir/usr/share/applications/"
+  install -Dm644 packaging/desktop/dev.fsc.FishsticksAndCustard.svg -t "$pkgdir/usr/share/icons/hicolor/scalable/apps/"
 }

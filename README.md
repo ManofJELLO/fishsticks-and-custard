@@ -73,6 +73,13 @@ cargo install --locked --root ~/.local --path crates/fsc-cli
 
 Or build the same package the repository ships: `cd packaging/arch && makepkg -si`.
 
+For a launcher entry (rofi `drun`, etc.) when installing with cargo:
+
+```sh
+install -Dm644 packaging/desktop/dev.fsc.FishsticksAndCustard.desktop -t ~/.local/share/applications/
+install -Dm644 packaging/desktop/dev.fsc.FishsticksAndCustard.svg -t ~/.local/share/icons/hicolor/scalable/apps/
+```
+
 ### Releasing
 
 Bump `version` in `Cargo.toml` and `pkgver` in `packaging/arch/PKGBUILD` (they must match),
@@ -87,6 +94,10 @@ fscd --self-test     # Piper speaks a sentence, whisper transcribes it back, wit
 ```
 
 Then paste `packaging/hyprland/fsc.lua` into `~/.config/hypr/hyprland.lua`.
+
+The package installs a launcher entry, **Fishsticks & Custard**. Opening it starts `fscd`, or
+toggles the popup if it's already running. Its actions (Type, Talk, New conversation, Quit)
+show in rofi with `rofi -show drun -drun-show-actions`.
 
 ## Use
 

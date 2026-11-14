@@ -132,6 +132,8 @@ fn main() -> Result<()> {
             }
             // Keep running with no visible window.
             std::mem::forget(app.hold());
+            // The window's icon: the police box from the installed icon theme.
+            gtk::Window::set_default_icon_name(APP_ID);
 
             let ui = ui::Ui::new(
                 app,
