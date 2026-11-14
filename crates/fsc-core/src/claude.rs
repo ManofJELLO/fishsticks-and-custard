@@ -58,8 +58,8 @@ enum Req {
     Interrupt,
     Answer { id: String, answer: Answer },
     /// End this session and start a fresh one. `save`: update long-term
-    /// memory from it first.
-    Rotate { save: bool },
+    /// memory from it first. `last`: the app is quitting, so don't start one.
+    Rotate { save: bool, last: bool },
     Forget,
 }
 
@@ -95,7 +95,13 @@ impl ClaudeHandle {
     /// End the session (saving what's worth remembering) and start fresh.
     /// A prompt asked meanwhile is held until the new session is up.
     pub fn rotate(&self, save: bool) {
-        let _ = self.tx.send(Req::Rotate { save });
+        let _ = self.tx.send(Req::Rotate { save, last: false });
+    }
+
+    /// Like `rotate`, for quitting: the session ends (saving memory first if
+    /// `save`) and no new one is started.
+    pub fn end(&self, save: bool) {
+        let _ = self.tx.send(Req::Rotate { save, last: true });
     }
 
     /// Delete long-term memory and start a fresh session.
@@ -189,12 +195,16 @@ enum Internal {
     Memory { ok: bool, reply: String },
 }
 
-/// Kill the current process (if any) and start a new session.
-async fn restart(proc: &mut Option<Proc>, cfg: &ClaudeConfig, home: &Path) {
+/// Kill the current process (if any) and start a new session, unless the
+/// app is `closing` (a new session would only be killed again on exit; one
+/// is still started on demand if a prompt does arrive).
+async fn restart(proc: &mut Option<Proc>, cfg: &ClaudeConfig, home: &Path, closing: bool) {
     if let Some(mut p) = proc.take() {
         let _ = p.child.kill().await;
     }
-    *proc = start(cfg, home);
+    if !closing {
+        *proc = start(cfg, home);
+    }
 }
 
 async fn send_user(proc: &mut Option<Proc>, text: &str) -> std::io::Result<()> {
@@ -284,6 +294,8 @@ where
     // A hidden (drain + memory update) turn must finish by this time, or it's
     // abandoned so a queued prompt can't hang behind it.
     let mut internal_deadline: Option<tokio::time::Instant> = None;
+    // The app is quitting: sessions that end aren't replaced.
+    let mut closing = false;
 
     loop {
         if turn.active && turn.internal {
@@ -300,7 +312,7 @@ where
                     error: Some("memory update timed out".into()),
                 });
                 turn = Turn::default();
-                restart(&mut proc, &cfg, &home).await;
+                restart(&mut proc, &cfg, &home, closing).await;
                 dirty = false;
                 for text in queued.drain(..) {
                     ask(&mut proc, &mut turn, &mut dirty, &cfg, &home, &text, &emit).await;
@@ -332,7 +344,8 @@ where
                         turn.interrupted = true;
                     }
                 }
-                Some(Req::Rotate { save }) => {
+                Some(Req::Rotate { save, last }) => {
+                    closing |= last;
                     if turn.active && turn.internal {
                         continue; // already rotating
                     }
@@ -366,7 +379,7 @@ where
                             });
                         }
                     }
-                    restart(&mut proc, &cfg, &home).await;
+                    restart(&mut proc, &cfg, &home, closing).await;
                     dirty = false;
                     eprintln!("fsc: new claude session");
                 }
@@ -381,7 +394,7 @@ where
                         emit(ClaudeEvent::TurnDone { ok: true, interrupted: true, error: None });
                     }
                     turn = Turn::default();
-                    restart(&mut proc, &cfg, &home).await;
+                    restart(&mut proc, &cfg, &home, closing).await;
                     dirty = false;
                     eprintln!("fsc: memory forgotten, new claude session");
                     emit(ClaudeEvent::Forgotten);
@@ -406,7 +419,7 @@ where
                         }
                     };
                     if !saving {
-                        restart(&mut proc, &cfg, &home).await;
+                        restart(&mut proc, &cfg, &home, closing).await;
                         dirty = false;
                         for text in queued.drain(..) {
                             ask(&mut proc, &mut turn, &mut dirty, &cfg, &home, &text, &emit).await;

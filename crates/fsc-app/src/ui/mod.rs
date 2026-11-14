@@ -60,6 +60,24 @@ struct Exchange {
     /// The most recent "⚙ TOOL" line, so a permission card for the same
     /// tool can replace it instead of repeating it.
     last_tool: Option<(String, gtk::Label)>,
+    /// `text` has grown since it was last put in `reply`. Streamed text is
+    /// shown at most once per main-loop pass rather than on every chunk,
+    /// since each `set_text` lays out the whole reply again.
+    stale: bool,
+}
+
+impl Exchange {
+    fn new(reply: gtk::Label) -> Self {
+        Self { reply, text: String::new(), last_tool: None, stale: false }
+    }
+
+    /// Bring the label up to date with `text`.
+    fn show(&mut self) {
+        if std::mem::take(&mut self.stale) {
+            self.reply.set_text(self.text.trim_start());
+            self.reply.set_visible(true);
+        }
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -561,8 +579,7 @@ impl Ui {
                 st.viz.kick(0.25 + t.len() as f32 * 0.03);
                 if let Some(cur) = st.current.as_mut() {
                     cur.text.push_str(&t);
-                    cur.reply.set_text(cur.text.trim_start());
-                    cur.reply.set_visible(true);
+                    cur.stale = true;
                 }
                 let ready = if speak { st.sentences.push(&t) } else { Vec::new() };
                 drop(st);
@@ -597,7 +614,9 @@ impl Ui {
                     let mut st = self.st.borrow_mut();
                     let rest = if ok && !interrupted { st.sentences.flush() } else { None };
                     st.sentences.clear();
-                    (st.current.take(), rest)
+                    let mut cur = st.current.take();
+                    cur.iter_mut().for_each(Exchange::show);
+                    (cur, rest)
                 };
                 if let Some(rest) = rest
                     && self.should_speak()
@@ -795,7 +814,10 @@ impl Ui {
 
         {
             let mut st = self.st.borrow_mut();
-            st.current = Some(Exchange { reply, text: String::new(), last_tool: None });
+            if let Some(old) = st.current.as_mut() {
+                old.show();
+            }
+            st.current = Some(Exchange::new(reply));
             st.voice_turn = voice;
             st.sentences.clear();
         }
@@ -826,16 +848,20 @@ impl Ui {
     /// End the Claude session (saving memory) and mark it in the history.
     fn rotate_session(&self) {
         eprintln!("fsc: session idle, rotating");
-        self.end_session();
+        self.end_session(false);
         self.add_divider("NEW SESSION");
     }
 
-    /// Ask for a fresh Claude session, saving memory from this one if it had
-    /// any exchanges.
-    fn end_session(&self) {
+    /// End the Claude session, saving memory from it if it had any
+    /// exchanges. A fresh session is started unless `quitting`.
+    fn end_session(&self, quitting: bool) {
         let mut st = self.st.borrow_mut();
         let save = st.session_dirty;
-        self.claude.rotate(save);
+        if quitting {
+            self.claude.end(save);
+        } else {
+            self.claude.rotate(save);
+        }
         st.memory_saving |= save && self.cfg.claude.memory;
         st.session_dirty = false;
         st.last_activity = None;
@@ -865,19 +891,19 @@ impl Ui {
     /// Quit, saving memory first if this session had any exchanges (or
     /// waiting for a save already under way).
     fn quit(self: &Rc<Self>) {
-        let (wait, dirty) = {
+        let wait = {
             let mut st = self.st.borrow_mut();
             let wait = self.cfg.claude.memory && (st.session_dirty || st.memory_saving) && !st.quitting;
             st.quitting = true;
-            (wait, st.session_dirty)
+            wait
         };
         if !wait {
             self.app.quit();
             return;
         }
-        if dirty {
-            self.end_session();
-        }
+        // Also when a save is already running (from an idle rotation), so
+        // no new session is started after it.
+        self.end_session(true);
         self.flash_meta_for("SAVING MEMORY…", Duration::from_secs(30));
         // Don't hang forever if the save stalls.
         let app = self.app.clone();
@@ -1057,7 +1083,7 @@ impl Ui {
     fn new_conversation(self: &Rc<Self>) {
         self.cancel_listen();
         self.audio.stop_speaking();
-        self.end_session();
+        self.end_session(false);
         while let Some(child) = self.history.first_child() {
             self.history.remove(&child);
         }
@@ -1408,6 +1434,8 @@ impl Ui {
         }
     }
 
+    /// On the next idle pass, show any streamed reply text and scroll to the
+    /// bottom. Repeated calls before then share that one pass.
     fn scroll_to_end(self: &Rc<Self>) {
         if self.scroll_pending.replace(true) {
             return;
@@ -1416,6 +1444,9 @@ impl Ui {
         glib::idle_add_local_once(move || {
             if let Some(ui) = weak.upgrade() {
                 ui.scroll_pending.set(false);
+                if let Some(cur) = ui.st.borrow_mut().current.as_mut() {
+                    cur.show();
+                }
                 let adj = ui.scroller.vadjustment();
                 adj.set_value(adj.upper() - adj.page_size());
             }

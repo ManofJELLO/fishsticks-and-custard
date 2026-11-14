@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, Device, Stream, StreamConfig};
+use cpal::{BufferSize, Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -43,16 +43,61 @@ impl Resampler {
         Self { step: from as f64 / to as f64, pos: 0.0, last: 0.0 }
     }
 
-    pub(crate) fn push(&mut self, input: &[f32], out: &mut Vec<f32>) {
+    pub(crate) fn push(&mut self, input: &[f32], out: &mut impl Extend<f32>) {
         for &s in input {
             while self.pos < 1.0 {
-                out.push(self.last + (s - self.last) * self.pos as f32);
+                out.extend([self.last + (s - self.last) * self.pos as f32]);
                 self.pos += self.step;
             }
             self.pos -= 1.0;
             self.last = s;
         }
     }
+}
+
+/// Call `$f::<T>(args)` with `T` the Rust type of sample format `$fmt`.
+macro_rules! with_sample_type {
+    ($fmt:expr, $f:ident($($arg:expr),*)) => {
+        match $fmt {
+            SampleFormat::I8 => $f::<i8>($($arg),*),
+            SampleFormat::I16 => $f::<i16>($($arg),*),
+            SampleFormat::I24 => $f::<cpal::I24>($($arg),*),
+            SampleFormat::I32 => $f::<i32>($($arg),*),
+            SampleFormat::I64 => $f::<i64>($($arg),*),
+            SampleFormat::U8 => $f::<u8>($($arg),*),
+            SampleFormat::U16 => $f::<u16>($($arg),*),
+            SampleFormat::U24 => $f::<cpal::U24>($($arg),*),
+            SampleFormat::U32 => $f::<u32>($($arg),*),
+            SampleFormat::U64 => $f::<u64>($($arg),*),
+            SampleFormat::F32 => $f::<f32>($($arg),*),
+            SampleFormat::F64 => $f::<f64>($($arg),*),
+            other => Err(anyhow!("unsupported sample format {other:?}")),
+        }
+    };
+}
+
+/// Capture in the device's own format, mixing to mono and resampling here.
+fn mic_fallback<T>(dev: &Device, def: &SupportedStreamConfig, sink: Arc<Mutex<Vec<f32>>>) -> Result<Stream>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    let ch = def.channels() as usize;
+    let mut rs = Resampler::new(def.sample_rate(), MIC_RATE);
+    let mut mono = Vec::new();
+    let mut out = Vec::new();
+    Ok(dev.build_input_stream::<T, _, _>(
+        def.config(),
+        move |data: &[T], _| {
+            mono.clear();
+            mono.extend(data.chunks(ch).map(|f| f.iter().map(|&s| f32::from_sample(s)).sum::<f32>() / ch as f32));
+            out.clear();
+            rs.push(&mono, &mut out);
+            sink.lock().unwrap().extend_from_slice(&out);
+        },
+        |e| eprintln!("fsc: mic error: {e}"),
+        None,
+    )?)
 }
 
 /// An open microphone. Captured 16 kHz mono samples accumulate in `buf`.
@@ -81,23 +126,7 @@ impl Mic {
             Err(e) => {
                 eprintln!("fsc: mic refused 16 kHz mono ({e}); converting locally");
                 let def = dev.default_input_config().context("mic default config")?;
-                let ch = def.channels() as usize;
-                let mut rs = Resampler::new(def.sample_rate(), MIC_RATE);
-                let sink = buf.clone();
-                let mut mono = Vec::new();
-                let mut out = Vec::new();
-                dev.build_input_stream::<f32, _, _>(
-                    def.config(),
-                    move |data: &[f32], _| {
-                        mono.clear();
-                        mono.extend(data.chunks(ch).map(|f| f.iter().sum::<f32>() / ch as f32));
-                        out.clear();
-                        rs.push(&mono, &mut out);
-                        sink.lock().unwrap().extend_from_slice(&out);
-                    },
-                    |e| eprintln!("fsc: mic error: {e}"),
-                    None,
-                )?
+                with_sample_type!(def.sample_format(), mic_fallback(&dev, &def, buf.clone()))?
             }
         };
         stream.play()?;
@@ -278,43 +307,85 @@ fn build_output(
         Err(e) => {
             eprintln!("fsc: output refused {rate} Hz stereo ({e}); converting locally");
             let def = dev.default_output_config().context("output default config")?;
-            let ch = def.channels() as usize;
-            let step = rate as f64 / def.sample_rate() as f64;
-            let shared = st.clone();
-            let alive = keep_alive.clone();
-            let mut seed = 0x1234_5678u32;
-            let (mut pos, mut cur, mut next) = (0.0f64, 0.0f32, 0.0f32);
-            dev.build_output_stream::<f32, _, _>(
-                def.config(),
-                move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
-                    let mut s = shared.lock().unwrap();
-                    let keep = alive.load(Ordering::Relaxed);
-                    let mut real = 0;
-                    for frame in out.chunks_mut(ch) {
-                        while pos >= 1.0 {
-                            cur = next;
-                            next = match s.queue.pop_front() {
-                                Some(v) => {
-                                    real += 1;
-                                    v
-                                }
-                                None if keep => dither(&mut seed),
-                                None => 0.0,
-                            };
-                            s.recent.push_back(next);
-                            pos -= 1.0;
-                        }
-                        let v = cur + (next - cur) * pos as f32;
-                        frame.iter_mut().for_each(|o| *o = v);
-                        pos += step;
-                    }
-                    s.played(info, real, rate);
-                },
-                on_err,
-                None,
-            )?
+            with_sample_type!(def.sample_format(), output_fallback(&dev, &def, rate, st.clone(), keep_alive.clone(), on_err))?
         }
     };
     stream.play()?;
     Ok(stream)
+}
+
+/// Play in the device's own format and rate, converting here.
+fn output_fallback<T>(
+    dev: &Device,
+    def: &SupportedStreamConfig,
+    rate: u32,
+    shared: Arc<Mutex<PlayState>>,
+    alive: Arc<AtomicBool>,
+    on_err: impl FnMut(cpal::Error) + Send + 'static,
+) -> Result<Stream>
+where
+    T: SizedSample + FromSample<f32>,
+{
+    let ch = def.channels() as usize;
+    let mut rs = Resampler::new(rate, def.sample_rate());
+    // Resampled samples not yet played (at most a few).
+    let mut ready = VecDeque::new();
+    let mut seed = 0x1234_5678u32;
+    Ok(dev.build_output_stream::<T, _, _>(
+        def.config(),
+        move |out: &mut [T], info: &cpal::OutputCallbackInfo| {
+            let mut s = shared.lock().unwrap();
+            let keep = alive.load(Ordering::Relaxed);
+            let mut real = 0;
+            for frame in out.chunks_mut(ch) {
+                while ready.is_empty() {
+                    let v = match s.queue.pop_front() {
+                        Some(v) => {
+                            real += 1;
+                            v
+                        }
+                        None if keep => dither(&mut seed),
+                        None => 0.0,
+                    };
+                    s.recent.push_back(v);
+                    rs.push(&[v], &mut ready);
+                }
+                frame.fill(T::from_sample(ready.pop_front().unwrap_or(0.0)));
+            }
+            s.played(info, real, rate);
+        },
+        on_err,
+        None,
+    )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resampler_rates() {
+        let input: Vec<f32> = (0..2205).map(|i| i as f32).collect();
+        for (from, to) in [(22_050, 48_000), (48_000, 16_000), (16_000, 16_000)] {
+            let mut out = Vec::new();
+            Resampler::new(from, to).push(&input, &mut out);
+            let want = input.len() as f64 * to as f64 / from as f64;
+            assert!((out.len() as f64 - want).abs() <= 1.0, "{from}->{to}: {} vs {want}", out.len());
+            // A ramp stays a ramp: never decreasing.
+            assert!(out.windows(2).all(|w| w[1] >= w[0]));
+        }
+    }
+
+    #[test]
+    fn resampler_one_sample_at_a_time_matches_bulk() {
+        let input: Vec<f32> = (0..500).map(|i| (i as f32 * 0.1).sin()).collect();
+        let mut bulk = Vec::new();
+        Resampler::new(22_050, 44_100).push(&input, &mut bulk);
+        let mut rs = Resampler::new(22_050, 44_100);
+        let mut pulled = VecDeque::new();
+        for &s in &input {
+            rs.push(&[s], &mut pulled);
+        }
+        assert_eq!(bulk, Vec::from(pulled));
+    }
 }

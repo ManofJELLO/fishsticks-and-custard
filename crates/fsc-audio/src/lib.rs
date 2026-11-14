@@ -156,7 +156,7 @@ struct Listening {
     pending: Vec<f32>,
     speech_start: Option<usize>,
     last_speech: usize,
-    run: u32,
+    onset: Onset,
     started: Instant,
 }
 
@@ -198,7 +198,7 @@ struct WakeDetector {
     pending: Vec<f32>,
     /// The current speech segment, if one is in progress.
     seg: Option<Vec<f32>>,
-    run: u32,
+    onset: Onset,
     silence: usize,
     /// Early check said "not the wake phrase": ignore the rest of this segment.
     rejected: bool,
@@ -223,12 +223,7 @@ impl WakeDetector {
                     self.preroll.extend(&chunk);
                     let excess = self.preroll.len().saturating_sub(PREROLL);
                     self.preroll.drain(..excess);
-                    if p >= VAD_ON {
-                        self.run += 1;
-                    } else if p < VAD_OFF {
-                        self.run = 0;
-                    }
-                    if self.run >= 3 {
+                    if self.onset.step(p) {
                         self.seg = Some(self.preroll.drain(..).collect());
                         self.silence = 0;
                         self.rejected = false;
@@ -246,7 +241,7 @@ impl WakeDetector {
                     }
                     if self.silence >= end_silence || seg.len() >= max_len {
                         let seg = self.seg.take().unwrap_or_default();
-                        self.run = 0;
+                        self.onset.reset();
                         if !self.rejected {
                             return Some(Segment::Done(seg));
                         }
@@ -338,6 +333,32 @@ const SPECTRUM_EVERY: Duration = Duration::from_millis(33);
 const MIC_START_TIMEOUT: Duration = Duration::from_secs(12);
 const VAD_ON: f32 = 0.5;
 const VAD_OFF: f32 = 0.35;
+/// Speechy chunks in a row (a dip between `VAD_OFF` and `VAD_ON` doesn't
+/// break the run) before speech counts as started.
+const ONSET_CHUNKS: u32 = 3;
+
+/// Decides when speech starts, from per-chunk VAD probabilities.
+#[derive(Default)]
+struct Onset {
+    run: u32,
+}
+
+impl Onset {
+    /// Feed one chunk's probability; true while a run of speech is long
+    /// enough to count.
+    fn step(&mut self, p: f32) -> bool {
+        if p >= VAD_ON {
+            self.run += 1;
+        } else if p < VAD_OFF {
+            self.run = 0;
+        }
+        self.run >= ONSET_CHUNKS
+    }
+
+    fn reset(&mut self) {
+        self.run = 0;
+    }
+}
 const PAD: usize = (MIC_RATE as usize * 3) / 10; // 300 ms either side of speech
 
 impl<F: Fn(AudioEvent)> Engine<F> {
@@ -470,7 +491,7 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                             pending: Vec::new(),
                             speech_start: None,
                             last_speech: 0,
-                            run: 0,
+                            onset: Onset::default(),
                             started: Instant::now(),
                         });
                         (self.emit)(if reused { AudioEvent::MicLive } else { AudioEvent::MicWaiting });
@@ -548,15 +569,13 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             let chunk: Vec<f32> = l.pending.drain(..CHUNK).collect();
             let end = l.pcm.len() - l.pending.len();
             let p = vad.prob(&chunk).unwrap_or(0.0);
+            let started = l.onset.step(p);
             if p >= VAD_ON {
-                l.run += 1;
-                if l.run >= 3 && l.speech_start.is_none() {
-                    l.speech_start = Some(end.saturating_sub(3 * CHUNK));
+                if started && l.speech_start.is_none() {
+                    l.speech_start = Some(end.saturating_sub(ONSET_CHUNKS as usize * CHUNK));
                     (self.emit)(AudioEvent::SpeechStarted);
                 }
                 l.last_speech = end;
-            } else if p < VAD_OFF {
-                l.run = 0;
             }
         }
 
@@ -957,4 +976,23 @@ pub fn self_test(cfg: &VoiceConfig) -> anyhow::Result<()> {
         println!("wake     {:.2}s  {heard:?} -> {verdict}", t.elapsed().as_secs_f32());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn onset_needs_a_run_and_tolerates_dips() {
+        let mut o = Onset::default();
+        assert!(!o.step(0.9));
+        assert!(!o.step(0.9));
+        assert!(!o.step(0.4)); // between OFF and ON: neither counts nor resets
+        assert!(o.step(0.9));
+        assert!(o.step(0.4));
+        assert!(!o.step(0.1)); // below OFF resets
+        assert!(!o.step(0.9));
+        o.reset();
+        assert!(!o.step(0.9));
+    }
 }

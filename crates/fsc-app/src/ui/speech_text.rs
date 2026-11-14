@@ -17,12 +17,35 @@ pub struct SentenceBuffer {
     buf: String,
     /// Inside a ``` block: its lines are skipped.
     in_code: bool,
+    /// How far `boundary` has looked without finding one, so each push
+    /// only scans the new text.
+    scan: Scan,
+}
+
+/// Progress of the sentence-boundary scan through `buf`.
+#[derive(Default, Clone, Copy)]
+struct Scan {
+    /// Byte offset of the next character to look at.
+    pos: usize,
+    prev: Option<char>,
+    /// Characters since the first non-whitespace one.
+    chars: usize,
+    /// Byte range from the first to the end of the last non-whitespace character.
+    first: Option<usize>,
+    last_end: usize,
 }
 
 impl SentenceBuffer {
     pub fn clear(&mut self) {
         self.buf.clear();
         self.in_code = false;
+        self.scan = Scan::default();
+    }
+
+    /// Remove and return the first `end` bytes.
+    fn take(&mut self, end: usize) -> String {
+        self.scan = Scan::default();
+        self.buf.drain(..end).collect()
     }
 
     /// Add streamed text; returns any sentences that are now complete.
@@ -34,7 +57,7 @@ impl SentenceBuffer {
             if self.in_code || "```".starts_with(head) || head.starts_with("```") {
                 // Code fences work a whole line at a time.
                 let Some(nl) = self.buf.find('\n') else { break };
-                let line: String = self.buf.drain(..=nl).collect();
+                let line = self.take(nl + 1);
                 let fence = line.trim_start().starts_with("```");
                 if fence && !self.in_code {
                     out.push(CODE_BLOCK.to_string());
@@ -48,7 +71,7 @@ impl SentenceBuffer {
                 continue;
             }
             let Some(end) = self.boundary() else { break };
-            let s: String = self.buf.drain(..end).collect();
+            let s = self.take(end);
             if let Some(s) = speakable(&s) {
                 out.push(s);
             }
@@ -60,27 +83,43 @@ impl SentenceBuffer {
     pub fn flush(&mut self) -> Option<String> {
         let s = std::mem::take(&mut self.buf);
         let in_code = std::mem::take(&mut self.in_code);
+        self.scan = Scan::default();
         if in_code || s.trim_start().starts_with("```") { None } else { speakable(&s) }
     }
 
     /// Byte index just past a sentence end: `.`/`!`/`?` followed by
     /// whitespace (so "3.5" and "e.g.x" don't split), or a newline.
-    fn boundary(&self) -> Option<usize> {
-        let mut prev: Option<(usize, char)> = None;
-        for (i, c) in self.buf.char_indices() {
-            if c == '\n' && self.buf[..i].trim().len() >= 2 {
-                return Some(i + 1);
+    /// The text before each position never changes, so a position that
+    /// wasn't a boundary never becomes one: the scan resumes where it stopped.
+    fn boundary(&mut self) -> Option<usize> {
+        let mut sc = self.scan;
+        let mut found = None;
+        for (off, c) in self.buf[sc.pos..].char_indices() {
+            let i = sc.pos + off;
+            // `sc` describes buf[..i]; its trimmed length is last_end - first.
+            let trimmed = sc.first.map_or(0, |f| sc.last_end - f);
+            if c == '\n' && trimmed >= 2 {
+                found = Some(i + 1);
+                break;
             }
-            if let Some((_, p)) = prev
-                && matches!(p, '.' | '!' | '?')
-                && c.is_whitespace()
-                && self.buf[..i].trim().chars().count() >= MIN_CHUNK
-            {
-                return Some(i + c.len_utf8());
+            if matches!(sc.prev, Some('.' | '!' | '?')) && c.is_whitespace() && sc.chars >= MIN_CHUNK {
+                found = Some(i + c.len_utf8());
+                break;
             }
-            prev = Some((i, c));
+            if !c.is_whitespace() {
+                sc.first.get_or_insert(i);
+                sc.last_end = i + c.len_utf8();
+            }
+            if sc.first.is_some() {
+                sc.chars += 1;
+            }
+            sc.prev = Some(c);
         }
-        None
+        if found.is_none() {
+            sc.pos = self.buf.len();
+            self.scan = sc;
+        }
+        found
     }
 }
 
@@ -269,6 +308,51 @@ mod tests {
             all("Run `find / -name '*.pacnew' -newer /etc/pacman.conf 2>/dev/null` now."),
             vec![format!("Run {LONG_CODE} now.")]
         );
+    }
+
+    /// The original whole-buffer scan, as a reference for the resuming one.
+    fn naive_boundary(buf: &str) -> Option<usize> {
+        let mut prev: Option<char> = None;
+        for (i, c) in buf.char_indices() {
+            if c == '\n' && buf[..i].trim().len() >= 2 {
+                return Some(i + 1);
+            }
+            if matches!(prev, Some('.' | '!' | '?')) && c.is_whitespace() && buf[..i].trim().chars().count() >= MIN_CHUNK {
+                return Some(i + c.len_utf8());
+            }
+            prev = Some(c);
+        }
+        None
+    }
+
+    #[test]
+    fn resumed_scan_matches_full_rescan() {
+        let texts = [
+            "  Héllo wörld, this is a test. Short. And another sentence here!  Then more?\n\nNext line\n",
+            "a\n \n  ab\nYes. No. Maybe so, but that's long enough now. x",
+            "Ünïcödé façade résumé naïve. Ünïcödé façade résumé naïve. 3.5 e.g.x ok. ",
+        ];
+        for text in texts {
+            for step in [1, 2, 3, 7, 1000] {
+                let mut b = SentenceBuffer::default();
+                let mut got = Vec::new();
+                let mut want = Vec::new();
+                let mut reference = String::new();
+                let chars: Vec<char> = text.chars().collect();
+                for piece in chars.chunks(step) {
+                    let piece: String = piece.iter().collect();
+                    b.buf.push_str(&piece);
+                    reference.push_str(&piece);
+                    while let Some(end) = b.boundary() {
+                        got.push(b.take(end));
+                    }
+                    while let Some(end) = naive_boundary(&reference) {
+                        want.push(reference.drain(..end).collect::<String>());
+                    }
+                }
+                assert_eq!(got, want, "step {step}: {text:?}");
+            }
+        }
     }
 
     #[test]
