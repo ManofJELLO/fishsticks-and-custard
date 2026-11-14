@@ -66,12 +66,23 @@ jobs:
         shell: bash
         run: |
           cd packaging/arch
-          build() { sudo -u builder env CMAKE_BUILD_PARALLEL_LEVEL=4 makepkg --noconfirm --sign --key "$FPR" "$@"; }
-          # whisper.cpp's parallel Vulkan shader build occasionally races and the
-          # link fails on missing *_cm1 shader symbols (seen in v0.6.1; a re-run
-          # passed). Retry once from a clean source tree (-C) so the broken cmake
-          # output isn't reused.
-          build || { echo "::warning::build failed; retrying once from clean"; build -C -f; }
+          # $1: how many cmake jobs (whisper.cpp shader generators) run at once.
+          build() { local jobs=$1; shift; sudo -u builder env CMAKE_BUILD_PARALLEL_LEVEL="$jobs" makepkg --noconfirm --sign --key "$FPR" "$@"; }
+          # whisper.cpp's Vulkan shader generator silently drops any shader whose
+          # glslc run prints to stderr, and the link then fails on missing *_cm1
+          # symbols (v0.6.1, v0.6.4, v0.6.5). It's intermittent, most likely glslc
+          # failing under load, since each generator runs several glslc at once.
+          # So: fewer generators at a time, and on failure show what glslc said,
+          # then retry from a clean tree (-C) with one generator at a time.
+          shader_errors() {
+            grep -h -A15 "cannot compile\|Error executing command" \
+              src/*/target/release/build/whisper-rs-sys-*/{output,stderr} 2>/dev/null | head -80 || true
+          }
+          build 2 || {
+            echo "::warning::build failed; shader generator errors follow, then a clean serial retry"
+            shader_errors
+            build 1 -C -f
+          }
           ls -l *.pkg.tar.zst*
 
       - name: Build repository database
