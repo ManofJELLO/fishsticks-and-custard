@@ -2,7 +2,8 @@
 //! sizes the tray asks for. Two shapes: a police box (default) or a
 //! fishbone at 45°.
 //!
-//! - white on dark themes, black on light themes
+//! - police box: blue with white lamp and windows, on any theme
+//! - fishbone: white on dark themes, black on light themes
 //! - recording: a red dot in the bottom-right corner, cut out of the shape
 //! - muted: dimmed
 
@@ -42,13 +43,13 @@ pub fn render(size: u32, st: &IconState) -> Pixmap {
         ThemeMode::Dark => [255u8, 255, 255],
         ThemeMode::Light => [18, 18, 18],
     };
-    let alpha: u8 = if st.muted { 110 } else { 255 };
+    let alpha: u8 = if st.muted { 150 } else { 255 };
     let mut paint = Paint::default();
     paint.set_color_rgba8(fg[0], fg[1], fg[2], alpha);
     paint.anti_alias = true;
 
     match st.shape {
-        TrayIcon::PoliceBox => police_box(&mut pm, &paint, t),
+        TrayIcon::PoliceBox => police_box(&mut pm, alpha, t, size),
         TrayIcon::Fishbone => fishbone(&mut pm, &paint, t, size),
     }
 
@@ -75,63 +76,58 @@ fn fill_circle(pm: &mut Pixmap, paint: &Paint, t: Transform, c: (f32, f32), r: f
     }
 }
 
-/// A plain police-box silhouette: lamp, stepped roof, sign band, two door
-/// windows, a centre seam and a plinth. Openings are cut out (even-odd).
-fn police_box(pm: &mut Pixmap, paint: &Paint, t: Transform) {
-    let mut pb = PathBuilder::new();
-    // Outline, clockwise from the lamp.
-    for (i, &(x, y)) in [
-        (14.6, 1.5),
-        (17.4, 1.5),
-        (17.4, 4.5),
-        (21.5, 4.5),
-        (21.5, 6.2),
-        (23.0, 6.2),
-        (23.0, 8.0),
-        (22.3, 8.0),
-        (22.3, 28.0),
-        (23.4, 28.0),
-        (23.4, 30.5),
-        (8.6, 30.5),
-        (8.6, 28.0),
-        (9.7, 28.0),
-        (9.7, 8.0),
-        (9.0, 8.0),
-        (9.0, 6.2),
-        (10.5, 6.2),
-        (10.5, 4.5),
-        (14.6, 4.5),
-    ]
-    .iter()
-    .enumerate()
-    {
-        if i == 0 {
-            pb.move_to(x, y);
-        } else {
-            pb.line_to(x, y);
+/// Police-box colours: blue body, white lamp and windows, dark sign band.
+const BOX_BLUE: [u8; 3] = [0x2c, 0x5a, 0xa0];
+const BOX_DARK: [u8; 3] = [0x12, 0x26, 0x4a];
+const BOX_WHITE: [u8; 3] = [0xf4, 0xf6, 0xfa];
+
+/// A police box in blue with white lamp and windows: lamp, stepped roof,
+/// dark sign band, two door windows, a centre seam and a plinth. Its own
+/// colours read on light and dark bars alike, so it ignores the theme.
+fn police_box(pm: &mut Pixmap, alpha: u8, t: Transform, size: u32) {
+    let paint = |rgb: [u8; 3]| {
+        let mut p = Paint::default();
+        p.set_color_rgba8(rgb[0], rgb[1], rgb[2], alpha);
+        p.anti_alias = true;
+        p
+    };
+    let fill_rects = |pm: &mut Pixmap, rgb: [u8; 3], rects: &[(f32, f32, f32, f32)]| {
+        let mut pb = PathBuilder::new();
+        for r in rects.iter().filter_map(|&(l, t, r, b)| Rect::from_ltrb(l, t, r, b)) {
+            pb.push_rect(r);
         }
-    }
-    pb.close();
-    // Openings: the sign slit, a window per door, and the seam between doors.
-    for r in [
-        Rect::from_ltrb(11.2, 9.3, 20.8, 10.9),
-        Rect::from_ltrb(11.2, 12.6, 15.2, 16.8),
-        Rect::from_ltrb(16.8, 12.6, 20.8, 16.8),
-        Rect::from_ltrb(15.4, 18.4, 16.6, 28.0),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        pb.push_rect(r);
-    }
-    // Drawn a touch narrow; widen it around the centre line.
-    let t = t.pre_concat(
-        Transform::from_translate(16.0, 0.0)
-            .pre_scale(1.15, 1.0)
-            .pre_translate(-16.0, 0.0),
+        if let Some(path) = pb.finish() {
+            pm.fill_path(&path, &paint(rgb), FillRule::Winding, t, None);
+        }
+    };
+
+    // Lamp (white) on a small blue cap.
+    fill_rects(pm, BOX_WHITE, &[(14.4, 1.0, 17.6, 3.8)]);
+    // Roof tiers, body and plinth: one solid blue block, wider than tall-and-thin.
+    fill_rects(
+        pm,
+        BOX_BLUE,
+        &[
+            (13.6, 3.6, 18.4, 4.8), // lamp cap
+            (9.6, 4.6, 22.4, 6.4),  // upper roof
+            (7.8, 6.2, 24.2, 8.2),  // lower roof
+            (8.8, 8.0, 23.2, 28.4), // body
+            (7.2, 28.2, 24.8, 31.0), // plinth
+        ],
     );
-    if let Some(path) = pb.finish() {
-        pm.fill_path(&path, paint, FillRule::EvenOdd, t, None);
+    // Sign band across the top and the seam between the doors.
+    fill_rects(pm, BOX_DARK, &[(9.8, 9.0, 22.2, 11.0), (15.4, 18.2, 16.6, 27.6)]);
+    // Door windows; split into panes once there are enough pixels for it.
+    let windows = [(10.4, 12.4, 15.0, 16.8), (17.0, 12.4, 21.6, 16.8)];
+    fill_rects(pm, BOX_WHITE, &windows);
+    if size >= 32 {
+        let mut bars = Vec::new();
+        for (l, t, r, b) in windows {
+            let (cx, cy) = ((l + r) / 2.0, (t + b) / 2.0);
+            bars.push((cx - 0.4, t, cx + 0.4, b));
+            bars.push((l, cy - 0.4, r, cy + 0.4));
+        }
+        fill_rects(pm, BOX_BLUE, &bars);
     }
 }
 

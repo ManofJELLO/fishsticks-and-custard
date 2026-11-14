@@ -204,7 +204,7 @@ talk shortcut does the same.
 - **Visualiser:** chunky LED-segment bars rising from the bottom, like an old car-stereo
   spectrum analyser (`ui.visualiser = "spectrum"`, `ui.bands`, `ui.block_percent`), or a
   scrolling loudness history (`"loudness"`). Red while listening, white for replies.
-- **Tray icon:** a police box (`ui.tray_icon = "police-box"`) or a fishbone at 45°
+- **Tray icon:** a blue police box with white windows (`ui.tray_icon = "police-box"`) or a fishbone at 45°
   (`"fishbone"`). A red dot in the corner means the mic is recording.
 - **Colour:** the accent marks state only: listening, permission questions. Errors use
   the theme's error colour.
