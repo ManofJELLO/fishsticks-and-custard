@@ -66,7 +66,12 @@ jobs:
         shell: bash
         run: |
           cd packaging/arch
-          sudo -u builder env CMAKE_BUILD_PARALLEL_LEVEL=4 makepkg --noconfirm --sign --key "$FPR"
+          build() { sudo -u builder env CMAKE_BUILD_PARALLEL_LEVEL=4 makepkg --noconfirm --sign --key "$FPR" "$@"; }
+          # whisper.cpp's parallel Vulkan shader build occasionally races and the
+          # link fails on missing *_cm1 shader symbols (seen in v0.6.1; a re-run
+          # passed). Retry once from a clean source tree (-C) so the broken cmake
+          # output isn't reused.
+          build || { echo "::warning::build failed; retrying once from clean"; build -C -f; }
           ls -l *.pkg.tar.zst*
 
       - name: Build repository database
