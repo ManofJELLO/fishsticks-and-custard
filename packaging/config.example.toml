@@ -39,7 +39,7 @@ piper_voice = "en_GB-alan-medium"        # any voice from huggingface.co/rhasspy
 speech_rate = 1.0
 speak = "voice"                          # speak replies to spoken prompts: "voice", "always", "never"
 input_device = ""                        # substring of the mic name; empty = system default
-end_silence_ms = 800                     # pause that ends an utterance
+end_silence_ms = 1500                    # pause that ends an utterance; raise it if you get cut off mid-thought
 no_speech_timeout_ms = 6000
 max_utterance_secs = 30
 hold_mic_while_speaking = true           # needed for Bluetooth headsets

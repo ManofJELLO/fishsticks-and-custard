@@ -68,7 +68,7 @@ impl Default for VoiceConfig {
             speech_rate: 1.0,
             speak: SpeakMode::Voice,
             input_device: String::new(),
-            end_silence_ms: 800,
+            end_silence_ms: 1500,
             no_speech_timeout_ms: 6000,
             max_utterance_secs: 30,
             hold_mic_while_speaking: true,
