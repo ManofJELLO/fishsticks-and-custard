@@ -32,10 +32,7 @@
     "deny": [
       "Bash(sudo:*)",
       "Bash(rm:*)",
-      "Bash(hyprctl dispatch exit:*)",
-      "Edit",
-      "Write",
-      "NotebookEdit"
+      "Bash(hyprctl dispatch exit:*)"
     ]
   }
 }

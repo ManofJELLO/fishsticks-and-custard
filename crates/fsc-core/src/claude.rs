@@ -104,17 +104,57 @@ impl ClaudeHandle {
     }
 }
 
+/// Version of the seeded settings. Bump it with a step in `migrate_settings`
+/// when an existing home's `settings.local.json` needs changing.
+/// 1: Edit/Write/NotebookEdit denied. 2: they're asked about instead.
+const SETTINGS_VERSION: u32 = 2;
+const SETTINGS_VERSION_FILE: &str = ".claude/fsc-settings-version";
+
 /// Create the assistant's working directory with a default persona and
-/// tool allow-list. Existing files are never overwritten.
+/// tool allow-list. Existing files are never overwritten, but older seeded
+/// settings are migrated once (see `SETTINGS_VERSION`).
 pub fn ensure_home(home: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(home.join(".claude"))?;
-    for (rel, body) in [("persona.md", PERSONA), (".claude/settings.local.json", SETTINGS)] {
-        let p = home.join(rel);
-        if !p.exists() {
-            std::fs::write(p, body)?;
+    let settings = home.join(".claude/settings.local.json");
+    let version_file = home.join(SETTINGS_VERSION_FILE);
+    if settings.exists() {
+        // No version file: seeded before versions were tracked, i.e. version 1.
+        let from = std::fs::read_to_string(&version_file).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(1);
+        if from < SETTINGS_VERSION {
+            let text = std::fs::read_to_string(&settings)?;
+            match migrate_settings(&text, from) {
+                Some(new) => std::fs::write(&settings, new)?,
+                None => eprintln!("fsc: {} isn't valid JSON; left as it is", settings.display()),
+            }
         }
+    } else {
+        std::fs::write(&settings, SETTINGS)?;
+    }
+    if std::fs::read_to_string(&version_file).ok().as_deref().map(str::trim) != Some(&SETTINGS_VERSION.to_string()) {
+        std::fs::write(&version_file, format!("{SETTINGS_VERSION}\n"))?;
+    }
+    let persona = home.join("persona.md");
+    if !persona.exists() {
+        std::fs::write(persona, PERSONA)?;
     }
     Ok(())
+}
+
+/// Bring settings written for version `from` up to `SETTINGS_VERSION`,
+/// keeping everything the user (or ALWAYS answers) added. `None` if the file
+/// isn't a JSON object, so it's left alone.
+fn migrate_settings(text: &str, from: u32) -> Option<String> {
+    let mut v: Value = serde_json::from_str(text).ok()?;
+    v.as_object()?;
+    if from < 2 {
+        // File edits are asked about now rather than refused.
+        if let Some(deny) = v.pointer_mut("/permissions/deny").and_then(Value::as_array_mut) {
+            deny.retain(|r| !matches!(r.as_str(), Some("Edit" | "Write" | "NotebookEdit")));
+        }
+    }
+    let mut out = serde_json::to_string_pretty(&v).ok()?;
+    out.push('\n');
+    Some(out)
 }
 
 struct Proc {
@@ -653,6 +693,43 @@ pub fn pretty_tool(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_lets_file_edits_ask_and_keeps_user_rules() {
+        let old = r#"{"permissions":{"allow":["Read","Bash(git status:*)"],
+            "deny":["Bash(sudo:*)","Edit","Write","NotebookEdit"]},"model":"x"}"#;
+        let v: Value = serde_json::from_str(&migrate_settings(old, 1).unwrap()).unwrap();
+        assert_eq!(v["permissions"]["deny"], json!(["Bash(sudo:*)"]));
+        assert_eq!(v["permissions"]["allow"], json!(["Read", "Bash(git status:*)"]));
+        assert_eq!(v["model"], "x");
+        assert!(migrate_settings("not json", 1).is_none());
+        assert!(migrate_settings("[1]", 1).is_none());
+    }
+
+    #[test]
+    fn seeded_settings_match_current_version() {
+        let v: Value = serde_json::from_str(SETTINGS).unwrap();
+        let deny = v["permissions"]["deny"].as_array().unwrap();
+        assert!(!deny.iter().any(|r| r == "Edit" || r == "Write"));
+    }
+
+    #[test]
+    fn ensure_home_migrates_once() {
+        let home = std::env::temp_dir().join(format!("fsc-home-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let settings = home.join(".claude/settings.local.json");
+        std::fs::write(&settings, r#"{"permissions":{"deny":["Edit","Write"]}}"#).unwrap();
+        ensure_home(&home).unwrap();
+        let read = || serde_json::from_str::<Value>(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(read()["permissions"]["deny"], json!([]));
+        // A rule the user adds back afterwards stays.
+        std::fs::write(&settings, r#"{"permissions":{"deny":["Write"]}}"#).unwrap();
+        ensure_home(&home).unwrap();
+        assert_eq!(read()["permissions"]["deny"], json!(["Write"]));
+        assert!(home.join("persona.md").exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
 
     #[test]
     fn model_names() {

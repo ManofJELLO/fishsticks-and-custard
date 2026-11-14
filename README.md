@@ -124,7 +124,9 @@ show in rofi with `rofi -show drun -drun-show-actions`.
   on `allow` just runs, anything on `deny` never does, and anything else is asked about (see
   below). **ALWAYS** answers are added here. Run `fsc new` after editing it or the persona.
   (Local settings are used because Claude Code ignores a folder's shared `settings.json`
-  allow-list until you've trusted the folder interactively.)
+  allow-list until you've trusted the folder interactively.) File edits (`Edit`, `Write`)
+  are asked about. Versions before 0.6.4 denied them; updating removes those three deny rules
+  once, so add them back to `deny` if you'd rather it never edits files.
 - **Look and model:** `~/.config/fsc/config.toml` (see `packaging/config.example.toml`).
 - Preview the tray icons: `fscd --dump-icons /some/dir`.
 
