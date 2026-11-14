@@ -2,10 +2,15 @@
 
 use anyhow::{Context, Result, anyhow};
 use std::path::Path;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use std::sync::Mutex;
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
 
+/// Shared between the audio thread and wake-phrase transcriptions. One
+/// whisper state is reused for every run, which also means runs take turns
+/// (on the GPU they would anyway).
 pub struct Stt {
-    ctx: WhisperContext,
+    _ctx: WhisperContext,
+    state: Mutex<WhisperState>,
     language: String,
 }
 
@@ -18,12 +23,12 @@ impl Stt {
         let ctx = WhisperContext::new_with_params(path, params)
             .map_err(|e| anyhow!("{e}"))
             .with_context(|| format!("loading {}", path.display()))?;
-        Ok(Self { ctx, language: language.to_string() })
+        let state = ctx.create_state().map_err(|e| anyhow!("{e}"))?;
+        Ok(Self { _ctx: ctx, state: Mutex::new(state), language: language.to_string() })
     }
 
     /// `pcm`: mono f32 at 16 kHz.
     pub fn transcribe(&self, pcm: &[f32]) -> Result<String> {
-        let mut state = self.ctx.create_state().map_err(|e| anyhow!("{e}"))?;
         let mut p = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         let lang = (self.language != "auto").then_some(self.language.as_str());
         p.set_language(lang);
@@ -44,6 +49,7 @@ impl Stt {
         if audio.len() < 16_000 + 1_600 {
             audio.resize(16_000 + 1_600, 0.0);
         }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.full(p, &audio).map_err(|e| anyhow!("{e}"))?;
 
         let mut text = String::new();

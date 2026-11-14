@@ -266,11 +266,22 @@ impl Config {
     }
 
     pub fn claude_home(&self) -> PathBuf {
-        self.claude.home.clone().unwrap_or_else(|| {
-            directories::BaseDirs::new()
+        let base = directories::BaseDirs::new();
+        match &self.claude.home {
+            Some(p) => expand_tilde(p, base.as_ref().map(|d| d.home_dir())),
+            None => base
                 .map(|d| d.data_dir().join("fsc").join("home"))
-                .unwrap_or_else(|| PathBuf::from(".fsc-home"))
-        })
+                .unwrap_or_else(|| PathBuf::from(".fsc-home")),
+        }
+    }
+}
+
+/// "~" or "~/x" -> under the home directory, as a shell would. TOML has no
+/// such expansion, but config paths are naturally written that way.
+fn expand_tilde(p: &std::path::Path, home: Option<&std::path::Path>) -> PathBuf {
+    match (p.strip_prefix("~"), home) {
+        (Ok(rest), Some(home)) => home.join(rest),
+        _ => p.to_path_buf(),
     }
 }
 
@@ -287,5 +298,15 @@ mod tests {
         let c: Config = toml::from_str("[ui]\nsurface = \"layer\"\nanchor = \"bottom-right\"\n").unwrap();
         assert_eq!((c.ui.surface, c.ui.anchor), (Surface::Layer, Anchor::BottomRight));
         assert_eq!(c.ui.anchor.edges(), (false, true, false, true));
+    }
+
+    #[test]
+    fn tilde_paths() {
+        let home = std::path::Path::new("/home/u");
+        let t = |p: &str| expand_tilde(std::path::Path::new(p), Some(home));
+        assert_eq!(t("~/.local/share/fsc/home"), PathBuf::from("/home/u/.local/share/fsc/home"));
+        assert_eq!(t("~"), PathBuf::from("/home/u"));
+        assert_eq!(t("/srv/fsc"), PathBuf::from("/srv/fsc"));
+        assert_eq!(t("~other/x"), PathBuf::from("~other/x"));
     }
 }

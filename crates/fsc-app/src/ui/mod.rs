@@ -692,8 +692,9 @@ impl Ui {
             }
             AudioEvent::MicWaiting => self.flash_meta_for("WAITING FOR MIC…", Duration::from_secs(15)),
             AudioEvent::MicLive => {
-                if !self.st.borrow().asks.is_empty() {
-                    self.flash_meta_for("SAY YES, ALWAYS OR NO", Duration::from_secs(8));
+                let open = self.st.borrow().asks.first().map(|a| a.ask.can_always);
+                if let Some(can_always) = open {
+                    self.flash_meta_for(choices(can_always).1, Duration::from_secs(8));
                 } else if self.st.borrow().follow_up {
                     self.flash_meta_for("GO AHEAD · ESC ENDS CONVERSATION", Duration::from_secs(5));
                 } else {
@@ -1202,7 +1203,7 @@ impl Ui {
             if let Some(rest) = rest {
                 self.speak(rest);
             }
-            self.speak(format!("{} Yes, always, or no?", ask.spoken));
+            self.speak(format!("{} {}", ask.spoken, choices(ask.can_always).0));
         }
         self.maybe_follow_up();
     }
@@ -1218,9 +1219,11 @@ impl Ui {
             st.answer_tries
         };
         if tries < MAX_ANSWER_TRIES {
-            self.flash_meta("SAY YES, ALWAYS OR NO");
+            let can_always = self.st.borrow().asks.iter().find(|a| a.ask.id == id).is_some_and(|a| a.ask.can_always);
+            let (spoken, meta) = choices(can_always);
+            self.flash_meta(meta);
             if !text.trim().is_empty() && self.should_speak() {
-                self.speak("Sorry. Yes, always, or no?".into());
+                self.speak(format!("Sorry. {spoken}"));
             }
             self.maybe_follow_up();
         } else {
@@ -1229,6 +1232,9 @@ impl Ui {
     }
 
     fn answer_ask(self: &Rc<Self>, id: &str, answer: Answer) {
+        // Nothing can be saved for this request: an "always" is a plain allow.
+        let can_always = self.st.borrow().asks.iter().find(|a| a.ask.id == id).is_some_and(|a| a.ask.can_always);
+        let answer = if answer == Answer::Always && !can_always { Answer::Once } else { answer };
         self.claude.answer(id, answer);
         let note = match answer {
             Answer::Once => "✓ ALLOWED",
@@ -1489,4 +1495,10 @@ fn notify(text: &str) {
             .status()
             .await;
     });
+}
+
+/// How to ask for an answer: (spoken, status line). "Always" is only offered
+/// when the request comes with a rule that can be saved.
+fn choices(can_always: bool) -> (&'static str, &'static str) {
+    if can_always { ("Yes, always, or no?", "SAY YES, ALWAYS OR NO") } else { ("Yes or no?", "SAY YES OR NO") }
 }

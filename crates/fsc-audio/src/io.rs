@@ -77,7 +77,12 @@ macro_rules! with_sample_type {
 }
 
 /// Capture in the device's own format, mixing to mono and resampling here.
-fn mic_fallback<T>(dev: &Device, def: &SupportedStreamConfig, sink: Arc<Mutex<Vec<f32>>>) -> Result<Stream>
+fn mic_fallback<T>(
+    dev: &Device,
+    def: &SupportedStreamConfig,
+    sink: Arc<Mutex<Vec<f32>>>,
+    on_err: impl FnMut(cpal::Error) + Send + 'static,
+) -> Result<Stream>
 where
     T: SizedSample,
     f32: FromSample<T>,
@@ -95,15 +100,23 @@ where
             rs.push(&mono, &mut out);
             sink.lock().unwrap().extend_from_slice(&out);
         },
-        |e| eprintln!("fsc: mic error: {e}"),
+        on_err,
         None,
     )?)
 }
+
+/// A mic that has delivered nothing for this long is treated as gone. Long
+/// enough for a Bluetooth headset's profile switch, during which it still
+/// delivers (silent) audio anyway.
+const MIC_STALL: Duration = Duration::from_secs(10);
 
 /// An open microphone. Captured 16 kHz mono samples accumulate in `buf`.
 pub struct Mic {
     _stream: Stream,
     buf: Arc<Mutex<Vec<f32>>>,
+    /// The stream reported an error (e.g. the device was unplugged).
+    dead: Arc<AtomicBool>,
+    last_data: std::cell::Cell<Instant>,
 }
 
 impl Mic {
@@ -112,12 +125,21 @@ impl Mic {
         let dev = find_input(&host, device_name).ok_or_else(|| anyhow!("no microphone found"))?;
         let buf: Arc<Mutex<Vec<f32>>> = Arc::default();
 
+        let dead = Arc::new(AtomicBool::new(false));
+        let on_err = {
+            let dead = dead.clone();
+            move |e: cpal::Error| {
+                eprintln!("fsc: mic error: {e}");
+                dead.store(true, Ordering::Relaxed);
+            }
+        };
+
         let wanted = StreamConfig { channels: 1, sample_rate: MIC_RATE, buffer_size: BufferSize::Default };
         let sink = buf.clone();
         let direct = dev.build_input_stream::<f32, _, _>(
             wanted,
             move |data: &[f32], _| sink.lock().unwrap().extend_from_slice(data),
-            |e| eprintln!("fsc: mic error: {e}"),
+            on_err.clone(),
             None,
         );
 
@@ -126,16 +148,25 @@ impl Mic {
             Err(e) => {
                 eprintln!("fsc: mic refused 16 kHz mono ({e}); converting locally");
                 let def = dev.default_input_config().context("mic default config")?;
-                with_sample_type!(def.sample_format(), mic_fallback(&dev, &def, buf.clone()))?
+                with_sample_type!(def.sample_format(), mic_fallback(&dev, &def, buf.clone(), on_err))?
             }
         };
         stream.play()?;
-        Ok(Self { _stream: stream, buf })
+        Ok(Self { _stream: stream, buf, dead, last_data: std::cell::Cell::new(Instant::now()) })
     }
 
     /// Take everything captured since the last call.
     pub fn drain(&self) -> Vec<f32> {
-        std::mem::take(&mut *self.buf.lock().unwrap())
+        let data = std::mem::take(&mut *self.buf.lock().unwrap());
+        if !data.is_empty() {
+            self.last_data.set(Instant::now());
+        }
+        data
+    }
+
+    /// The device went away or stopped delivering audio: reopen it.
+    pub fn failed(&self) -> bool {
+        self.dead.load(Ordering::Relaxed) || self.last_data.get().elapsed() > MIC_STALL
     }
 }
 

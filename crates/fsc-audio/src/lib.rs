@@ -24,6 +24,7 @@ mod vad;
 mod wake;
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -190,7 +191,9 @@ impl Watching {
 }
 
 /// Cuts mic audio into speech segments with the VAD; each segment is
-/// transcribed and checked for the wake phrase.
+/// transcribed and checked for the wake phrase. Transcription runs on its
+/// own thread, so the audio thread keeps feeding the speaker meanwhile
+/// (on speakers, the mic hears our own reply as speech).
 #[derive(Default)]
 struct WakeDetector {
     /// Recent audio before speech starts, so the first syllable isn't lost.
@@ -200,20 +203,38 @@ struct WakeDetector {
     seg: Option<Vec<f32>>,
     onset: Onset,
     silence: usize,
-    /// Early check said "not the wake phrase": ignore the rest of this segment.
-    rejected: bool,
-    checked_early: bool,
+    /// Early checks of the segment in progress.
+    check: Check,
+    /// Words allowed before the phrase in this segment: more when it carries
+    /// on from a rejected one, which ends with whatever was being said.
+    lead: usize,
+    /// Counts segments, so a late early-check result for an abandoned one is ignored.
+    generation: u64,
+    /// Transcriptions in flight, oldest first.
+    jobs: VecDeque<Job>,
 }
 
-enum Segment {
-    /// The first `EARLY_CHECK` of a segment still in progress.
-    Early(Vec<f32>),
-    /// A finished segment.
-    Done(Vec<f32>),
+#[derive(Default, PartialEq)]
+enum Check {
+    /// Transcribe what there is once the segment is this long.
+    Due(usize),
+    /// An early transcription is running.
+    Waiting,
+    /// The phrase was heard (or there's nothing to check): wait for the end.
+    #[default]
+    Done,
+}
+
+struct Job {
+    generation: u64,
+    /// The finished segment, rather than an early look at one in progress.
+    done: bool,
+    lead: usize,
+    rx: mpsc::Receiver<String>,
 }
 
 impl WakeDetector {
-    fn feed(&mut self, fresh: &[f32], vad: &mut Vad, end_silence: usize, max_len: usize) -> Option<Segment> {
+    fn feed(&mut self, fresh: &[f32], vad: &mut Vad, stt: &Arc<Stt>, end_silence: usize, max_len: usize) {
         self.pending.extend_from_slice(fresh);
         while self.pending.len() >= CHUNK {
             let chunk: Vec<f32> = self.pending.drain(..CHUNK).collect();
@@ -224,16 +245,12 @@ impl WakeDetector {
                     let excess = self.preroll.len().saturating_sub(PREROLL);
                     self.preroll.drain(..excess);
                     if self.onset.step(p) {
-                        self.seg = Some(self.preroll.drain(..).collect());
-                        self.silence = 0;
-                        self.rejected = false;
-                        self.checked_early = false;
+                        let seg = self.preroll.drain(..).collect();
+                        self.start(seg, EARLY_CHECK, wake::MAX_LEADING_WORDS);
                     }
                 }
                 Some(seg) => {
-                    if !self.rejected {
-                        seg.extend_from_slice(&chunk);
-                    }
+                    seg.extend_from_slice(&chunk);
                     if p >= VAD_ON {
                         self.silence = 0;
                     } else if p < VAD_OFF {
@@ -242,14 +259,81 @@ impl WakeDetector {
                     if self.silence >= end_silence || seg.len() >= max_len {
                         let seg = self.seg.take().unwrap_or_default();
                         self.onset.reset();
-                        if !self.rejected {
-                            return Some(Segment::Done(seg));
-                        }
-                    } else if !self.rejected && !self.checked_early && seg.len() >= EARLY_CHECK {
-                        self.checked_early = true;
-                        return Some(Segment::Early(seg.clone()));
+                        self.check = Check::Done;
+                        self.transcribe(stt, seg, true);
+                    } else if let Check::Due(at) = self.check
+                        && seg.len() >= at
+                        && self.jobs.is_empty()
+                    {
+                        // Only when nothing else is being transcribed: on a slow
+                        // (CPU) whisper, early checks wait rather than pile up.
+                        let seg = seg.clone();
+                        self.check = Check::Waiting;
+                        self.transcribe(stt, seg, false);
                     }
                 }
+            }
+        }
+    }
+
+    fn start(&mut self, seg: Vec<f32>, check_at: usize, lead: usize) {
+        self.seg = Some(seg);
+        self.silence = 0;
+        self.check = Check::Due(check_at);
+        self.lead = lead;
+        self.generation += 1;
+    }
+
+    fn transcribe(&mut self, stt: &Arc<Stt>, audio: Vec<f32>, done: bool) {
+        let (tx, rx) = mpsc::channel();
+        let stt = stt.clone();
+        let spawned = std::thread::Builder::new()
+            .name("fsc-wake-stt".into())
+            .spawn(move || {
+                let _ = tx.send(stt.transcribe(&audio).unwrap_or_default());
+            });
+        match spawned {
+            Ok(_) => self.jobs.push_back(Job { generation: self.generation, done, lead: self.lead, rx }),
+            Err(e) => eprintln!("fsc: could not start wake transcription: {e}"),
+        }
+    }
+
+    /// Collect finished transcriptions. Returns (what was heard, what followed
+    /// the phrase) once a finished segment starts with the wake phrase.
+    fn poll(&mut self, phrase: &str) -> Option<(String, String)> {
+        while let Some(job) = self.jobs.front() {
+            let heard = match job.rx.try_recv() {
+                Ok(text) => text,
+                Err(mpsc::TryRecvError::Empty) => return None,
+                Err(mpsc::TryRecvError::Disconnected) => String::new(),
+            };
+            let Some(job) = self.jobs.pop_front() else { break };
+            let hit = wake::match_wake_after(&heard, phrase, job.lead);
+            if job.done {
+                if let Some(rest) = hit {
+                    return Some((heard, rest));
+                }
+                continue;
+            }
+            if job.generation != self.generation || self.check != Check::Waiting {
+                continue; // that segment is over
+            }
+            let Some(seg) = self.seg.as_mut() else { continue };
+            if hit.is_some() {
+                // Heard. The finished segment's transcript also has whatever
+                // came before (other speech carried over), so it may sit
+                // further in by then.
+                self.check = Check::Done;
+                self.lead = usize::MAX;
+            } else if wake::could_start(&heard, phrase) {
+                // Maybe mid-phrase ("hey, uh... fishsticks and"): look again later.
+                self.check = Check::Due(seg.len() + RECHECK);
+            } else {
+                // Not the wake phrase (a TV, a conversation). Carry on with
+                // just the end of it, so the phrase said over continuing
+                // background speech is still caught.
+                let keep = seg.split_off(seg.len().saturating_sub(OVERLAP));
+                self.start(keep, OVERLAP + RECHECK, OVERLAP_LEADING_WORDS);
             }
         }
         None
@@ -262,25 +346,13 @@ fn detect_wake(
     det: &mut WakeDetector,
     fresh: &[f32],
     vad: &mut Vad,
-    stt: &Stt,
+    stt: &Arc<Stt>,
     cfg: &VoiceConfig,
 ) -> Option<(String, String)> {
     let end_silence = cfg.end_silence_ms as usize * MIC_RATE as usize / 1000;
     let max_len = cfg.max_utterance_secs as usize * MIC_RATE as usize;
-    match det.feed(fresh, vad, end_silence, max_len)? {
-        Segment::Early(audio) => {
-            let heard = stt.transcribe(&audio).unwrap_or_default();
-            if wake::match_wake(&heard, &cfg.wake_phrase).is_none() {
-                det.rejected = true;
-            }
-            None
-        }
-        Segment::Done(audio) => {
-            let heard = stt.transcribe(&audio).unwrap_or_default();
-            let rest = wake::match_wake(&heard, &cfg.wake_phrase)?;
-            Some((heard, rest))
-        }
-    }
+    det.feed(fresh, vad, stt, end_silence, max_len);
+    det.poll(&cfg.wake_phrase)
 }
 
 /// Audio kept from before speech starts.
@@ -288,6 +360,13 @@ const PREROLL: usize = MIC_RATE as usize / 2;
 /// Transcribe a long segment's first part this early to reject non-wake
 /// speech (a TV, a conversation) without transcribing all of it.
 const EARLY_CHECK: usize = MIC_RATE as usize * 5 / 2;
+/// After an early check, look again once this much more has been said.
+const RECHECK: usize = MIC_RATE as usize * 2;
+/// What's kept of a rejected segment that's still going: room for the wake
+/// phrase to have started just before the cut.
+const OVERLAP: usize = MIC_RATE as usize * 2;
+/// Words of other speech that can come before the phrase in that overlap.
+const OVERLAP_LEADING_WORDS: usize = 6;
 /// Don't retry opening a failing mic more often than this.
 const WATCH_RETRY: Duration = Duration::from_secs(10);
 
@@ -313,7 +392,7 @@ struct Engine<F> {
     cfg: VoiceConfig,
     emit: F,
     vad: Option<Vad>,
-    stt: Option<Stt>,
+    stt: Option<Arc<Stt>>,
     tts: Option<Tts>,
     listening: Option<Listening>,
     held: Option<Held>,
@@ -412,7 +491,7 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                 // Warm up: the first run compiles GPU shaders.
                 let _ = s.transcribe(&[0.0; MIC_RATE as usize]);
                 eprintln!("fsc: whisper ready in {:.1}s", t0.elapsed().as_secs_f32());
-                self.stt = Some(s);
+                self.stt = Some(Arc::new(s));
             }
             Err(e) => eprintln!("fsc: speech recognition unavailable: {e:#}"),
         }
@@ -543,6 +622,15 @@ impl<F: Fn(AudioEvent)> Engine<F> {
     fn step_listen(&mut self) {
         let Some(l) = self.listening.as_mut() else { return };
         let fresh = l.mic.drain();
+        if l.live.is_some() && l.mic.failed() {
+            // Transcribe what was said before it went.
+            (self.emit)(AudioEvent::Error("microphone stopped".into()));
+            if let Some(mut l) = self.listening.take() {
+                l.pcm.extend(fresh);
+                self.finish(l);
+            }
+            return;
+        }
         if l.live.is_none() {
             // A Bluetooth placeholder source yields exact zeros until the
             // headset profile is up; any real mic has a noise floor.
@@ -709,6 +797,14 @@ impl<F: Fn(AudioEvent)> Engine<F> {
         }
         let Some(w) = self.watching.as_mut() else { return };
         let fresh = w.mic.drain();
+        if w.mic.failed() {
+            // Unplugged, or the stream died: reopen it (after WATCH_RETRY,
+            // so a device that keeps failing isn't hammered).
+            eprintln!("fsc: wake word mic stopped; reopening");
+            self.watching = None;
+            self.watch_failed_at = Some(Instant::now());
+            return;
+        }
         let (Some(vad), Some(stt)) = (self.vad.as_mut(), self.stt.as_ref()) else { return };
         let Some(hit) = detect_wake(&mut w.det, &fresh, vad, stt, &self.cfg) else { return };
         if self.wake_heard(hit) {
@@ -746,6 +842,12 @@ impl<F: Fn(AudioEvent)> Engine<F> {
         let wake = self.wake_active();
         let Some(h) = self.held.as_mut() else { return };
         let fresh = h.mic.drain();
+        if h.mic.failed() {
+            // A follow-up opens a fresh mic; otherwise wake watching does.
+            eprintln!("fsc: held mic stopped; dropping it");
+            self.held = None;
+            return;
+        }
         // Talking over a reply: the UI stops it and takes the mic.
         let hit = match (wake, self.vad.as_mut(), self.stt.as_ref()) {
             (true, Some(vad), Some(stt)) => detect_wake(&mut h.det, &fresh, vad, stt, &self.cfg),
@@ -981,6 +1083,75 @@ pub fn self_test(cfg: &VoiceConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Speech from Piper through the wake detector, as the mic would deliver
+    /// it. Needs the models: `cargo test -p fsc-audio --release -- --ignored wake_`.
+    #[test]
+    #[ignore]
+    fn wake_detector_end_to_end() {
+        let cfg = VoiceConfig::default();
+        let env = ort::init().with_name("fsc-test").build().unwrap();
+        let mut vad = Vad::load(&env, &models::vad_path()).unwrap();
+        let mut tts = Tts::load(&env, &models::piper_path(&cfg), &models::piper_config_path(&cfg), 1.0).unwrap();
+        let stt = Arc::new(Stt::load(&models::whisper_path(&cfg), &cfg.language, cfg.gpu).unwrap());
+        let say = |tts: &mut Tts, text: &str| {
+            let pcm = tts.synth(text).unwrap();
+            let mut rs = io::Resampler::new(tts.sample_rate(), MIC_RATE);
+            let mut out = Vec::new();
+            rs.push(&pcm, &mut out);
+            out
+        };
+        let silence = vec![0.0f32; MIC_RATE as usize * 2];
+        let run = |vad: &mut Vad, audio: &[f32]| {
+            vad.reset();
+            let mut det = WakeDetector::default();
+            let t = Instant::now();
+            // In real time, as a mic delivers it, so transcriptions keep pace.
+            for c in audio.chunks(MIC_RATE as usize / 50) {
+                std::thread::sleep(Duration::from_millis(20));
+                if let Some(hit) = detect_wake(&mut det, c, vad, &stt, &cfg) {
+                    return Some(hit);
+                }
+            }
+            // Let the last transcriptions finish.
+            while t.elapsed() < Duration::from_secs(20) && !det.jobs.is_empty() {
+                std::thread::sleep(Duration::from_millis(20));
+                if let Some(hit) = det.poll(&cfg.wake_phrase) {
+                    return Some(hit);
+                }
+            }
+            None
+        };
+
+        // A plain wake-up with a command.
+        let mut a = say(&mut tts, "Fishsticks and custard, what time is it?");
+        a.extend(&silence);
+        let hit = run(&mut vad, &a).expect("plain wake");
+        eprintln!("plain: {hit:?}");
+
+        // The phrase said over other speech that never pauses (#7) and after
+        // more than the early check's worth of it (#6).
+        let mut b = say(
+            &mut tts,
+            "and then we walked all the way down to the harbour to look at the boats, and the weather was lovely, \
+             Fishsticks and custard, what time is it?",
+        );
+        b.extend(&silence);
+        let hit = run(&mut vad, &b).expect("wake after continuous speech");
+        eprintln!("continuous: {hit:?}");
+
+        // A slow start: the early check lands partway into the phrase (#6).
+        let mut h = say(&mut tts, "Hey, um... so... hmm, okay.");
+        h.extend(say(&mut tts, "Fishsticks and custard, what time is it?"));
+        h.extend(&silence);
+        let hit = run(&mut vad, &h).expect("wake after a hesitation");
+        eprintln!("hesitation: {hit:?}");
+
+        // No phrase: nothing.
+        let mut c = say(&mut tts, "and then we walked all the way down to the harbour to look at the boats.");
+        c.extend(&silence);
+        assert!(run(&mut vad, &c).is_none());
+    }
 
     #[test]
     fn onset_needs_a_run_and_tolerates_dips() {

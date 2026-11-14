@@ -7,12 +7,44 @@
 //! a mention in the middle of a sentence is not a wake-up).
 
 /// Words allowed before the phrase, e.g. "hey", "okay".
-const MAX_LEADING_WORDS: usize = 2;
+pub const MAX_LEADING_WORDS: usize = 2;
 
 /// If `text` starts with the wake phrase, returns whatever follows it
 /// (possibly empty). `None` if it doesn't.
 pub fn match_wake(text: &str, phrase: &str) -> Option<String> {
     match_after(text, phrase, MAX_LEADING_WORDS)
+}
+
+/// `match_wake` allowing up to `max_leading` words before the phrase.
+pub fn match_wake_after(text: &str, phrase: &str, max_leading: usize) -> Option<String> {
+    match_after(text, phrase, max_leading)
+}
+
+/// Whether `text` ends partway into the phrase ("hey, uh... fishsticks
+/// and"), so it may still be being said.
+pub fn could_start(text: &str, phrase: &str) -> bool {
+    let target: Vec<char> = normalize(phrase).split_whitespace().flat_map(str::chars).collect();
+    let words: Vec<String> = normalize(text).split_whitespace().map(String::from).collect();
+    let mut tail = String::new();
+    for w in words.iter().rev().take(4) {
+        tail.insert_str(0, w);
+        let n = tail.chars().count();
+        // Too short to mean anything, or as long as the whole phrase (which
+        // `match_wake` would have found).
+        if n < 4 || n >= target.len() {
+            continue;
+        }
+        // Against phrase beginnings of about the same length, so a dropped
+        // or extra letter ("fishstiks") still lines up.
+        let close = (n.saturating_sub(2)..=(n + 2).min(target.len())).any(|m| {
+            let head: String = target[..m].iter().collect();
+            levenshtein(&tail, &head) <= (n / 4).max(1)
+        });
+        if close {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether the phrase appears anywhere in `text`. Used to recognise our
@@ -92,7 +124,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{match_wake, mentions};
+    use super::{could_start, match_wake, match_wake_after, mentions};
 
     const P: &str = "fishsticks and custard";
 
@@ -126,6 +158,24 @@ mod tests {
         assert_eq!(match_wake("", P), None);
         // Mentioned mid-sentence: not a wake-up.
         assert_eq!(match_wake("My kids were laughing about the Doctor eating fish sticks and custard.", P), None);
+    }
+
+    #[test]
+    fn partway_into_the_phrase() {
+        assert!(could_start("Hey, uh, fishsticks and", P));
+        assert!(could_start("Fish sticks", P));
+        assert!(could_start("Okay, fish sticks an", P));
+        assert!(could_start("hey fishstiks", P));
+        assert!(!could_start("What's the weather like", P));
+        assert!(!could_start("I went to the shops", P));
+        assert!(!could_start("", P));
+    }
+
+    #[test]
+    fn more_leading_words_when_allowed() {
+        let s = "and then they went home. Fishsticks and custard, play some music";
+        assert_eq!(match_wake(s, P), None);
+        assert_eq!(match_wake_after(s, P, 6).as_deref(), Some("play some music"));
     }
 
     #[test]

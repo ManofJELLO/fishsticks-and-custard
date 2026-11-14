@@ -66,23 +66,47 @@ jobs:
         shell: bash
         run: |
           cd packaging/arch
-          # $1: how many cmake jobs (whisper.cpp shader generators) run at once.
-          build() { local jobs=$1; shift; sudo -u builder env CMAKE_BUILD_PARALLEL_LEVEL="$jobs" makepkg --noconfirm --sign --key "$FPR" "$@"; }
           # whisper.cpp's Vulkan shader generator silently drops any shader whose
           # glslc run prints to stderr, and the link then fails on missing *_cm1
-          # symbols (v0.6.1, v0.6.4, v0.6.5). It's intermittent, most likely glslc
-          # failing under load, since each generator runs several glslc at once.
-          # So: fewer generators at a time, and on failure show what glslc said,
-          # then retry from a clean tree (-C) with one generator at a time.
+          # symbols (v0.6.1, v0.6.4, v0.6.5). The cause isn't known yet: only
+          # the cm1 shaders go missing, which doesn't fit simple load. So build
+          # normally, and only on that failure show what glslc said, then retry
+          # from a clean tree (-C) with every glslc run strictly one at a time.
+          # (Each generator runs several glslc itself, so cmake job counts
+          # alone can't do that: a wrapper takes a lock around each run.)
+          first() { sudo -u builder makepkg --noconfirm --sign --key "$FPR" 2>&1 | tee "$RUNNER_TEMP/build1.log"; }
+          retry() {
+            sudo -u builder env PATH="/opt/glslc-serial:$PATH" \
+              makepkg --noconfirm --sign --key "$FPR" -C -f 2>&1 | tee "$RUNNER_TEMP/build2.log"
+          }
+          mkdir -p "/opt/glslc-serial"
+          printf '#!/bin/sh\nexec flock /tmp/glslc.lock %s "$@"\n' "$(command -v glslc)" > "/opt/glslc-serial/glslc"
+          chmod 755 "/opt/glslc-serial/glslc"
           shader_errors() {
-            grep -h -A15 "cannot compile\|Error executing command" \
-              src/*/target/release/build/whisper-rs-sys-*/{output,stderr} 2>/dev/null | head -80 || true
+            local files
+            files=$(find src -path '*/whisper-rs-sys-*' \( -name output -o -name stderr \) -type f 2>/dev/null)
+            if [ -z "$files" ]; then
+              echo "(no whisper-rs-sys build output found under packaging/arch/src)"
+              return
+            fi
+            # shellcheck disable=SC2086
+            { grep -h -A15 "cannot compile\|Error executing command" $files || echo "(no shader generator errors in it)"; } | head -80
           }
-          build 2 || {
-            echo "::warning::build failed; shader generator errors follow, then a clean serial retry"
+          missing_shaders() { grep -qE "undefined (reference to|symbol).*_cm1" "$1"; }
+
+          if ! first; then
+            if ! missing_shaders "$RUNNER_TEMP/build1.log"; then
+              echo "::error::build failed (not the missing-shader flake, so no retry)"
+              exit 1
+            fi
+            echo "::warning::whisper.cpp shaders went missing; glslc output follows, then a clean retry"
             shader_errors
-            build 1 -C -f
-          }
+            if ! retry; then
+              echo "::error::the retry failed too; its glslc output follows"
+              shader_errors
+              exit 1
+            fi
+          fi
           ls -l *.pkg.tar.zst*
 
       - name: Build repository database
@@ -109,8 +133,14 @@ jobs:
           gh release view -R "$GITHUB_REPOSITORY" "$RELEASE_TAG" >/dev/null 2>&1 || \
             gh release create -R "$GITHUB_REPOSITORY" "$RELEASE_TAG" --title "pacman repository" --latest=false \
               --notes "Signed pacman repository. See the README's install section. Assets here are replaced on every release."
-          # Drop packages from previous versions, then upload the new set.
+          # New packages first, then the database that points at them, and only
+          # then drop old packages: the live database never names a missing file.
+          gh release upload -R "$GITHUB_REPOSITORY" "$RELEASE_TAG" out/*.pkg.tar.zst out/*.pkg.tar.zst.sig --clobber
+          find out -maxdepth 1 -type f ! -name '*.pkg.tar.zst' ! -name '*.pkg.tar.zst.sig' -print0 |
+            xargs -0 gh release upload -R "$GITHUB_REPOSITORY" "$RELEASE_TAG" --clobber
           for a in $(gh release view -R "$GITHUB_REPOSITORY" "$RELEASE_TAG" --json assets --jq '.assets[].name'); do
-            case "$a" in *.pkg.tar.zst|*.pkg.tar.zst.sig) gh release delete-asset -R "$GITHUB_REPOSITORY" "$RELEASE_TAG" "$a" --yes ;; esac
+            case "$a" in
+              *.pkg.tar.zst|*.pkg.tar.zst.sig)
+                [ -e "out/$a" ] || gh release delete-asset -R "$GITHUB_REPOSITORY" "$RELEASE_TAG" "$a" --yes ;;
+            esac
           done
-          gh release upload -R "$GITHUB_REPOSITORY" "$RELEASE_TAG" out/* --clobber

@@ -123,6 +123,9 @@ pub fn ensure_home(home: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(home.join(".claude"))?;
     let settings = home.join(".claude/settings.local.json");
     let version_file = home.join(SETTINGS_VERSION_FILE);
+    // Whether the settings are now at SETTINGS_VERSION. Not when an invalid
+    // file was left alone, so it's migrated once the user fixes it.
+    let mut current = true;
     if settings.exists() {
         // No version file: seeded before versions were tracked, i.e. version 1.
         let from = std::fs::read_to_string(&version_file).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(1);
@@ -130,13 +133,18 @@ pub fn ensure_home(home: &Path) -> std::io::Result<()> {
             let text = std::fs::read_to_string(&settings)?;
             match migrate_settings(&text, from) {
                 Some(new) => std::fs::write(&settings, new)?,
-                None => eprintln!("fsc: {} isn't valid JSON; left as it is", settings.display()),
+                None => {
+                    eprintln!("fsc: {} isn't valid JSON; left as it is", settings.display());
+                    current = false;
+                }
             }
         }
     } else {
         std::fs::write(&settings, SETTINGS)?;
     }
-    if std::fs::read_to_string(&version_file).ok().as_deref().map(str::trim) != Some(&SETTINGS_VERSION.to_string()) {
+    if current
+        && std::fs::read_to_string(&version_file).ok().as_deref().map(str::trim) != Some(&SETTINGS_VERSION.to_string())
+    {
         std::fs::write(&version_file, format!("{SETTINGS_VERSION}\n"))?;
     }
     let persona = home.join("persona.md");
@@ -337,6 +345,11 @@ where
                     }
                 }
                 Some(Req::Interrupt) => {
+                    if turn.active && turn.internal {
+                        // The save carries on; the prompts waiting behind it don't.
+                        drop_queued(&mut queued, &emit);
+                        continue;
+                    }
                     deny_pending(&mut proc, &mut turn).await;
                     if let (Some(p), true) = (proc.as_mut(), turn.active && !turn.internal)
                         && send_interrupt(p, &mut req_id).await.is_ok()
@@ -347,7 +360,11 @@ where
                 Some(Req::Rotate { save, last }) => {
                     closing |= last;
                     if turn.active && turn.internal {
-                        continue; // already rotating
+                        // Already rotating: the new session follows the save.
+                        // Prompts queued for it belonged to the conversation
+                        // being left, so they're dropped.
+                        drop_queued(&mut queued, &emit);
+                        continue;
                     }
                     let save = save && cfg.memory;
                     deny_pending(&mut proc, &mut turn).await;
@@ -458,6 +475,14 @@ where
                 }
             },
         }
+    }
+}
+
+/// Abandon prompts held behind a memory save, ending their turn in the UI.
+fn drop_queued<F: Fn(ClaudeEvent)>(queued: &mut VecDeque<String>, emit: &F) {
+    if !queued.is_empty() {
+        queued.clear();
+        emit(ClaudeEvent::TurnDone { ok: true, interrupted: true, error: None });
     }
 }
 
@@ -741,6 +766,24 @@ mod tests {
         ensure_home(&home).unwrap();
         assert_eq!(read()["permissions"]["deny"], json!(["Write"]));
         assert!(home.join("persona.md").exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn ensure_home_migrates_once_fixed() {
+        let home = std::env::temp_dir().join(format!("fsc-home-test-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let settings = home.join(".claude/settings.local.json");
+        // Broken JSON is left alone and not marked as migrated...
+        std::fs::write(&settings, r#"{"permissions":{"deny":["Edit",]}}"#).unwrap();
+        ensure_home(&home).unwrap();
+        assert!(!home.join(SETTINGS_VERSION_FILE).exists());
+        // ...so it's migrated once the user fixes it.
+        std::fs::write(&settings, r#"{"permissions":{"deny":["Edit"]}}"#).unwrap();
+        ensure_home(&home).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["permissions"]["deny"], json!([]));
         std::fs::remove_dir_all(&home).unwrap();
     }
 
