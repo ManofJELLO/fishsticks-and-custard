@@ -57,6 +57,9 @@ struct OpenAsk {
 struct Exchange {
     reply: gtk::Label,
     text: String,
+    /// The most recent "⚙ TOOL" line, so a permission card for the same
+    /// tool can replace it instead of repeating it.
+    last_tool: Option<(String, gtk::Label)>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -231,6 +234,7 @@ impl Ui {
         );
 
         let model = pretty_model(&cfg.claude.model);
+        let viz = Viz::new(&cfg.ui);
         let ui = Rc::new(Ui {
             cfg,
             claude,
@@ -255,7 +259,7 @@ impl Ui {
                 muted: false,
                 model,
                 voice: Voice::default(),
-                viz: Viz::default(),
+                viz,
                 last_frame: None,
                 current: None,
                 voice_turn: false,
@@ -328,8 +332,7 @@ impl Ui {
                 let mut st = ui.st.borrow_mut();
                 let dt = st.last_frame.map(|t| ((now - t) as f32 / 1e6).clamp(0.0, 0.1)).unwrap_or(0.016);
                 st.last_frame = Some(now);
-                let cols = Viz::columns_for(area.width() as f64);
-                st.viz.tick(dt, cols);
+                st.viz.tick(dt, area.width() as f64);
             }
             area.queue_draw();
             ui.status.queue_draw();
@@ -497,11 +500,13 @@ impl Ui {
                 if self.st.borrow().asks.is_empty() {
                     self.set_claude(Phase::Working);
                 }
-                if let Some(cur) = self.st.borrow().current.as_ref() {
-                    let l = label(&format!("󰒓  {}", pretty_tool(&name).to_uppercase()), "tool");
+                if let Some(cur) = self.st.borrow_mut().current.as_mut() {
+                    let tool = pretty_tool(&name);
+                    let l = label(&format!("󰒓  {}", tool.to_uppercase()), "tool");
                     if let Some(parent) = cur.reply.parent() {
                         l.insert_before(&parent, Some(&cur.reply));
                     }
+                    cur.last_tool = Some((tool, l));
                 }
                 self.scroll_to_end();
             }
@@ -715,7 +720,7 @@ impl Ui {
 
         {
             let mut st = self.st.borrow_mut();
-            st.current = Some(Exchange { reply, text: String::new() });
+            st.current = Some(Exchange { reply, text: String::new(), last_tool: None });
             st.voice_turn = voice;
             st.sentences.clear();
         }
@@ -1047,6 +1052,14 @@ impl Ui {
 
         let first = {
             let mut st = self.st.borrow_mut();
+            // The card names the tool itself; drop the plain line just shown for it.
+            if let Some(cur) = st.current.as_mut()
+                && cur.last_tool.as_ref().is_some_and(|(t, _)| *t == ask.tool)
+                && let Some((_, l)) = cur.last_tool.take()
+                && let Some(parent) = l.parent().and_downcast::<gtk::Box>()
+            {
+                parent.remove(&l);
+            }
             match st.current.as_ref().and_then(|c| c.reply.parent().map(|p| (p, c.reply.clone()))) {
                 // Like tool labels: above the reply text.
                 Some((parent, reply)) => card.insert_before(&parent, Some(&reply)),
@@ -1228,7 +1241,7 @@ impl Ui {
             theme: st.palette.mode,
             muted: st.muted,
             accent: st.palette.accent,
-            glow: self.cfg.ui.glow,
+            shape: self.cfg.ui.tray_icon,
         };
         // Each update re-renders the icon at 6 sizes and signals the tray host.
         if st.tray_sent != Some(state) {

@@ -17,7 +17,10 @@ max_height = 360              # conversation area before it scrolls
 font = "0xProto Nerd Font"
 accent = "#D71921"
 theme = "auto"                # "auto" follows the desktop portal; or "dark" / "light"
-glow = "contrast"             # tray glow while recording: "contrast", "accent", "none"
+tray_icon = "police-box"      # or "fishbone"; a red dot in the corner means it's recording
+visualiser = "spectrum"       # "spectrum" (frequency bars) or "loudness" (level over time)
+bands = 16                    # spectrum bars
+block_percent = 10            # each bar lights in blocks of this many percent
 notify_when_hidden = true
 
 [voice]

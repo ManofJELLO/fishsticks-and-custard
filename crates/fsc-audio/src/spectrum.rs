@@ -7,10 +7,13 @@ use std::sync::Arc;
 
 pub const BANDS: usize = 48;
 const N: usize = 1024;
-const F_LO: f32 = 90.0;
-const F_HI: f32 = 7500.0;
+/// The axis is fixed and wider than speech, so the end bands only light up
+/// for real lows and highs. Bands above a source's Nyquist stay dark (the
+/// 16 kHz mic stops at 8 kHz).
+const F_LO: f32 = 50.0;
+const F_HI: f32 = 11000.0;
 /// Visible dynamic range below the running peak.
-const RANGE_DB: f32 = 60.0;
+const RANGE_DB: f32 = 50.0;
 /// Headroom kept above the running peak so loud frames don't pin to the top.
 const HEADROOM_DB: f32 = 2.0;
 /// How fast the running peak falls back after loud passages.
@@ -55,8 +58,7 @@ impl Analyzer {
         self.fft.process(&mut self.buf);
 
         let bin_hz = rate as f32 / N as f32;
-        let hi = F_HI.min(rate as f32 / 2.0 - bin_hz);
-        let ratio = (hi / F_LO).powf(1.0 / BANDS as f32);
+        let ratio = (F_HI / F_LO).powf(1.0 / BANDS as f32);
         let norm = 2.0 / (N as f32 * 0.5); // window coherent gain ≈ 0.5
 
         let dbs: Vec<f32> = (0..BANDS)
@@ -64,6 +66,9 @@ impl Analyzer {
                 let f0 = F_LO * ratio.powi(b as i32);
                 let f1 = f0 * ratio;
                 let i0 = ((f0 / bin_hz).floor() as usize).max(1);
+                if i0 >= N / 2 {
+                    return -200.0; // above Nyquist
+                }
                 let i1 = ((f1 / bin_hz).ceil() as usize).max(i0 + 1).min(N / 2);
                 let peak = self.buf[i0..i1].iter().map(|c| c.norm()).fold(0.0f32, f32::max) * norm;
                 20.0 * peak.max(1e-9).log10()

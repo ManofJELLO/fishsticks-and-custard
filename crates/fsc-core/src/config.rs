@@ -137,14 +137,21 @@ pub enum ThemePref {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum GlowStyle {
-    /// Glow in the opposite of the theme colour (white on dark, black on light).
+#[serde(rename_all = "kebab-case")]
+pub enum TrayIcon {
     #[default]
-    Contrast,
-    /// Glow in the accent colour.
-    Accent,
-    None,
+    PoliceBox,
+    Fishbone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Visualiser {
+    /// Frequency bands as LED-segment bars.
+    #[default]
+    Spectrum,
+    /// Loudness over time, scrolling right to left.
+    Loudness,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -160,8 +167,12 @@ pub struct UiConfig {
     /// The one colour allowed to shout. Hex, e.g. "#D71921".
     pub accent: String,
     pub theme: ThemePref,
-    /// Tray icon glow while recording.
-    pub glow: GlowStyle,
+    pub tray_icon: TrayIcon,
+    pub visualiser: Visualiser,
+    /// Frequency bands shown by the spectrum visualiser.
+    pub bands: u32,
+    /// Each visualiser bar is split into blocks this many percent tall.
+    pub block_percent: u32,
     /// Send a desktop notification when a reply finishes while the popup is hidden.
     pub notify_when_hidden: bool,
 }
@@ -176,7 +187,10 @@ impl Default for UiConfig {
             font: "0xProto Nerd Font".into(),
             accent: "#D71921".into(),
             theme: ThemePref::Auto,
-            glow: GlowStyle::Contrast,
+            tray_icon: TrayIcon::PoliceBox,
+            visualiser: Visualiser::Spectrum,
+            bands: 16,
+            block_percent: 10,
             notify_when_hidden: true,
         }
     }

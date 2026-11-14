@@ -11,8 +11,8 @@ It runs on your Claude subscription through Claude Code's headless stream-json m
 | 1 | Tray icon, popup (translucent panel, dot-matrix status and visualiser), text input, `fsc` CLI, Claude session | **done** |
 | 2 | Push-to-talk: cpal (PipeWire) → Silero VAD → whisper-rs (Vulkan) → Claude → Piper, spoken sentence by sentence; real FFT in the visualiser | **done** |
 | 3 | Wake phrase "fishsticks and custard" (VAD-gated whisper, say a command in the same breath) | **done** |
-| 4 | Safe system control: permission prompts routed to the popup | next |
-| 5 | Polish: wake chime, echo cancel + barge-in, openWakeWord first stage, visuals | |
+| 4 | Safe system control: permission prompts routed to the popup | **done** |
+| 5 | Polish: police-box tray icon, LED-segment visualiser, window/layer/headless modes, spoken-reply cleanup | in progress |
 
 ## Layout
 
@@ -179,10 +179,15 @@ talk shortcut does the same.
 
 - **Theme:** follows `org.freedesktop.appearance color-scheme` from the XDG settings
   portal, live. The popup, visualiser and tray icon all switch together.
-- **Panel:** translucent, most see-through behind the visualiser and most solid behind
-  text, with faint halos behind lit dots for contrast. The Hyprland `layer_rule` blur
+- **Panel:** translucent, most see-through behind the visualiser and nearly solid behind
+  text. The Hyprland `layer_rule` blur
   is optional; it uses your global blur settings.
 - **Wayland only:** the popup is a layer-shell surface, so there is no X11 fallback.
 - **Type:** 0xProto Nerd Font for body text. The status label uses a built-in 5×7
-  dot-matrix font drawn as circles, matching the visualiser grid.
-- **Colour:** monochrome. Red (`#D71921`) marks state only: recording, peaks and errors.
+  dot-matrix font drawn as circles.
+- **Visualiser:** chunky LED-segment bars rising from the bottom, like an old car-stereo
+  spectrum analyser (`ui.visualiser = "spectrum"`, `ui.bands`, `ui.block_percent`), or a
+  scrolling loudness history (`"loudness"`). Red while listening, white for replies.
+- **Tray icon:** a police box (`ui.tray_icon = "police-box"`) or a fishbone at 45°
+  (`"fishbone"`). A red dot in the corner means the mic is recording.
+- **Colour:** monochrome. Red (`#D71921`) marks state only: recording, permission questions and errors.

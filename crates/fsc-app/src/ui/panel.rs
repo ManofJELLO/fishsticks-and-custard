@@ -33,8 +33,8 @@ struct Alphas {
 
 fn alphas(mode: ThemeMode) -> Alphas {
     match mode {
-        ThemeMode::Dark => Alphas { header: 0.58, graphic: 0.32, text: 0.86 },
-        ThemeMode::Light => Alphas { header: 0.62, graphic: 0.40, text: 0.88 },
+        ThemeMode::Dark => Alphas { header: 0.66, graphic: 0.42, text: 0.95 },
+        ThemeMode::Light => Alphas { header: 0.70, graphic: 0.50, text: 0.96 },
     }
 }
 
