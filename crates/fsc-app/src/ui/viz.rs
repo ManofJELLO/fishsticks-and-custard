@@ -113,6 +113,11 @@ impl Viz {
                         let d = (x - pos) / 0.07;
                         0.70 * (-d * d).exp() + 0.05
                     }
+                    Phase::Asking => {
+                        // Waiting on you: a slow, even pulse across the row.
+                        let breath = 0.5 - 0.5 * (t * 2.6).cos();
+                        0.08 + 0.30 * breath
+                    }
                     Phase::Responding | Phase::Speaking => {
                         let env = speech_envelope(x, 0.36);
                         let n = self.rand();
@@ -141,7 +146,7 @@ impl Viz {
         let half = (ROWS / 2) as i32;
         let x0 = (w - n as f64 * PITCH) / 2.0 + PITCH / 2.0;
         let cy = h / 2.0;
-        let bar = if self.phase == Phase::Listening { p.accent } else { p.fg };
+        let bar = if matches!(self.phase, Phase::Listening | Phase::Asking) { p.accent } else { p.fg };
 
         for c in 0..n {
             let lvl = self.levels.get(c).copied().unwrap_or(0.0);

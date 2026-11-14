@@ -14,6 +14,8 @@ pub enum Phase {
     Working,
     /// Reply text is streaming in.
     Responding,
+    /// Claude is waiting for permission to use a tool.
+    Asking,
     /// Reply is being read aloud.
     Speaking,
     Error,
@@ -28,6 +30,7 @@ impl Phase {
             Phase::Thinking => "THINKING",
             Phase::Working => "WORKING",
             Phase::Responding => "RESPONDING",
+            Phase::Asking => "ALLOW?",
             Phase::Speaking => "SPEAKING",
             Phase::Error => "ERROR",
         }
@@ -35,6 +38,6 @@ impl Phase {
 
     /// A Claude turn is in flight.
     pub fn busy(self) -> bool {
-        matches!(self, Phase::Thinking | Phase::Working | Phase::Responding)
+        matches!(self, Phase::Thinking | Phase::Working | Phase::Responding | Phase::Asking)
     }
 }

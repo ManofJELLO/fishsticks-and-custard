@@ -3,8 +3,8 @@
 [claude]
 bin = "claude"
 model = "sonnet"              # alias or full id, e.g. "haiku", "opus", "claude-sonnet-5-5"
-# home = "~/.local/share/fsc/home"   # persona.md + .claude/settings.json live here
-setting_sources = "project"   # keep your personal Claude Code settings/hooks out of the assistant
+# home = "~/.local/share/fsc/home"   # persona.md + .claude/settings.local.json live here
+setting_sources = "project,local"   # the assistant's own settings (+ your "always allow" answers), not your personal ones
 extra_args = []
 session_idle_minutes = 20     # start a fresh session after this long idle (0 = never)
 memory = true                 # remember durable facts across sessions (fsc memory / fsc forget)

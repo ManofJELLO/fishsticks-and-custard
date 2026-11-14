@@ -86,14 +86,6 @@ fsc fetch-models
 fscd --self-test     # Piper speaks a sentence, whisper transcribes it back, with timings
 ```
 
-**Trust the assistant's workspace once.** Claude Code ignores the allow-list in
-`~/.local/share/fsc/home/.claude/settings.json` until that directory is trusted.
-Until then every tool is denied, which is safe but not useful:
-
-```sh
-cd ~/.local/share/fsc/home && claude    # accept the trust prompt, then /exit
-```
-
 Then paste `packaging/hyprland/fsc.lua` into `~/.config/hypr/hyprland.lua`.
 
 ## Use
@@ -107,6 +99,7 @@ Then paste `packaging/hyprland/fsc.lua` into `~/.config/hypr/hyprland.lua`.
 | `Ctrl+N` / `fsc new` | new conversation |
 | `SUPER+SHIFT+A` hold / `fsc listen` + `fsc release` | push-to-talk; a quick tap listens until you stop talking |
 | `fsc ask "…"` | send without opening the field |
+| **ALLOW / ALWAYS / DENY** / `fsc allow [--always]` / `fsc deny` | answer a permission question; by voice, say *yes*, *always* or *no*; typing `y` or `n` works too |
 | *"Fishsticks and custard[, question]"* | wake it by voice; a question in the same breath is sent straight away |
 | `fsc mute [on\|off]` / tray | mute the wake word |
 | `fsc status` | `ready`, `thinking`, `listening`, … |
@@ -116,10 +109,22 @@ Then paste `packaging/hyprland/fsc.lua` into `~/.config/hypr/hyprland.lua`.
 ## Customise
 
 - **Persona and reply style:** `~/.local/share/fsc/home/persona.md`
-- **What Claude may run:** `~/.local/share/fsc/home/.claude/settings.json`. In headless mode,
-  anything not allowed is denied automatically. Run `fsc new` after editing either file.
+- **What Claude may run:** `~/.local/share/fsc/home/.claude/settings.local.json`. Anything
+  on `allow` just runs, anything on `deny` never does, and anything else is asked about (see
+  below). **ALWAYS** answers are added here. Run `fsc new` after editing it or the persona.
+  (Local settings are used because Claude Code ignores a folder's shared `settings.json`
+  allow-list until you've trusted the folder interactively.)
 - **Look and model:** `~/.config/fsc/config.toml` (see `packaging/config.example.toml`).
 - Preview the tray icons: `fscd --dump-icons /some/dir`.
+
+## Permission questions
+
+When Claude wants a tool that isn't allowed or denied (a command, a web page, a file
+write), the reply pauses: the status turns red (**ALLOW?**) and a card shows what it wants
+to do and the exact command, URL or path, with **ALLOW**, **ALWAYS** and **DENY**. After a
+spoken question it also asks out loud ("May I search the web for…? Yes, always, or no?")
+and listens for the answer. Closing the popup counts as no. **ALWAYS** saves the rule
+Claude Code suggests, so the same kind of request just runs next time.
 
 ## Sessions and memory
 

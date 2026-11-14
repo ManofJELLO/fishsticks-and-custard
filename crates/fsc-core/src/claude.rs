@@ -21,9 +21,14 @@ use tokio::sync::mpsc;
 
 use crate::config::ClaudeConfig;
 use crate::memory;
+use crate::permission::{self, Answer, PermissionAsk};
 
 const PERSONA: &str = include_str!("../../../voice-home/persona.md");
-const SETTINGS: &str = include_str!("../../../voice-home/.claude/settings.json");
+/// The assistant's allow/deny lists. In `settings.local.json` because Claude
+/// Code ignores a folder's shared `settings.json` allow rules until you've
+/// trusted the folder interactively; local settings are yours and always apply.
+/// "Always" answers to permission questions are saved here too.
+const SETTINGS: &str = include_str!("../../../voice-home/.claude/settings.local.json");
 
 #[derive(Debug, Clone)]
 pub enum ClaudeEvent {
@@ -33,6 +38,10 @@ pub enum ClaudeEvent {
     TextDelta(String),
     /// Claude started using a tool.
     ToolUse { name: String },
+    /// Claude needs permission for a tool. Answer with `ClaudeHandle::answer`.
+    Permission(PermissionAsk),
+    /// The CLI withdrew a permission question.
+    PermissionClosed { id: String },
     /// The turn finished.
     TurnDone { ok: bool, interrupted: bool, error: Option<String> },
     /// The CLI process went away. It is restarted on the next prompt.
@@ -47,6 +56,7 @@ pub enum ClaudeEvent {
 enum Req {
     Ask(String),
     Interrupt,
+    Answer { id: String, answer: Answer },
     /// End this session and start a fresh one. `save`: update long-term
     /// memory from it first.
     Rotate { save: bool },
@@ -77,6 +87,11 @@ impl ClaudeHandle {
         let _ = self.tx.send(Req::Interrupt);
     }
 
+    /// Answer a `ClaudeEvent::Permission` question.
+    pub fn answer(&self, id: impl Into<String>, answer: Answer) {
+        let _ = self.tx.send(Req::Answer { id: id.into(), answer });
+    }
+
     /// End the session (saving what's worth remembering) and start fresh.
     /// A prompt asked meanwhile is held until the new session is up.
     pub fn rotate(&self, save: bool) {
@@ -93,7 +108,7 @@ impl ClaudeHandle {
 /// tool allow-list. Existing files are never overwritten.
 pub fn ensure_home(home: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(home.join(".claude"))?;
-    for (rel, body) in [("persona.md", PERSONA), (".claude/settings.json", SETTINGS)] {
+    for (rel, body) in [("persona.md", PERSONA), (".claude/settings.local.json", SETTINGS)] {
         let p = home.join(rel);
         if !p.exists() {
             std::fs::write(p, body)?;
@@ -120,6 +135,10 @@ struct Turn {
     /// Its output is discarded; the memory update is sent once it ends.
     draining: bool,
     buf: String,
+    /// Permission questions the CLI is waiting on.
+    pending: Vec<permission::Pending>,
+    /// Control responses to write back to the CLI.
+    outbox: Vec<Value>,
 }
 
 /// What `handle_line` reports about a hidden turn.
@@ -142,6 +161,26 @@ async fn send_user(proc: &mut Option<Proc>, text: &str) -> std::io::Result<()> {
     let p = proc.as_mut().ok_or_else(|| std::io::Error::other("claude is not running"))?;
     let msg = json!({ "type": "user", "message": { "role": "user", "content": text } });
     write_line(&mut p.stdin, &msg).await
+}
+
+/// Write the turn's queued control responses.
+async fn flush_outbox(proc: &mut Option<Proc>, turn: &mut Turn) {
+    let out = std::mem::take(&mut turn.outbox);
+    if let Some(p) = proc.as_mut() {
+        for msg in out {
+            if let Err(e) = write_line(&mut p.stdin, &msg).await {
+                eprintln!("fsc: could not answer claude: {e}");
+            }
+        }
+    }
+}
+
+/// Say no to every open permission question (the turn is being stopped).
+async fn deny_pending(proc: &mut Option<Proc>, turn: &mut Turn) {
+    for p in std::mem::take(&mut turn.pending) {
+        turn.outbox.push(permission::response(&p, Answer::Deny));
+    }
+    flush_outbox(proc, turn).await;
 }
 
 async fn send_interrupt(p: &mut Proc, req_id: &mut u64) -> std::io::Result<()> {
@@ -237,7 +276,16 @@ where
                     }
                     ask(&mut proc, &mut turn, &mut dirty, &cfg, &home, &text, &emit).await;
                 }
+                Some(Req::Answer { id, answer }) => {
+                    if let Some(i) = turn.pending.iter().position(|p| p.id == id) {
+                        let p = turn.pending.remove(i);
+                        eprintln!("fsc: permission {answer:?}");
+                        turn.outbox.push(permission::response(&p, answer));
+                        flush_outbox(&mut proc, &mut turn).await;
+                    }
+                }
                 Some(Req::Interrupt) => {
+                    deny_pending(&mut proc, &mut turn).await;
                     if let (Some(p), true) = (proc.as_mut(), turn.active && !turn.internal)
                         && send_interrupt(p, &mut req_id).await.is_ok()
                     {
@@ -249,6 +297,7 @@ where
                         continue; // already rotating
                     }
                     let save = save && cfg.memory;
+                    deny_pending(&mut proc, &mut turn).await;
                     if turn.active {
                         emit(ClaudeEvent::TurnDone { ok: true, interrupted: true, error: None });
                         if save && dirty && let Some(p) = proc.as_mut() {
@@ -303,7 +352,9 @@ where
             },
             line = next_line(&mut proc) => match line {
                 Ok(Some(l)) => {
-                    let Some(done) = handle_line(&l, &mut turn, &emit) else { continue };
+                    let done = handle_line(&l, &mut turn, &emit);
+                    flush_outbox(&mut proc, &mut turn).await;
+                    let Some(done) = done else { continue };
                     let saving = match done {
                         Internal::Drained => begin_save(&mut proc, &mut turn, &home, &emit).await,
                         Internal::Memory { ok, reply } => {
@@ -411,6 +462,9 @@ fn start(cfg: &ClaudeConfig, home: &Path) -> Option<Proc> {
         &cfg.model,
         "--setting-sources",
         &cfg.setting_sources,
+        // Ask us (over stdin/stdout) when a tool needs permission.
+        "--permission-prompt-tool",
+        "stdio",
     ]);
     // Fall back to the bare persona if the combined prompt can't be written.
     let persona = home.join("persona.md");
@@ -517,6 +571,30 @@ fn handle_line<F: Fn(ClaudeEvent)>(line: &str, turn: &mut Turn, emit: &F) -> Opt
                     }
                 }
                 _ => {}
+            }
+        }
+        Some("control_request") => {
+            let id = s(&v["request_id"]);
+            let req = &v["request"];
+            if req["subtype"] == "can_use_tool" {
+                let (ask, pending) = permission::parse(&id, req);
+                if turn.active && !turn.internal && !turn.draining {
+                    eprintln!("fsc: permission asked: {} · {}", ask.tool, ask.action);
+                    turn.pending.push(pending);
+                    emit(ClaudeEvent::Permission(ask));
+                } else {
+                    // A hidden turn (memory update) never gets to use tools.
+                    turn.outbox.push(permission::response(&pending, Answer::Deny));
+                }
+            } else {
+                turn.outbox.push(permission::unsupported(&id));
+            }
+        }
+        Some("control_cancel_request") => {
+            let id = s(&v["request_id"]);
+            if let Some(i) = turn.pending.iter().position(|p| p.id == id) {
+                turn.pending.remove(i);
+                emit(ClaudeEvent::PermissionClosed { id });
             }
         }
         Some("result") => {

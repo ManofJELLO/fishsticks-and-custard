@@ -88,7 +88,7 @@ pub struct ClaudeConfig {
     /// Model alias or full id passed to `--model`.
     pub model: String,
     /// Working directory for the assistant's Claude session. Holds
-    /// `persona.md` and `.claude/settings.json` (the tool allow-list).
+    /// `persona.md` and `.claude/settings.local.json` (the tool allow-list).
     /// Defaults to `~/.local/share/fsc/home`.
     pub home: Option<PathBuf>,
     /// Passed to `--setting-sources`. "project" keeps your personal
@@ -110,7 +110,7 @@ impl Default for ClaudeConfig {
             bin: "claude".into(),
             model: "sonnet".into(),
             home: None,
-            setting_sources: "project".into(),
+            setting_sources: "project,local".into(),
             extra_args: Vec::new(),
             session_idle_minutes: 20,
             memory: true,

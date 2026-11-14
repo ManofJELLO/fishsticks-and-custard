@@ -24,6 +24,7 @@ use fsc_core::Phase;
 use fsc_core::claude::{ClaudeEvent, ClaudeHandle, pretty_model, pretty_tool};
 use fsc_core::config::{Config, Position, SpeakMode};
 use fsc_core::ipc::{Command, Reply};
+use fsc_core::permission::{self, Answer, PermissionAsk};
 
 use crate::AppEvent;
 use crate::icon::IconState;
@@ -40,8 +41,18 @@ const STATUS_DOT: f64 = 1.15;
 const TAP: Duration = Duration::from_millis(350);
 /// Follow-ups in a row that hear nothing before a conversation hangs up.
 const MAX_EMPTY_FOLLOW_UPS: u32 = 3;
+/// Spoken answers to a permission question that can't be understood before
+/// we stop listening for one (the buttons still work).
+const MAX_ANSWER_TRIES: u32 = 3;
 /// How long "CONVERSATION ENDED" shows before the popup closes itself.
 const HANG_UP_CLOSE: Duration = Duration::from_secs(3);
+
+/// A permission question on screen.
+struct OpenAsk {
+    ask: PermissionAsk,
+    card: gtk::Box,
+    buttons: gtk::Box,
+}
 
 struct Exchange {
     reply: gtk::Label,
@@ -92,6 +103,10 @@ struct State {
     /// A prompt that arrived while Claude was still busy (e.g. you spoke over
     /// a reply that hadn't finished stopping). Sent when the turn ends.
     pending_prompt: Option<(String, bool)>,
+    /// Permission questions waiting for an answer, oldest first.
+    asks: Vec<OpenAsk>,
+    /// Spoken replies to the current question that weren't yes/always/no.
+    answer_tries: u32,
     /// Last state sent to the tray, to skip redundant re-renders.
     tray_sent: Option<IconState>,
     meta_timer: Option<glib::SourceId>,
@@ -254,6 +269,8 @@ impl Ui {
                 memory_saving: false,
                 quitting: false,
                 pending_prompt: None,
+                asks: Vec::new(),
+                answer_tries: 0,
                 tray_sent: None,
                 meta_timer: None,
             }),
@@ -298,7 +315,7 @@ impl Ui {
                 cr.fill().ok();
                 x += 14.0;
             }
-            let on = if phase == Phase::Error { p.accent } else { p.fg };
+            let on = if matches!(phase, Phase::Error | Phase::Asking) { p.accent } else { p.fg };
             dotfont::draw(cr, phase.label(), x, y, STATUS_PITCH, STATUS_DOT, (on, 1.0), (p.fg, 0.10), Some((p.bg, 0.5)));
         });
 
@@ -323,6 +340,13 @@ impl Ui {
         self.entry.connect_activate(move |e| {
             if let Some(ui) = weak.upgrade() {
                 let text = e.text().to_string();
+                // "y" / "yes" / "always" / "no" answers an open permission question.
+                let open = ui.st.borrow().asks.first().map(|a| a.ask.id.clone());
+                if let (Some(id), Some(answer)) = (open, permission::parse_answer(&text)) {
+                    e.set_text("");
+                    ui.answer_ask(&id, answer);
+                    return;
+                }
                 if ui.ask(&text, false) {
                     e.set_text("");
                 }
@@ -387,6 +411,17 @@ impl Ui {
                 if !self.ask(&text, false) {
                     return Reply::err("busy: a reply is still in progress (fsc stop to interrupt)");
                 }
+            }
+            Command::Allow { .. } | Command::Deny => {
+                let Some(id) = self.st.borrow().asks.first().map(|a| a.ask.id.clone()) else {
+                    return Reply::err("nothing is waiting for permission");
+                };
+                let answer = match cmd {
+                    Command::Allow { always: true } => Answer::Always,
+                    Command::Allow { always: false } => Answer::Once,
+                    _ => Answer::Deny,
+                };
+                self.answer_ask(&id, answer);
             }
             Command::New => self.new_conversation(),
             Command::Mute { on } => {
@@ -459,7 +494,9 @@ impl Ui {
                 self.scroll_to_end();
             }
             ClaudeEvent::ToolUse { name } => {
-                self.set_claude(Phase::Working);
+                if self.st.borrow().asks.is_empty() {
+                    self.set_claude(Phase::Working);
+                }
                 if let Some(cur) = self.st.borrow().current.as_ref() {
                     let l = label(&format!("󰒓  {}", pretty_tool(&name).to_uppercase()), "tool");
                     if let Some(parent) = cur.reply.parent() {
@@ -468,7 +505,14 @@ impl Ui {
                 }
                 self.scroll_to_end();
             }
+            ClaudeEvent::Permission(ask) => self.on_permission(ask),
+            ClaudeEvent::PermissionClosed { id } => self.close_ask(&id, "— WITHDRAWN"),
             ClaudeEvent::TurnDone { ok, interrupted, error } => {
+                // Questions still open when the turn ends were never answered.
+                let open: Vec<String> = self.st.borrow().asks.iter().map(|a| a.ask.id.clone()).collect();
+                for id in open {
+                    self.close_ask(&id, "— NOT ANSWERED");
+                }
                 let (cur, rest) = {
                     let mut st = self.st.borrow_mut();
                     let rest = if ok && !interrupted { st.sentences.flush() } else { None };
@@ -549,7 +593,9 @@ impl Ui {
             }
             AudioEvent::MicWaiting => self.flash_meta_for("WAITING FOR MIC…", Duration::from_secs(15)),
             AudioEvent::MicLive => {
-                if self.st.borrow().follow_up {
+                if !self.st.borrow().asks.is_empty() {
+                    self.flash_meta_for("SAY YES, ALWAYS OR NO", Duration::from_secs(8));
+                } else if self.st.borrow().follow_up {
                     self.flash_meta_for("GO AHEAD · ESC ENDS CONVERSATION", Duration::from_secs(5));
                 } else {
                     self.flash_meta("SPEAK NOW");
@@ -577,6 +623,11 @@ impl Ui {
                 self.refresh();
                 if !was_capturing {
                     return; // cancelled meanwhile
+                }
+                let open = self.st.borrow().asks.first().map(|a| a.ask.id.clone());
+                if let Some(id) = open {
+                    self.spoken_answer(&id, &text);
+                    return;
                 }
                 if text.trim().is_empty() {
                     let gave_up = {
@@ -812,13 +863,14 @@ impl Ui {
     fn maybe_follow_up(self: &Rc<Self>) {
         let ready = {
             let st = self.st.borrow();
-            st.conversation
-                && !st.claude.busy()
+            // A permission question asked by voice: listen for the answer.
+            let answering = !st.asks.is_empty() && st.voice_turn && st.answer_tries < MAX_ANSWER_TRIES;
+            let next_question = st.conversation && !st.claude.busy() && st.empty_follow_ups < MAX_EMPTY_FOLLOW_UPS;
+            (answering || next_question)
                 && !st.speaking
                 && !st.speech_pending
                 && st.listening.is_none()
                 && !st.transcribing
-                && st.empty_follow_ups < MAX_EMPTY_FOLLOW_UPS
         };
         if ready && self.window.is_visible() {
             self.listen_inner(true);
@@ -942,10 +994,144 @@ impl Ui {
     }
 
     fn hide(&self) {
+        // Closing the popup is a "no" to anything still waiting for permission.
+        let open: Vec<String> = self.st.borrow().asks.iter().map(|a| a.ask.id.clone()).collect();
+        for id in open {
+            self.claude.answer(&id, Answer::Deny);
+            self.close_ask(&id, "✕ DENIED (CLOSED)");
+        }
         self.cancel_listen();
         self.end_conversation();
         self.window.set_visible(false);
         self.st.borrow_mut().last_frame = None;
+    }
+
+    /// Claude wants to use a tool that needs your OK: show a card with
+    /// buttons and, in a voice turn, ask out loud and listen for the answer.
+    fn on_permission(self: &Rc<Self>, ask: PermissionAsk) {
+        if !self.window.is_visible() {
+            self.show(false);
+            notify(&format!("Claude wants to {}.", ask.action));
+        }
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        card.add_css_class("ask");
+        card.append(&label(&format!("󰒓  {} · ALLOW?", ask.tool.to_uppercase()), "tool"));
+        card.append(&label(&sentence(&ask.action), "ask-action"));
+        if let Some(d) = &ask.detail {
+            let l = label(d, "ask-detail");
+            l.set_selectable(true);
+            l.set_focusable(false);
+            card.append(&l);
+        }
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        for (text, answer) in [("ALLOW", Answer::Once), ("ALWAYS", Answer::Always), ("DENY", Answer::Deny)] {
+            if answer == Answer::Always && !ask.can_always {
+                continue;
+            }
+            let b = gtk::Button::with_label(text);
+            b.add_css_class("ask-button");
+            if answer == Answer::Once {
+                b.add_css_class("allow");
+            }
+            b.set_focus_on_click(false);
+            let weak = Rc::downgrade(self);
+            let id = ask.id.clone();
+            b.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.answer_ask(&id, answer);
+                }
+            });
+            buttons.append(&b);
+        }
+        card.append(&buttons);
+
+        let first = {
+            let mut st = self.st.borrow_mut();
+            match st.current.as_ref().and_then(|c| c.reply.parent().map(|p| (p, c.reply.clone()))) {
+                // Like tool labels: above the reply text.
+                Some((parent, reply)) => card.insert_before(&parent, Some(&reply)),
+                None => self.history.append(&card),
+            }
+            st.asks.push(OpenAsk { ask: ask.clone(), card, buttons });
+            st.asks.len() == 1
+        };
+        self.set_claude(Phase::Asking);
+        self.scroll_to_end();
+        if first {
+            self.put_question(&ask);
+        }
+    }
+
+    /// Read the question aloud (when replies are spoken) and listen for the answer.
+    fn put_question(self: &Rc<Self>, ask: &PermissionAsk) {
+        self.st.borrow_mut().answer_tries = 0;
+        if self.should_speak() {
+            // Finish the sentence in progress first.
+            let rest = self.st.borrow_mut().sentences.flush();
+            if let Some(rest) = rest {
+                self.speak(rest);
+            }
+            self.speak(format!("{} Yes, always, or no?", ask.spoken));
+        }
+        self.maybe_follow_up();
+    }
+
+    fn spoken_answer(self: &Rc<Self>, id: &str, text: &str) {
+        if let Some(answer) = permission::parse_answer(text) {
+            self.answer_ask(id, answer);
+            return;
+        }
+        let tries = {
+            let mut st = self.st.borrow_mut();
+            st.answer_tries += 1;
+            st.answer_tries
+        };
+        if tries < MAX_ANSWER_TRIES {
+            self.flash_meta("SAY YES, ALWAYS OR NO");
+            if !text.trim().is_empty() && self.should_speak() {
+                self.speak("Sorry. Yes, always, or no?".into());
+            }
+            self.maybe_follow_up();
+        } else {
+            self.flash_meta_for("ANSWER WITH THE BUTTONS", Duration::from_secs(8));
+        }
+    }
+
+    fn answer_ask(self: &Rc<Self>, id: &str, answer: Answer) {
+        self.claude.answer(id, answer);
+        let note = match answer {
+            Answer::Once => "✓ ALLOWED",
+            Answer::Always => "✓ ALLOWED · WON'T ASK AGAIN",
+            Answer::Deny => "✕ DENIED",
+        };
+        self.close_ask(id, note);
+        let next = self.st.borrow().asks.first().map(|a| a.ask.clone());
+        match next {
+            Some(ask) => self.put_question(&ask),
+            None => {
+                if self.st.borrow().claude == Phase::Asking {
+                    self.set_claude(Phase::Working);
+                }
+            }
+        }
+    }
+
+    /// Replace a question's buttons with what became of it.
+    fn close_ask(&self, id: &str, note: &str) {
+        let (open, none_left) = {
+            let mut st = self.st.borrow_mut();
+            let Some(i) = st.asks.iter().position(|a| a.ask.id == id) else { return };
+            let open = st.asks.remove(i);
+            st.answer_tries = 0;
+            (open, st.asks.is_empty())
+        };
+        open.card.remove(&open.buttons);
+        open.card.add_css_class("answered");
+        open.card.append(&label(note, "note"));
+        // Was listening for the answer: don't let that turn into a new prompt.
+        if none_left && self.st.borrow().listening.is_some() && self.st.borrow().claude.busy() {
+            self.cancel_listen();
+        }
     }
 
     /// Nobody spoke: end the conversation and, like ending a call, put the
@@ -1114,6 +1300,15 @@ fn label(text: &str, class: &str) -> gtk::Label {
     l.set_max_width_chars(1);
     l.set_hexpand(true);
     l
+}
+
+/// "search the web" -> "Search the web."
+fn sentence(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => format!("{}{}.", f.to_uppercase(), c.as_str()),
+        None => String::new(),
+    }
 }
 
 fn notify(text: &str) {

@@ -108,6 +108,50 @@ window.fsc * {{
     color: {red};
     font-size: 12px;
 }}
+.fsc .ask {{
+    border-left: 2px solid {red};
+    padding: 2px 0 2px 12px;
+}}
+.fsc .ask.answered {{
+    border-left-color: {faint};
+}}
+.fsc .ask-action {{
+    color: {text};
+    font-size: 14px;
+}}
+.fsc .ask-detail {{
+    color: {dim};
+    font-size: 12px;
+    background-color: {field};
+    border-radius: 8px;
+    padding: 6px 10px;
+}}
+.fsc button.ask-button {{
+    background-color: transparent;
+    background-image: none;
+    color: {text};
+    border: 1px solid {border};
+    border-radius: 999px;
+    padding: 2px 16px;
+    min-height: 24px;
+    font-size: 11px;
+    letter-spacing: 2px;
+    box-shadow: none;
+    text-shadow: none;
+    outline: none;
+}}
+.fsc button.ask-button:hover {{
+    border-color: {border_focus};
+    background-color: {field};
+}}
+.fsc button.ask-button.allow {{
+    background-color: {red};
+    border-color: {red};
+    color: #ffffff;
+}}
+.fsc button.ask-button.allow:hover {{
+    background-color: {red_hover};
+}}
 .fsc label selection {{
     background-color: {sel};
     color: {text};
@@ -164,6 +208,7 @@ window.fsc * {{
             dim = fg(0.55),
             text = fg(0.95),
             red = accent(1.0),
+            red_hover = accent(0.85),
             sel = accent(0.35),
             faint = fg(0.14),
             field = fg(0.04),

@@ -26,6 +26,11 @@ pub enum Command {
     Release,
     /// Send a prompt without opening the text field.
     Ask { text: String },
+    /// Answer the oldest open permission question. `always`: and save a
+    /// rule so it isn't asked again.
+    Allow { always: bool },
+    /// Refuse the oldest open permission question.
+    Deny,
     /// Throw away the conversation and start a fresh Claude session.
     New,
     /// Mute the wake word. `None` toggles.

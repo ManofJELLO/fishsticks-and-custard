@@ -33,6 +33,14 @@ enum Cmd {
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
     },
+    /// Allow what Claude is asking permission for
+    Allow {
+        /// Also allow it from now on
+        #[arg(long)]
+        always: bool,
+    },
+    /// Refuse what Claude is asking permission for
+    Deny,
     /// Start a fresh conversation
     New,
     /// Mute or unmute the wake word
@@ -70,6 +78,8 @@ fn main() -> ExitCode {
         Cmd::Stop => Command::Stop,
         Cmd::Release => Command::Release,
         Cmd::Ask { text } => Command::Ask { text: text.join(" ") },
+        Cmd::Allow { always } => Command::Allow { always },
+        Cmd::Deny => Command::Deny,
         Cmd::New => Command::New,
         Cmd::Mute { mode } => Command::Mute {
             on: match mode {
