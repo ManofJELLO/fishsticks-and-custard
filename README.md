@@ -15,7 +15,7 @@ See [Choosing an agent](#choosing-an-agent).
 | 3 | Wake phrase "fishsticks and custard" (VAD-gated whisper, say a command in the same breath) | **done** |
 | 4 | Safe system control: permission prompts routed to the popup | **done** |
 | 5 | Polish: police-box tray icon, LED-segment visualiser, window/layer/headless modes, spoken-reply cleanup | **done** |
-| 6 | Any agent: Codex and Antigravity through the Agent Client Protocol, beside Claude Code | in progress |
+| 6 | Any agent: Codex, Antigravity and OpenCode through the Agent Client Protocol, beside Claude Code; agent, model and mode menus | **done** |
 
 ## Layout
 
