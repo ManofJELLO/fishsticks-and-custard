@@ -767,6 +767,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
@@ -2561,6 +2562,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

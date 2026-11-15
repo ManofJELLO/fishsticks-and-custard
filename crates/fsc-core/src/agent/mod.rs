@@ -51,6 +51,58 @@ pub enum AgentEvent {
     MemorySaved { ok: bool, facts: usize, error: Option<String> },
     /// `forget()` finished: memory deleted, fresh session started.
     Forgotten,
+    /// The models and modes this agent offers, and which are in use.
+    Choices(Choices),
+}
+
+/// What can be picked for the session (an agent may offer neither).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Choices {
+    pub model: Option<Select>,
+    pub mode: Option<Select>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Select {
+    /// The `id` in use.
+    pub current: String,
+    pub options: Vec<Choice>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Choice {
+    pub id: String,
+    pub name: String,
+}
+
+impl Select {
+    /// The name of the option in use (its id if it isn't listed).
+    pub fn current_name(&self) -> &str {
+        self.options.iter().find(|o| o.id == self.current).map(|o| o.name.as_str()).unwrap_or(&self.current)
+    }
+}
+
+/// Which session setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setting {
+    Model,
+    Mode,
+}
+
+impl Choices {
+    pub fn get(&self, which: Setting) -> Option<&Select> {
+        match which {
+            Setting::Model => self.model.as_ref(),
+            Setting::Mode => self.mode.as_ref(),
+        }
+    }
+
+    fn get_mut(&mut self, which: Setting) -> Option<&mut Select> {
+        match which {
+            Setting::Model => self.model.as_mut(),
+            Setting::Mode => self.mode.as_mut(),
+        }
+    }
 }
 
 enum Req {
@@ -64,6 +116,8 @@ enum Req {
     /// End this session (saving memory first if `save`) and carry on with
     /// another agent.
     Switch { cfg: Box<Config>, save: bool },
+    /// Use another model or mode, now and in later sessions.
+    Set { which: Setting, value: String },
 }
 
 #[derive(Clone)]
@@ -118,6 +172,11 @@ impl AgentHandle {
     pub fn forget(&self) {
         let _ = self.tx.send(Req::Forget);
     }
+
+    /// Use model or mode `value` (an id from `AgentEvent::Choices`).
+    pub fn set(&self, which: Setting, value: impl Into<String>) {
+        let _ = self.tx.send(Req::Set { which, value: value.into() });
+    }
 }
 
 /// What a backend makes of the agent's output.
@@ -135,6 +194,17 @@ pub(crate) enum Event {
     PermissionClosed { id: String },
     /// The turn ended. `error` says why when `ok` is false.
     TurnEnd { ok: bool, error: Option<String> },
+    /// What the session offers, or a change to which is in use.
+    Choices(Choices),
+}
+
+/// How a backend took a new setting.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Applied {
+    /// In effect for the running session.
+    Live,
+    /// Only a new session picks it up.
+    NextSession,
 }
 
 /// Starts an agent. One per configured agent; lives as long as the app.
@@ -149,6 +219,8 @@ pub(crate) trait Backend: Send + Sync + 'static {
     /// straight away (such as `Ready`), or why it couldn't start.
     fn start(&self, home: &Path, prompt: &str)
     -> impl Future<Output = Result<(Self::Conn, Vec<Event>), String>> + Send;
+    /// Use this model or mode for sessions started from now on.
+    fn remember(&mut self, which: Setting, value: &str);
 }
 
 /// A running agent. Writes are queued and sent by `flush`, so reading
@@ -170,6 +242,8 @@ pub(crate) trait Conn: Send {
     fn answer(&mut self, id: &str, answer: Answer) -> bool;
     /// Queue a refusal for every open permission question.
     fn deny_all(&mut self);
+    /// Change the running session's model or mode.
+    fn set(&mut self, which: Setting, value: &str) -> impl Future<Output = Result<Applied, String>> + Send;
     /// Start a fresh session in the running agent, as `Backend::start` does
     /// for a new one. `Err` if it can't: the agent is then restarted.
     fn new_session(&mut self, home: &Path, prompt: &str) -> impl Future<Output = Result<Vec<Event>, String>> + Send;
@@ -218,6 +292,8 @@ enum After {
     Drained,
     /// The memory update finished.
     Memory { ok: bool, reply: String },
+    /// The session's choices: keep and show them.
+    Choices(Choices),
 }
 
 /// Everything the actor owns, so its steps can be methods.
@@ -238,6 +314,8 @@ struct Session<B: Backend, F> {
     start_error: Option<String>,
     /// Hand over to this agent once the session has ended.
     switch_to: Option<Config>,
+    /// What the session offers, as last reported.
+    choices: Choices,
 }
 
 impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
@@ -259,8 +337,15 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
     /// Events that need nothing more than showing (from starting a session).
     fn apply(&mut self, events: Vec<Event>) {
         for e in events {
-            on_event(e, &mut self.turn, &self.emit);
+            if let After::Choices(c) = on_event(e, &mut self.turn, &self.emit) {
+                self.show_choices(c);
+            }
         }
+    }
+
+    fn show_choices(&mut self, c: Choices) {
+        self.choices = c;
+        (self.emit)(AgentEvent::Choices(self.choices.clone()));
     }
 
     /// End the current session and start a new one: in the same agent if
@@ -358,6 +443,36 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
             Err(e) => {
                 self.memory_failed(e.to_string());
                 false
+            }
+        }
+    }
+
+    async fn set(&mut self, which: Setting, value: String) {
+        self.backend.remember(which, &value);
+        let applied = match self.conn.as_mut() {
+            // A save is running: the next session gets it.
+            Some(_) if self.turn.active && self.turn.internal => Ok(Applied::NextSession),
+            Some(c) => c.set(which, &value).await,
+            None => Ok(Applied::NextSession),
+        };
+        match applied {
+            Ok(Applied::Live) => {
+                eprintln!("fsc: {which:?} is now {value}");
+                if let Some(sel) = self.choices.get_mut(which) {
+                    sel.current = value;
+                    (self.emit)(AgentEvent::Choices(self.choices.clone()));
+                }
+            }
+            // Nothing said yet: a fresh session costs nothing, so start one.
+            Ok(Applied::NextSession) if self.conn.is_some() && !self.dirty && !self.turn.active => {
+                eprintln!("fsc: {which:?} is now {value} (new session)");
+                self.restart().await;
+            }
+            Ok(Applied::NextSession) => eprintln!("fsc: {which:?} will be {value} from the next session"),
+            Err(e) => {
+                eprintln!("fsc: could not change the {which:?} to {value}: {e}");
+                // Show the one still in use.
+                (self.emit)(AgentEvent::Choices(self.choices.clone()));
             }
         }
     }
@@ -460,6 +575,7 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
                 self.ask_queued().await;
             }
             Req::Switch { .. } => unreachable!("handled above"),
+            Req::Set { which, value } => self.set(which, value).await,
         }
     }
 
@@ -471,6 +587,10 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
         for event in events {
             let saving = match on_event(event, &mut self.turn, &self.emit) {
                 After::Nothing => continue,
+                After::Choices(c) => {
+                    self.show_choices(c);
+                    continue;
+                }
                 After::Refuse(id) => {
                     if let Some(c) = self.conn.as_mut() {
                         c.answer(&id, Answer::Deny);
@@ -576,6 +696,7 @@ where
         closing: false,
         start_error: None,
         switch_to: None,
+        choices: Choices::default(),
     };
     s.start().await;
     s.ask_queued().await;
@@ -645,6 +766,7 @@ fn on_event<F: Fn(AgentEvent)>(event: Event, turn: &mut Turn, emit: &F) -> After
             }
         }
         Event::PermissionClosed { id } => emit(AgentEvent::PermissionClosed { id }),
+        Event::Choices(c) => return After::Choices(c),
         Event::TurnEnd { ok: success, error } => {
             if !turn.active {
                 return After::Nothing;
@@ -831,6 +953,9 @@ mod tests {
             fn prepare(&self, _: &Path) -> std::io::Result<()> {
                 Ok(())
             }
+            fn remember(&mut self, which: Setting, value: &str) {
+                self.note(format!("remember {which:?} {value}"));
+            }
             async fn start(&self, _: &Path, prompt: &str) -> Result<(FakeConn, Vec<Event>), String> {
                 let (tx, rx) = mpsc::unbounded_channel();
                 *self.out.lock().unwrap() = Some(tx);
@@ -891,6 +1016,10 @@ mod tests {
             }
             async fn new_session(&mut self, _: &Path, _: &str) -> Result<Vec<Event>, String> {
                 Err(String::new())
+            }
+            async fn set(&mut self, which: Setting, value: &str) -> Result<Applied, String> {
+                self.fake.note(format!("set {which:?} {value}"));
+                Ok(Applied::Live)
             }
             async fn close(self) -> String {
                 self.fake.note("close".into());

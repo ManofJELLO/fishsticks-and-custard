@@ -99,9 +99,8 @@ fn main() -> Result<()> {
             // The recording dot is always red, whatever the theme.
             accent: style::NOTHING_RED,
             shape: cfg.ui.tray_icon,
-            agent: cfg.agent.backend,
-            agents: fsc_core::config::AgentKind::ALL.map(|k| cfg.available(k)),
         },
+        tray::MenuState::new(&cfg),
         tray_rx,
         ev_tx.clone(),
     ));
@@ -202,8 +201,6 @@ fn dump_icons(dir: &str) -> Result<()> {
                     muted,
                     accent: style::NOTHING_RED,
                     shape,
-                    agent: Default::default(),
-                    agents: [true; 4],
                 };
                 for size in [22u32, 64] {
                     let path = format!("{dir}/{shape:?}-{theme:?}-{name}-{size}.png").to_lowercase();

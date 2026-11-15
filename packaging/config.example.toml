@@ -1,14 +1,15 @@
 # ~/.config/fsc/config.toml. Every key is optional; these are the defaults.
 
 [agent]
-backend = "claude"            # "claude", "codex", "antigravity", or "acp" (any ACP agent: set command)
+backend = "claude"            # "claude", "codex", "antigravity", "opencode", or "acp" (any ACP agent: set command)
 # home = "~/.local/share/fsc/home"   # persona.md, memory.md and the agent's settings live here
 session_idle_minutes = 20     # start a fresh session after this long idle (0 = never)
 memory = true                 # remember durable facts across sessions (fsc memory / fsc forget)
 # Switch from the tray's Agent menu or with `fsc agent <name>`; that rewrites `backend` here.
 # auto_allow = ["read", "search", "fetch", "think"]   # ACP agents: tool kinds that run without asking
 
-# Each ACP agent's own settings (the same keys in [codex], [antigravity] and [acp]):
+# Each ACP agent's own settings (the same keys in [codex], [antigravity], [opencode] and [acp]).
+# The tray's Model and Mode menus (or `fsc model` / `fsc mode`) write model and mode here.
 [codex]
 # command = ""                # the agent's program; empty = codex-acp (agy for antigravity)
 # args = []                   # with command set, the whole argument list ("acp" for agy)
@@ -19,6 +20,9 @@ memory = true                 # remember durable facts across sessions (fsc memo
 [antigravity]
 # model = ""
 
+[opencode]                    # free models with no account; `opencode auth login` for others
+# model = ""
+
 [acp]                         # any other Agent Client Protocol agent
 # command = ""
 # args = []
@@ -26,6 +30,7 @@ memory = true                 # remember durable facts across sessions (fsc memo
 [claude]
 bin = "claude"
 model = "sonnet"              # alias or full id, e.g. "haiku", "opus", "claude-sonnet-5-5"
+# permission_mode = ""        # "default" (ask), "acceptEdits", "auto" or "plan"
 setting_sources = "project,local"   # the assistant's own settings (+ your "always allow" answers), not your personal ones
 extra_args = []
 

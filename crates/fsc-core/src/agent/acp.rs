@@ -31,7 +31,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 use tokio::process::Child;
 
-use super::{Backend, Conn, Event};
+use super::{Applied, Backend, Choice, Choices, Conn, Event, Select, Setting};
 use crate::config::{AcpAgentConfig, AgentKind};
 use crate::permission::{Answer, PermissionAsk, phrase, truncate};
 
@@ -46,6 +46,7 @@ const AUTH_REQUIRED: i64 = -32000;
 
 /// How to run one kind of ACP agent.
 pub(crate) struct Acp {
+    kind: AgentKind,
     program: String,
     args: Vec<String>,
     env: Vec<(String, String)>,
@@ -77,6 +78,7 @@ impl Acp {
                 "read-only",
             ),
             AgentKind::Antigravity => ("agy", vec!["acp".into()], Some("agy acp --login"), Some("antigravity-cli"), ""),
+            AgentKind::OpenCode => ("opencode", vec!["acp".into()], Some("opencode auth login"), Some("opencode"), ""),
             AgentKind::Acp | AgentKind::Claude => ("", Vec::new(), None, None, ""),
         };
         let program = if cfg.command.is_empty() {
@@ -88,6 +90,7 @@ impl Acp {
         };
         args.extend(cfg.args.iter().cloned());
         Self {
+            kind,
             program,
             args,
             env: cfg.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -110,7 +113,18 @@ impl Backend for Acp {
     }
 
     fn prepare(&self, home: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(workspace(home))
+        std::fs::create_dir_all(workspace(home))?;
+        if self.kind == AgentKind::OpenCode {
+            seed_opencode(&workspace(home))?;
+        }
+        Ok(())
+    }
+
+    fn remember(&mut self, which: Setting, value: &str) {
+        match which {
+            Setting::Model => self.settings.model = value.into(),
+            Setting::Mode => self.settings.mode = value.into(),
+        }
     }
 
     async fn start(&self, home: &Path, prompt: &str) -> Result<(AcpConn, Vec<Event>), String> {
@@ -201,6 +215,12 @@ pub(crate) struct AcpConn {
     outbox: Vec<Value>,
     /// A tool ran since the last reply text: the next text is a new block.
     after_tool: bool,
+    /// What the session offers, and which config option (if any) sets
+    /// each: [model, mode]. `None`: the session/set_model or set_mode method.
+    choices: Choices,
+    via: [Option<String>; 2],
+    /// Setting requests in flight: what to go back to if refused.
+    setting_requests: Vec<(u64, Setting, String)>,
 }
 
 impl AcpConn {
@@ -222,6 +242,9 @@ impl AcpConn {
             pending: Vec::new(),
             outbox: Vec::new(),
             after_tool: false,
+            choices: Choices::default(),
+            via: [None, None],
+            setting_requests: Vec::new(),
         }
     }
 
@@ -261,32 +284,39 @@ impl AcpConn {
         self.session = r["sessionId"].as_str().ok_or("no session id from the agent")?.to_string();
         self.after_tool = false;
 
+        (self.choices, self.via) = session_choices(&r);
         let s = self.settings.clone();
-        if !s.mode.is_empty() {
-            self.set(&r, "mode", &s.mode, "session/set_mode", "modeId").await;
+        for (which, value) in [(Setting::Mode, &s.mode), (Setting::Model, &s.model)] {
+            if value.is_empty() || self.choices.get(which).is_some_and(|c| &c.current == value) {
+                continue;
+            }
+            let (method, params) = self.setting_request(which, value);
+            match self.call(method, params).await {
+                Ok(_) => {
+                    if let Some(sel) = self.choices.get_mut(which) {
+                        sel.current = value.clone();
+                    }
+                }
+                Err(e) => eprintln!("fsc: could not set the agent's {which:?} to {value:?}: {e}"),
+            }
         }
-        if !s.model.is_empty() {
-            self.set(&r, "model", &s.model, "session/set_model", "modelId").await;
-        }
-        let model = if s.model.is_empty() { current_model(&r) } else { s.model };
-        Ok(vec![Event::Ready { session_id: self.session.clone(), model }])
+        let model = match &self.choices.model {
+            Some(sel) => sel.current.clone(),
+            None if !s.model.is_empty() => s.model,
+            None => current_model(&r),
+        };
+        Ok(vec![Event::Ready { session_id: self.session.clone(), model }, Event::Choices(self.choices.clone())])
     }
 
-    /// Choose a session setting: by config option where the agent has one
-    /// for it, else by its dedicated method. Failures are only logged.
-    async fn set(&mut self, session: &Value, category: &str, value: &str, method: &str, key: &str) {
-        let option = session["configOptions"]
-            .as_array()
-            .and_then(|o| o.iter().find(|o| o["category"] == category || o["id"] == category))
-            .and_then(|o| o["id"].as_str())
-            .map(str::to_string);
-        let sid = self.session.clone();
-        let r = match option {
-            Some(id) => self.call("session/set_config_option", json!({ "sessionId": sid, "configId": id, "value": value })).await,
-            None => self.call(method, json!({ "sessionId": sid, key: value })).await,
-        };
-        if let Err(e) = r {
-            eprintln!("fsc: could not set the agent's {category} to {value:?}: {e}");
+    /// The request that sets a session setting: its config option where
+    /// the agent has one for it, else its dedicated method.
+    fn setting_request(&self, which: Setting, value: &str) -> (&'static str, Value) {
+        let sid = &self.session;
+        let via = &self.via[which as usize];
+        match (via, which) {
+            (Some(id), _) => ("session/set_config_option", json!({ "sessionId": sid, "configId": id, "value": value })),
+            (None, Setting::Model) => ("session/set_model", json!({ "sessionId": sid, "modelId": value })),
+            (None, Setting::Mode) => ("session/set_mode", json!({ "sessionId": sid, "modeId": value })),
         }
     }
 
@@ -373,7 +403,7 @@ impl AcpConn {
                     .collect()
             })
             .unwrap_or_default();
-        let kind = call["kind"].as_str().unwrap_or("other");
+        let kind = tool_kind(call);
         let rpc = v["id"].as_str().map(str::to_string).unwrap_or_else(|| v["id"].to_string());
         let pending = Pending { id: format!("acp-{rpc}"), rpc_id: v["id"].clone(), options };
         if self.settings.auto_allow.iter().any(|k| k == kind)
@@ -416,6 +446,15 @@ impl AcpConn {
     }
 
     fn on_response(&mut self, v: &Value) -> Vec<Event> {
+        if let Some(i) = self.setting_requests.iter().position(|(id, ..)| v["id"] == json!(id)) {
+            let (_, which, before) = self.setting_requests.remove(i);
+            let Some(e) = v.get("error") else { return Vec::new() };
+            eprintln!("fsc: the agent wouldn't change its {which:?}: {}", self.describe(e));
+            if let Some(sel) = self.choices.get_mut(which) {
+                sel.current = before;
+            }
+            return vec![Event::Choices(self.choices.clone())];
+        }
         if self.prompt_id.is_none() || v["id"] != json!(self.prompt_id) {
             if let Some(e) = v.get("error") {
                 eprintln!("fsc: the agent refused a request: {}", self.describe(e));
@@ -501,6 +540,24 @@ impl Conn for AcpConn {
         }
     }
 
+    async fn set(&mut self, which: Setting, value: &str) -> Result<Applied, String> {
+        match which {
+            Setting::Model => self.settings.model = value.into(),
+            Setting::Mode => self.settings.mode = value.into(),
+        }
+        if self.session.is_empty() || self.choices.get(which).is_none() {
+            return Ok(Applied::NextSession);
+        }
+        let (method, params) = self.setting_request(which, value);
+        let id = self.request(method, params).await.map_err(|e| e.to_string())?;
+        let before = self.choices.get(which).map(|c| c.current.clone()).unwrap_or_default();
+        self.setting_requests.push((id, which, before));
+        if let Some(sel) = self.choices.get_mut(which) {
+            sel.current = value.into();
+        }
+        Ok(Applied::Live)
+    }
+
     async fn new_session(&mut self, _home: &Path, prompt: &str) -> Result<Vec<Event>, String> {
         let old = std::mem::take(&mut self.session);
         if self.prompt_id.take().is_some() {
@@ -534,6 +591,84 @@ impl Conn for AcpConn {
 /// The reply to an agent request we don't handle: refuse a permission
 /// question we can't place, and say other methods don't exist (we offered
 /// no file system or terminal).
+/// opencode allows every tool by default, and a project config in its
+/// working folder outranks the user's own. This one sends every action to
+/// FSC as a question; FSC then allows reads and searches (`auto_allow`) and
+/// asks about the rest. Written once: edits to it are kept.
+fn seed_opencode(workspace: &Path) -> std::io::Result<()> {
+    let dir = workspace.join(".opencode");
+    let file = dir.join("opencode.json");
+    if file.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(
+        file,
+        r#"{
+  "$schema": "https://opencode.ai/config.json",
+  "permissions": [
+    { "action": "*", "resource": "*", "effect": "ask" }
+  ]
+}
+"#,
+    )
+}
+
+/// The models and modes a new session offers: from its config options
+/// where it has them (newer agents), else its model and mode lists.
+fn session_choices(r: &Value) -> (Choices, [Option<String>; 2]) {
+    let options = r["configOptions"].as_array().cloned().unwrap_or_default();
+    let from_option = |category: &str| -> Option<(Select, String)> {
+        let o = options.iter().find(|o| o["category"] == category || o["id"] == category)?;
+        // Options may be grouped: {group, name, options: [...]}.
+        let mut flat = Vec::new();
+        for x in o["options"].as_array()? {
+            match x["options"].as_array() {
+                Some(group) => flat.extend(group.iter().cloned()),
+                None => flat.push(x.clone()),
+            }
+        }
+        let options = flat
+            .iter()
+            .filter_map(|x| {
+                let id = x["value"].as_str()?;
+                Some(Choice { id: id.into(), name: x["name"].as_str().unwrap_or(id).into() })
+            })
+            .collect();
+        Some((Select { current: o["currentValue"].as_str().unwrap_or_default().into(), options }, o["id"].as_str()?.into()))
+    };
+    let from_list = |list: &Value, key: &str, current: &Value| -> Option<Select> {
+        let options: Vec<Choice> = list
+            .as_array()?
+            .iter()
+            .filter_map(|x| {
+                let id = x[key].as_str()?;
+                Some(Choice { id: id.into(), name: x["name"].as_str().unwrap_or(id).into() })
+            })
+            .collect();
+        (!options.is_empty()).then(|| Select { current: current.as_str().unwrap_or_default().into(), options })
+    };
+    let (model, model_via) = match from_option("model") {
+        Some((s, id)) => (Some(s), Some(id)),
+        None => (from_list(&r["models"]["availableModels"], "modelId", &r["models"]["currentModelId"]), None),
+    };
+    let (mode, mode_via) = match from_option("mode") {
+        Some((s, id)) => (Some(s), Some(id)),
+        None => (from_list(&r["modes"]["availableModes"], "id", &r["modes"]["currentModeId"]), None),
+    };
+    (Choices { model, mode }, [model_via, mode_via])
+}
+
+/// A tool call's kind, reading "other" by what it carries: opencode's web
+/// search is "other" with a query.
+fn tool_kind(call: &Value) -> &str {
+    match call["kind"].as_str().unwrap_or("other") {
+        "other" if call["rawInput"]["query"].is_string() => "search",
+        "other" if call["rawInput"]["url"].is_string() => "fetch",
+        k => k,
+    }
+}
+
 /// Where ACP agents work: see the module docs.
 fn workspace(home: &Path) -> PathBuf {
     home.join("workspace")
@@ -585,12 +720,14 @@ fn describe_tool(id: &str, call: &Value, can_always: bool) -> PermissionAsk {
     };
     let path = call["locations"][0]["path"].as_str().map(str::to_string);
     let url = input["url"].as_str().map(str::to_string);
-    let (tool, action, detail) = match call["kind"].as_str().unwrap_or("other") {
+    let query = input["query"].as_str().map(str::to_string);
+    let (tool, action, detail) = match tool_kind(call) {
         "execute" => ("Command", "run a command".to_string(), command.or(title.map(String::from))),
         "edit" => ("Edit", "change a file".into(), path.or(title.map(String::from))),
         "delete" => ("Delete", "delete a file".into(), path.or(title.map(String::from))),
         "move" => ("Move", "move a file".into(), title.map(String::from)),
         "read" => ("Read", "read a file".into(), path.or(title.map(String::from))),
+        "search" if query.is_some() => ("Web search", "search the web".into(), query),
         "search" => ("Search", "search".into(), title.map(String::from)),
         "fetch" => ("Web", "open a web page".into(), url.or(title.map(String::from))),
         "think" => ("Think", "think it through".into(), None),
@@ -674,7 +811,7 @@ mod tests {
             c.open(home, "You are Custard."),
             a.handshake(json!({ "sessionCapabilities": { "systemPrompt": {} } }), "s1")
         );
-        assert!(matches!(&opened.unwrap()[..], [Event::Ready { model, .. }] if model == "fake-1"));
+        assert!(matches!(&opened.unwrap()[..], [Event::Ready { model, .. }, Event::Choices(_)] if model == "fake-1"));
         assert_eq!(new["params"]["systemPrompt"]["content"][0]["text"], "You are Custard.");
         assert_eq!(new["params"]["cwd"], "/tmp");
 
@@ -788,12 +925,66 @@ mod tests {
     }
 
     #[test]
+    fn choices_from_either_format() {
+        // Config options (Antigravity, opencode), grouped or not.
+        let r = json!({ "configOptions": [
+            { "id": "model", "category": "model", "currentValue": "b",
+              "options": [{ "value": "a", "name": "A" }, { "group": "g", "name": "G", "options": [{ "value": "b", "name": "B" }] }] },
+            { "id": "mode", "category": "mode", "currentValue": "build", "options": [{ "value": "build", "name": "Build" }] } ] });
+        let (c, via) = session_choices(&r);
+        let m = c.model.unwrap();
+        assert_eq!((m.current.as_str(), m.current_name(), m.options.len()), ("b", "B", 2));
+        assert_eq!(via, [Some("model".into()), Some("mode".into())]);
+        // Plain lists (older agents): set through set_model / set_mode.
+        let r = json!({ "models": { "currentModelId": "x", "availableModels": [{ "modelId": "x", "name": "X" }] },
+                        "modes": { "currentModeId": "ask", "availableModes": [{ "id": "ask", "name": "Ask" }] } });
+        let (c, via) = session_choices(&r);
+        assert_eq!(c.mode.unwrap().current_name(), "Ask");
+        assert_eq!(via, [None, None]);
+        assert_eq!(session_choices(&json!({})).0, Choices::default());
+    }
+
+    #[tokio::test]
+    async fn changing_the_model_live() {
+        let (mut c, mut a) = pair(settings());
+        let (opened, ()) = tokio::join!(c.open(Path::new("/tmp"), "p"), async {
+            let init = a.read().await;
+            a.reply(&init["id"], json!({ "protocolVersion": 1, "agentCapabilities": {} })).await;
+            let new = a.read().await;
+            a.reply(&new["id"], json!({ "sessionId": "s1",
+                "models": { "currentModelId": "x", "availableModels": [{ "modelId": "x" }, { "modelId": "y" }] } })).await;
+        });
+        opened.unwrap();
+        assert_eq!(c.set(Setting::Model, "y").await, Ok(Applied::Live));
+        let req = a.read().await;
+        assert_eq!((req["method"].as_str(), req["params"]["modelId"].as_str()), (Some("session/set_model"), Some("y")));
+        // No modes on offer: wait for a new session.
+        assert_eq!(c.set(Setting::Mode, "plan").await, Ok(Applied::NextSession));
+        // The agent says no: back to the one in use.
+        a.send(json!({ "jsonrpc": "2.0", "id": req["id"], "error": { "code": -32602, "message": "unknown model" } })).await;
+        let ev = events(&mut c, 1).await;
+        assert!(matches!(&ev[..], [Event::Choices(ch)] if ch.model.as_ref().unwrap().current == "x"));
+        // ...but new sessions still ask for it (it may exist there).
+        assert_eq!(c.settings.model, "y");
+    }
+
+    #[test]
+    fn web_searches_count_as_searches() {
+        let call = json!({ "kind": "other", "title": "arch kernel", "rawInput": { "query": "arch kernel" } });
+        assert_eq!(tool_kind(&call), "search");
+        let ask = describe_tool("x", &call, false);
+        assert_eq!((ask.spoken.as_str(), ask.detail.as_deref()), ("May I search the web?", Some("arch kernel")));
+    }
+
+    #[test]
     fn presets() {
         let mut cfg = AcpAgentConfig::default();
         let a = Acp::new(AgentKind::Antigravity, &cfg, &[]);
         assert_eq!((a.program.as_str(), a.args.clone()), ("agy", vec!["acp".to_string()]));
         let a = Acp::new(AgentKind::Codex, &cfg, &[]);
         assert_eq!((a.program.as_str(), a.settings.mode.as_str()), ("codex-acp", "read-only"));
+        let a = Acp::new(AgentKind::OpenCode, &cfg, &[]);
+        assert_eq!((a.program.as_str(), a.args.clone()), ("opencode", vec!["acp".to_string()]));
         cfg.command = "/opt/my-agent".into();
         cfg.args = vec!["--acp".into()];
         cfg.mode = "auto".into();

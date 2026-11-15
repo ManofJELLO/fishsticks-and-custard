@@ -43,6 +43,10 @@ pub enum Command {
     /// Switch to another agent ("claude", "codex", "antigravity", "acp")
     /// from now on, or say which one answers (`None`).
     Agent { backend: Option<String> },
+    /// Use another model (an id the agent lists), or list them (`None`).
+    Model { value: Option<String> },
+    /// Use another mode (an id the agent lists), or list them (`None`).
+    Mode { value: Option<String> },
     Quit,
 }
 

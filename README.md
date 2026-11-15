@@ -3,7 +3,8 @@
 A voice desktop assistant for Arch + Hyprland, written in Rust. You summon it with the
 wake phrase *"fishsticks and custard"*, a hotkey, or the tray icon.
 It runs on the AI subscription you already have: Claude (through Claude Code), ChatGPT
-(through Codex) or Google (through Antigravity CLI). See [Choosing an agent](#choosing-an-agent).
+(through Codex) or Google (through Antigravity CLI), or on OpenCode's free models.
+See [Choosing an agent](#choosing-an-agent).
 
 ## Status
 
@@ -63,11 +64,19 @@ and your next question goes to the new agent, which starts with the same memory.
 choice is saved as `backend` in the `[agent]` section of `~/.config/fsc/config.toml`; agents
 that aren't installed are greyed out in the menu.
 
+The tray menu's **Model** and **Mode** submenus list what the current agent offers
+(`fsc model` and `fsc mode` print the same lists, and `fsc model <id>` switches). A change
+applies to the conversation you're in, and is saved in that agent's section of the config
+so later sessions keep it. The mode is the agent's own idea of how much to ask first: for
+Claude, Ask (default), Accept edits, Auto or Plan; Codex's read-only asks before edits,
+commands and network use. The popup shows the model and mode in its top line.
+
 | `backend` | Needs | Sign in with |
 |---|---|---|
 | `"claude"` (default) | Claude Code CLI (`claude`) | `claude`, once, interactively |
 | `"codex"` | Codex CLI and `codex-acp` (AUR `codex-acp`, or `npm i -g @agentclientprotocol/codex-acp`) | `codex login` |
 | `"antigravity"` | Antigravity CLI `agy` 1.5 or newer (AUR `antigravity-cli`) | `agy acp --login` |
+| `"opencode"` | OpenCode (`pacman -S opencode`) | nothing for its free models; `opencode auth login` for your own providers |
 | `"acp"` | any [Agent Client Protocol](https://agentclientprotocol.com) agent: set `command` and `args` in `[acp]` | the agent's own way |
 
 Each agent has its own section for its settings, so switching back and forth keeps them:
@@ -83,6 +92,9 @@ backend = "codex"
 [antigravity]
 # model = "gemini-3.8-flash-low"
 
+[opencode]
+# model = "opencode/big-pickle"
+
 [acp]
 # command = "my-agent"
 # args = ["--acp"]
@@ -96,6 +108,9 @@ on the same card (see [Permission questions](#permission-questions)). ACP agents
 write there freely (Antigravity also writes in `/tmp` without asking), but changes to the
 assistant's own files and to anything of yours are asked about. Reading, searching, web
 fetches and thinking run without asking; set `auto_allow` to change which tool kinds do.
+OpenCode lets itself do anything by default, so FSC gives it a project config of its own,
+`~/.local/share/fsc/home/workspace/.opencode/opencode.json`, that asks about every action
+(your own OpenCode settings are left alone; edit that file to change what's asked).
 If an agent isn't signed in, the popup says which command to run.
 
 ## Build from source
@@ -161,7 +176,8 @@ show in rofi with `rofi -show drun -drun-show-actions`.
 | `fsc status` | `ready`, `thinking`, `listening`, … |
 | `fsc memory` | show what it remembers between sessions |
 | `fsc forget` / tray **Forget memories** | delete that memory and start a fresh session |
-| `fsc agent [name]` / tray **Agent** | say which agent answers, or switch (claude, codex, antigravity, acp) |
+| `fsc agent [name]` / tray **Agent** | say which agent answers, or switch (claude, codex, antigravity, opencode, acp) |
+| `fsc model [id]` / `fsc mode [id]` / tray **Model**, **Mode** | list the agent's models or modes, or switch |
 
 ## Customise
 

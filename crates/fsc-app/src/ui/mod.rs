@@ -21,13 +21,14 @@ use tokio::sync::mpsc;
 
 use fsc_audio::{AudioEvent, AudioHandle};
 use fsc_core::Phase;
-use fsc_core::agent::{AgentEvent, AgentHandle, pretty_model, pretty_tool};
+use fsc_core::agent::{AgentEvent, AgentHandle, Choices, Setting, pretty_model, pretty_tool};
 use fsc_core::config::{AgentKind, Config, SpeakMode, Surface};
 use fsc_core::ipc::{Command, Reply};
 use fsc_core::permission::{self, Answer, PermissionAsk};
 
 use crate::AppEvent;
 use crate::icon::IconState;
+use crate::tray::{self, TrayUpdate};
 use crate::style::{self, Palette, Rgb, ThemeMode};
 use speech_text::SentenceBuffer;
 use viz::Viz;
@@ -103,7 +104,10 @@ struct State {
     model: String,
     /// The agent answering, and which are installed (`AgentKind::ALL` order).
     agent: AgentKind,
-    agents: [bool; 4],
+    agents: [bool; AgentKind::ALL.len()],
+    /// The models and modes the agent offers.
+    choices: Choices,
+    menu_sent: Option<tray::MenuState>,
     voice: Voice,
     viz: Viz,
     last_frame: Option<i64>,
@@ -158,7 +162,7 @@ pub struct Ui {
     cfg: Config,
     claude: AgentHandle,
     audio: AudioHandle,
-    tray_tx: mpsc::UnboundedSender<IconState>,
+    tray_tx: mpsc::UnboundedSender<TrayUpdate>,
     app: gtk::Application,
     window: gtk::ApplicationWindow,
     panel: gtk::DrawingArea,
@@ -185,7 +189,7 @@ impl Ui {
         accent_pin: Option<Rgb>,
         claude: AgentHandle,
         audio: AudioHandle,
-        tray_tx: mpsc::UnboundedSender<IconState>,
+        tray_tx: mpsc::UnboundedSender<TrayUpdate>,
     ) -> Rc<Self> {
         let window = gtk::ApplicationWindow::builder()
             .application(app)
@@ -317,6 +321,8 @@ impl Ui {
                 model,
                 agent,
                 agents,
+                choices: Choices::default(),
+                menu_sent: None,
                 voice: Voice::default(),
                 viz,
                 last_frame: None,
@@ -570,6 +576,8 @@ impl Ui {
                 };
                 return self.switch_agent(kind);
             }
+            Command::Model { value } => return self.set_choice(Setting::Model, value),
+            Command::Mode { value } => return self.set_choice(Setting::Mode, value),
             Command::Quit => self.quit(),
         }
         Reply::ok()
@@ -692,6 +700,22 @@ impl Ui {
                 }
             }
             AgentEvent::Forgotten => self.flash_meta("MEMORY CLEARED"),
+            AgentEvent::Choices(c) => {
+                {
+                    let mut st = self.st.borrow_mut();
+                    if let Some(m) = &c.model
+                        && !m.current.is_empty()
+                    {
+                        let name = m.current_name();
+                        st.model = if name == m.current { pretty_model(name) } else { name.to_uppercase() };
+                    }
+                    st.choices = c;
+                }
+                if self.st.borrow().meta_timer.is_none() {
+                    self.restore_meta();
+                }
+                self.push_tray();
+            }
         }
     }
 
@@ -920,6 +944,8 @@ impl Ui {
             st.last_activity = None;
             st.agent = kind;
             st.model = pretty_model(&cfg.model_hint());
+            // The new agent says what it offers once it's up.
+            st.choices = Choices::default();
         }
         self.add_divider(&format!("NOW {}", kind.name().to_uppercase()));
         self.flash_meta(&format!("AGENT: {}", kind.name().to_uppercase()));
@@ -1456,19 +1482,65 @@ impl Ui {
             muted: st.muted,
             accent: style::NOTHING_RED,
             shape: self.cfg.ui.tray_icon,
-            agent: st.agent,
-            agents: st.agents,
         };
         // Each update re-renders the icon at 6 sizes and signals the tray host.
         if st.tray_sent != Some(state) {
             st.tray_sent = Some(state);
-            let _ = self.tray_tx.send(state);
+            let _ = self.tray_tx.send(TrayUpdate::Icon(state));
+        }
+        let menu = tray::MenuState { agent: st.agent, agents: st.agents, choices: st.choices.clone() };
+        if st.menu_sent.as_ref() != Some(&menu) {
+            st.menu_sent = Some(menu.clone());
+            let _ = self.tray_tx.send(TrayUpdate::Menu(menu));
         }
     }
 
     fn restore_meta(&self) {
-        let model = self.st.borrow().model.clone();
-        self.meta.set_text(&format!("{model}  ·  ⏎ SEND  ·  ESC"));
+        let st = self.st.borrow();
+        let mode = st.choices.mode.as_ref().map(|m| format!("{}  ·  ", m.current_name().to_uppercase())).unwrap_or_default();
+        self.meta.set_text(&format!("{}  ·  {mode}⏎ SEND  ·  ESC", st.model));
+    }
+
+    /// `fsc model` / `fsc mode` and the tray's Model and Mode menus: list
+    /// what the agent offers, or switch (saved in the agent's config table).
+    fn set_choice(self: &Rc<Self>, which: Setting, value: Option<String>) -> Reply {
+        let (agent, sel) = {
+            let st = self.st.borrow();
+            (st.agent, st.choices.get(which).cloned())
+        };
+        let what = if which == Setting::Mode { "mode" } else { "model" };
+        let Some(value) = value else {
+            let Some(sel) = sel else {
+                return Reply::err(format!("{} hasn't offered any {what}s (it does once its session is up)", agent.name()));
+            };
+            let lines: Vec<String> = sel
+                .options
+                .iter()
+                .map(|o| {
+                    let mark = if o.id == sel.current { "*" } else { " " };
+                    if o.name == o.id { format!("{mark} {}", o.id) } else { format!("{mark} {}  ({})", o.id, o.name) }
+                })
+                .collect();
+            return Reply::state(lines.join("\n"));
+        };
+        let name = match &sel {
+            Some(sel) => match sel.options.iter().find(|o| o.id == value) {
+                Some(o) => o.name.clone(),
+                None => return Reply::err(format!("{} has no {what} {value:?} (`fsc {what}` lists them)", agent.name())),
+            },
+            None => value.clone(),
+        };
+        self.claude.set(which, &value);
+        let (table, key) = Config::setting_key(agent, which == Setting::Mode);
+        let saved = Config::save_value(table, key, &value);
+        if let Err(e) = &saved {
+            eprintln!("fsc: could not save the {what}: {e:#}");
+        }
+        self.flash_meta(&format!("{}: {}", what.to_uppercase(), name.to_uppercase()));
+        match saved {
+            Ok(()) => Reply::state(format!("{what} is now {name}")),
+            Err(e) => Reply::state(format!("{what} is now {name} (not saved: {e:#})")),
+        }
     }
 
     fn flash_meta(self: &Rc<Self>, text: &str) {

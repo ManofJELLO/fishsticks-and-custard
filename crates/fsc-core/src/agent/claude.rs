@@ -19,7 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
 use super::claude_ask::{self, Pending};
-use super::{Backend, Conn, Event};
+use super::{Applied, Backend, Choice, Choices, Conn, Event, Select, Setting};
 use crate::config::ClaudeConfig;
 use crate::permission::Answer;
 
@@ -58,7 +58,34 @@ impl Backend for ClaudeCli {
 
     async fn start(&self, home: &Path, prompt: &str) -> Result<(ClaudeConn, Vec<Event>), String> {
         // The CLI says which model it's using once the first prompt is in.
-        start(&self.cfg, home, prompt).map(|c| (c, Vec::new()))
+        start(&self.cfg, home, prompt).map(|c| (c, vec![Event::Choices(choices(&self.cfg))]))
+    }
+
+    fn remember(&mut self, which: Setting, value: &str) {
+        match which {
+            Setting::Model => self.cfg.model = value.into(),
+            Setting::Mode => self.cfg.permission_mode = value.into(),
+        }
+    }
+}
+
+/// The models and permission modes on offer. Modes that skip questions
+/// altogether (bypassPermissions, dontAsk) aren't: the user is asked.
+fn choices(cfg: &ClaudeConfig) -> Choices {
+    let list = |items: &[(&str, &str)], current: &str| {
+        let mut options: Vec<Choice> = items.iter().map(|(id, name)| Choice { id: (*id).into(), name: (*name).into() }).collect();
+        if !current.is_empty() && !options.iter().any(|o| o.id == current) {
+            options.push(Choice { id: current.into(), name: current.into() });
+        }
+        Select { current: current.into(), options }
+    };
+    let mode = if cfg.permission_mode.is_empty() { "default" } else { &cfg.permission_mode };
+    Choices {
+        model: Some(list(&[("sonnet", "Sonnet"), ("opus", "Opus"), ("haiku", "Haiku")], &cfg.model)),
+        mode: Some(list(
+            &[("default", "Ask"), ("acceptEdits", "Accept edits"), ("auto", "Auto"), ("plan", "Plan")],
+            mode,
+        )),
     }
 }
 
@@ -123,6 +150,17 @@ pub(crate) struct ClaudeConn {
     outbox: Vec<Value>,
     /// Numbers our own control requests.
     req_id: u64,
+    /// A prompt has been sent. Before that, a model set over the control
+    /// channel is overridden when the session starts.
+    prompted: bool,
+}
+
+impl ClaudeConn {
+    async fn control(&mut self, request: Value) -> std::io::Result<()> {
+        self.req_id += 1;
+        let msg = json!({ "type": "control_request", "request_id": format!("fsc_{}", self.req_id), "request": request });
+        write_line(&mut self.stdin, &msg).await
+    }
 }
 
 impl Conn for ClaudeConn {
@@ -146,17 +184,25 @@ impl Conn for ClaudeConn {
 
     async fn prompt(&mut self, text: &str) -> std::io::Result<()> {
         let msg = json!({ "type": "user", "message": { "role": "user", "content": text } });
-        write_line(&mut self.stdin, &msg).await
+        write_line(&mut self.stdin, &msg).await?;
+        self.prompted = true;
+        Ok(())
     }
 
     async fn interrupt(&mut self) -> std::io::Result<()> {
-        self.req_id += 1;
-        let msg = json!({
-            "type": "control_request",
-            "request_id": format!("fsc_{}", self.req_id),
-            "request": { "subtype": "interrupt" },
-        });
-        write_line(&mut self.stdin, &msg).await
+        self.control(json!({ "subtype": "interrupt" })).await
+    }
+
+    async fn set(&mut self, which: Setting, value: &str) -> Result<Applied, String> {
+        if !self.prompted {
+            return Ok(Applied::NextSession);
+        }
+        let request = match which {
+            Setting::Model => json!({ "subtype": "set_model", "model": value }),
+            Setting::Mode => json!({ "subtype": "set_permission_mode", "mode": value }),
+        };
+        self.control(request).await.map_err(|e| e.to_string())?;
+        Ok(Applied::Live)
     }
 
     fn answer(&mut self, id: &str, answer: Answer) -> bool {
@@ -211,6 +257,9 @@ fn start(cfg: &ClaudeConfig, home: &Path, prompt: &str) -> Result<ClaudeConn, St
         "--permission-prompt-tool",
         "stdio",
     ]);
+    if !cfg.permission_mode.is_empty() {
+        cmd.arg("--permission-mode").arg(&cfg.permission_mode);
+    }
     // Fall back to the bare persona if the combined prompt can't be written.
     let persona = home.join("persona.md");
     let prompt_file = home.join(".session-prompt.md");
@@ -262,6 +311,7 @@ fn start(cfg: &ClaudeConfig, home: &Path, prompt: &str) -> Result<ClaudeConn, St
         pending: Vec::new(),
         outbox: Vec::new(),
         req_id: 0,
+        prompted: false,
     })
 }
 
@@ -314,6 +364,13 @@ fn parse_line(line: &str, pending: &mut Vec<Pending>) -> (Option<Event>, Option<
             let Some(i) = pending.iter().position(|p| p.id == id) else { return (None, None) };
             pending.remove(i);
             Event::PermissionClosed { id }
+        }
+        Some("control_response") => {
+            let r = &v["response"];
+            if r["subtype"] == "error" {
+                eprintln!("fsc: claude refused {}: {}", s(&r["request_id"]), s(&r["error"]));
+            }
+            return (None, None);
         }
         Some("result") => {
             // The turn is over, so nothing it asked is still waiting.

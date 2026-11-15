@@ -56,8 +56,18 @@ enum Cmd {
     Forget,
     /// Show which agent answers, or switch to another (saved in config.toml)
     Agent {
-        /// claude, codex, antigravity or acp
+        /// claude, codex, antigravity, opencode or acp
         backend: Option<String>,
+    },
+    /// List the agent's models, or switch to one (saved in config.toml)
+    Model {
+        /// An id from the list
+        id: Option<String>,
+    },
+    /// List the agent's modes (how much it asks first), or switch to one
+    Mode {
+        /// An id from the list
+        id: Option<String>,
     },
     /// Quit the daemon
     Quit,
@@ -97,6 +107,8 @@ fn main() -> ExitCode {
         Cmd::Memory => Command::Memory,
         Cmd::Forget => Command::Forget,
         Cmd::Agent { backend } => Command::Agent { backend },
+        Cmd::Model { id } => Command::Model { value: id },
+        Cmd::Mode { id } => Command::Mode { value: id },
         Cmd::Quit => Command::Quit,
     };
 

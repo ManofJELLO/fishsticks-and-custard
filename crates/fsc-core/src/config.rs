@@ -11,6 +11,7 @@ pub struct Config {
     pub claude: ClaudeConfig,
     pub codex: AcpAgentConfig,
     pub antigravity: AcpAgentConfig,
+    pub opencode: AcpAgentConfig,
     /// Any other ACP agent.
     pub acp: AcpAgentConfig,
     pub ui: UiConfig,
@@ -96,12 +97,17 @@ pub enum AgentKind {
     Codex,
     /// Google Antigravity CLI through `agy acp` (sign in with `agy acp --login`).
     Antigravity,
+    /// OpenCode through `opencode acp`: free models, or your own providers
+    /// (`opencode auth login`).
+    #[serde(rename = "opencode")]
+    OpenCode,
     /// Any other Agent Client Protocol agent: set `[acp] command`.
     Acp,
 }
 
 impl AgentKind {
-    pub const ALL: [AgentKind; 4] = [AgentKind::Claude, AgentKind::Codex, AgentKind::Antigravity, AgentKind::Acp];
+    pub const ALL: [AgentKind; 5] =
+        [AgentKind::Claude, AgentKind::Codex, AgentKind::Antigravity, AgentKind::OpenCode, AgentKind::Acp];
 
     /// As written in the config and on the command line.
     pub fn key(self) -> &'static str {
@@ -109,6 +115,7 @@ impl AgentKind {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Antigravity => "antigravity",
+            AgentKind::OpenCode => "opencode",
             AgentKind::Acp => "acp",
         }
     }
@@ -123,6 +130,7 @@ impl AgentKind {
             AgentKind::Claude => "Claude",
             AgentKind::Codex => "Codex",
             AgentKind::Antigravity => "Antigravity",
+            AgentKind::OpenCode => "OpenCode",
             AgentKind::Acp => "Custom agent",
         }
     }
@@ -184,6 +192,9 @@ pub struct ClaudeConfig {
     pub bin: String,
     /// Model alias or full id passed to `--model`.
     pub model: String,
+    /// Claude Code's permission mode: "default" (ask), "acceptEdits",
+    /// "auto" or "plan". Empty: default.
+    pub permission_mode: String,
     /// Old place for `[agent] home`, still read when that isn't set.
     pub home: Option<PathBuf>,
     /// Passed to `--setting-sources`. "project" keeps your personal
@@ -202,6 +213,7 @@ impl Default for ClaudeConfig {
         Self {
             bin: "claude".into(),
             model: "sonnet".into(),
+            permission_mode: String::new(),
             home: None,
             setting_sources: "project,local".into(),
             extra_args: Vec::new(),
@@ -378,6 +390,7 @@ impl Config {
         match kind {
             AgentKind::Codex => &self.codex,
             AgentKind::Antigravity => &self.antigravity,
+            AgentKind::OpenCode => &self.opencode,
             AgentKind::Acp | AgentKind::Claude => &self.acp,
         }
     }
@@ -388,6 +401,7 @@ impl Config {
             AgentKind::Claude => return self.claude.bin.clone(),
             AgentKind::Codex => "codex-acp",
             AgentKind::Antigravity => "agy",
+            AgentKind::OpenCode => "opencode",
             AgentKind::Acp => "",
         };
         let own = &self.acp_agent(kind).command;
@@ -412,13 +426,29 @@ impl Config {
     /// Switch to `kind` from now on: set `[agent] backend` in the config
     /// file, keeping the rest of it (comments included) as it is.
     pub fn save_backend(kind: AgentKind) -> Result<()> {
+        Self::save_value("agent", "backend", kind.key())
+    }
+
+    /// Where `kind`'s model or mode is kept: (table, key).
+    pub fn setting_key(kind: AgentKind, mode: bool) -> (&'static str, &'static str) {
+        match (kind, mode) {
+            (AgentKind::Claude, false) => ("claude", "model"),
+            (AgentKind::Claude, true) => ("claude", "permission_mode"),
+            (k, false) => (k.key(), "model"),
+            (k, true) => (k.key(), "mode"),
+        }
+    }
+
+    /// Set `[table] key = value` in the config file, keeping the rest of it
+    /// (comments included) as it is.
+    pub fn save_value(table: &str, key: &str, value: &str) -> Result<()> {
         let path = Self::path().context("no config directory")?;
         let text = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        let new = set_backend(&text, kind).with_context(|| format!("parsing {}", path.display()))?;
+        let new = set_value(&text, table, key, value).with_context(|| format!("parsing {}", path.display()))?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -441,25 +471,30 @@ impl Config {
     }
 }
 
-/// `text` (a config file) with `[agent] backend` set to `kind`.
-fn set_backend(text: &str, kind: AgentKind) -> Result<String> {
+/// `text` (a config file) with `[table] key` set to `value`.
+fn set_value(text: &str, table: &str, key: &str, value: &str) -> Result<String> {
     let mut doc: toml_edit::DocumentMut = text.parse()?;
-    let agent = doc.entry("agent").or_insert_with(toml_edit::table);
-    let agent = agent.as_table_like_mut().context("`agent` isn't a table")?;
-    match agent.get_mut("backend") {
+    let t = doc.entry(table).or_insert_with(toml_edit::table);
+    let t = t.as_table_like_mut().with_context(|| format!("`{table}` isn't a table"))?;
+    match t.get_mut(key) {
         // Keep the comment that follows the value.
         Some(item) if item.is_value() => {
             let decor = item.as_value().map(|v| v.decor().clone());
-            *item = toml_edit::value(kind.key());
+            *item = toml_edit::value(value);
             if let (Some(d), Some(v)) = (decor, item.as_value_mut()) {
                 *v.decor_mut() = d;
             }
         }
         _ => {
-            agent.insert("backend", toml_edit::value(kind.key()));
+            t.insert(key, toml_edit::value(value));
         }
     }
     Ok(doc.to_string())
+}
+
+#[cfg(test)]
+fn set_backend(text: &str, kind: AgentKind) -> Result<String> {
+    set_value(text, "agent", "backend", kind.key())
 }
 
 /// Look `prog` up like a shell would: a path as given, a name on `$PATH`.
