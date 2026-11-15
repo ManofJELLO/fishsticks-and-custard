@@ -15,10 +15,16 @@
 //! system prompt where the agent offers one (the `systemPrompt` session
 //! capability, or Antigravity's `_meta` equivalent), and otherwise in front
 //! of the session's first prompt.
+//!
+//! The agent works in `<home>/workspace`, an empty folder of its own, not
+//! the assistant's home. Agents let themselves write in their workspace
+//! without asking (Antigravity does, whatever its mode), and the home holds
+//! the assistant's memory, persona and settings, which should never change
+//! behind the user's back.
 
 use serde_json::{Value, json};
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -102,18 +108,20 @@ impl Backend for Acp {
         &self.program
     }
 
-    fn prepare(&self, _: &Path) -> std::io::Result<()> {
-        Ok(())
+    fn prepare(&self, home: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(workspace(home))
     }
 
     async fn start(&self, home: &Path, prompt: &str) -> Result<(AcpConn, Vec<Event>), String> {
         if self.program.is_empty() {
             return Err("no agent command: set `command` in [agent]".into());
         }
+        let cwd = workspace(home);
+        std::fs::create_dir_all(&cwd).map_err(|e| format!("could not create {}: {e}", cwd.display()))?;
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(&self.args)
             .envs(self.env.iter().map(|(k, v)| (k, v)))
-            .current_dir(home)
+            .current_dir(&cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -146,7 +154,7 @@ impl Backend for Acp {
         conn.stderr = stderr;
         conn.program = self.program.clone();
         conn.login = self.login;
-        match conn.open(home, prompt).await {
+        match conn.open(&cwd, prompt).await {
             Ok(events) => Ok((conn, events)),
             Err(e) => {
                 let reason = conn.close().await;
@@ -177,6 +185,8 @@ pub(crate) struct AcpConn {
     lines: Reader,
     stderr: Arc<Mutex<VecDeque<String>>>,
     settings: Settings,
+    /// The agent's working folder.
+    cwd: PathBuf,
     /// From `initialize`: what the agent can do.
     caps: Value,
     session: String,
@@ -202,6 +212,7 @@ impl AcpConn {
             lines: BufReader::new(reader).lines(),
             stderr: Default::default(),
             settings,
+            cwd: PathBuf::new(),
             caps: Value::Null,
             session: String::new(),
             preamble: None,
@@ -213,8 +224,9 @@ impl AcpConn {
         }
     }
 
-    /// `initialize`, then the first session.
-    async fn open(&mut self, home: &Path, prompt: &str) -> Result<Vec<Event>, String> {
+    /// `initialize`, then the first session, working in `cwd`.
+    async fn open(&mut self, cwd: &Path, prompt: &str) -> Result<Vec<Event>, String> {
+        self.cwd = cwd.to_path_buf();
         let init = self
             .call(
                 "initialize",
@@ -230,11 +242,11 @@ impl AcpConn {
             return Err(format!("unsupported ACP version {}", init["protocolVersion"]));
         }
         self.caps = init["agentCapabilities"].clone();
-        self.session_new(home, prompt).await
+        self.session_new(prompt).await
     }
 
-    async fn session_new(&mut self, home: &Path, prompt: &str) -> Result<Vec<Event>, String> {
-        let mut params = json!({ "cwd": home, "mcpServers": [] });
+    async fn session_new(&mut self, prompt: &str) -> Result<Vec<Event>, String> {
+        let mut params = json!({ "cwd": self.cwd, "mcpServers": [] });
         let standard = !self.caps.pointer("/sessionCapabilities/systemPrompt").is_none_or(Value::is_null);
         let antigravity = self.caps.pointer("/_meta/antigravity/systemPrompt/append") == Some(&json!(true));
         if standard {
@@ -361,7 +373,8 @@ impl AcpConn {
             })
             .unwrap_or_default();
         let kind = call["kind"].as_str().unwrap_or("other");
-        let pending = Pending { id: format!("acp-{}", v["id"]), rpc_id: v["id"].clone(), options };
+        let rpc = v["id"].as_str().map(str::to_string).unwrap_or_else(|| v["id"].to_string());
+        let pending = Pending { id: format!("acp-{rpc}"), rpc_id: v["id"].clone(), options };
         if self.settings.auto_allow.iter().any(|k| k == kind)
             && let Some(opt) = pick(&pending.options, &["allow_once"])
         {
@@ -487,7 +500,7 @@ impl Conn for AcpConn {
         }
     }
 
-    async fn new_session(&mut self, home: &Path, prompt: &str) -> Result<Vec<Event>, String> {
+    async fn new_session(&mut self, _home: &Path, prompt: &str) -> Result<Vec<Event>, String> {
         let old = std::mem::take(&mut self.session);
         if self.prompt_id.take().is_some() {
             let _ = self.write(&json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": old } })).await;
@@ -498,7 +511,7 @@ impl Conn for AcpConn {
             // Free the old one; its answer is ignored.
             let _ = self.request("session/close", json!({ "sessionId": old })).await;
         }
-        self.session_new(home, prompt).await
+        self.session_new(prompt).await
     }
 
     async fn close(mut self) -> String {
@@ -520,6 +533,11 @@ impl Conn for AcpConn {
 /// The reply to an agent request we don't handle: refuse a permission
 /// question we can't place, and say other methods don't exist (we offered
 /// no file system or terminal).
+/// Where ACP agents work: see the module docs.
+fn workspace(home: &Path) -> PathBuf {
+    home.join("workspace")
+}
+
 fn refuse_request(v: &Value) -> Option<Value> {
     let id = v.get("id")?;
     Some(if v["method"] == "session/request_permission" {
@@ -558,7 +576,8 @@ fn current_model(session: &Value) -> String {
 fn describe_tool(id: &str, call: &Value, can_always: bool) -> PermissionAsk {
     let title = call["title"].as_str().map(str::trim).filter(|t| !t.is_empty());
     let input = &call["rawInput"];
-    let command = match &input["command"] {
+    // codex-acp says "command", Antigravity "CommandLine".
+    let command = match input.get("command").unwrap_or(&input["CommandLine"]) {
         Value::String(s) => Some(s.clone()),
         Value::Array(a) => Some(a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")),
         _ => None,
@@ -725,6 +744,8 @@ mod tests {
             .await;
         let ev = events(&mut c, 1).await;
         assert!(matches!(&ev[0], Event::Permission(ask) if ask.detail.as_deref() == Some("/tmp/a.txt")));
+        let ask = describe_tool("x", &json!({ "kind": "execute", "title": "uname", "rawInput": { "CommandLine": "uname -r" } }), false);
+        assert_eq!(ask.detail.as_deref(), Some("uname -r"));
 
         // Stop: cancel the turn, and the open question is cancelled.
         c.interrupt().await.unwrap();
@@ -829,6 +850,64 @@ mod real {
         assert!(text.to_lowercase().contains("pong"), "{text:?}");
         agent.end(false);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Changing the assistant's own files must be asked about. Refused
+    /// here, so the file must be unchanged.
+    async fn asks_before_editing_home(kind: AgentKind) {
+        // Not under /tmp: Antigravity writes there without asking.
+        let cache = directories::BaseDirs::new().unwrap().cache_dir().to_path_buf();
+        let home = cache.join(format!("fsc-real-acp-ask-{kind:?}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let memory = home.join("memory.md");
+        std::fs::write(&memory, "- old fact\n").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut cfg = Config::default();
+        cfg.agent.backend = kind;
+        cfg.claude.memory = false;
+        let agent = AgentHandle::spawn(&cfg, home.clone(), move |e| {
+            let _ = tx.send(e);
+        });
+        agent.ask(format!("Append the line '- likes jam' to the file {}. Then say done.", memory.display()));
+        let mut asked = Vec::new();
+        let mut text = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(150), async {
+            while let Some(e) = rx.recv().await {
+                if !matches!(e, AgentEvent::TextDelta(_)) {
+                    eprintln!("{kind:?}: {e:?}");
+                }
+                match e {
+                    AgentEvent::TextDelta(t) => text.push_str(&t),
+                    AgentEvent::Permission(ask) => {
+                        agent.answer(&ask.id, crate::permission::Answer::Deny);
+                        asked.push(ask.tool);
+                    }
+                    AgentEvent::TurnDone { .. } | AgentEvent::Exited { .. } => return,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("no end of turn within 150 s");
+        agent.end(false);
+        let after = std::fs::read_to_string(&memory).unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        eprintln!("{kind:?} said: {text}");
+        assert!(!asked.is_empty(), "never asked");
+        assert_eq!(after, "- old fact\n");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn real_acp_codex_asks() {
+        asks_before_editing_home(AgentKind::Codex).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn real_acp_antigravity_asks() {
+        asks_before_editing_home(AgentKind::Antigravity).await;
     }
 
     #[tokio::test]
