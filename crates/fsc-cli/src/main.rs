@@ -33,13 +33,13 @@ enum Cmd {
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
     },
-    /// Allow what Claude is asking permission for
+    /// Allow what the assistant is asking permission for
     Allow {
         /// Also allow it from now on
         #[arg(long)]
         always: bool,
     },
-    /// Refuse what Claude is asking permission for
+    /// Refuse what the assistant is asking permission for
     Deny,
     /// Start a fresh conversation
     New,

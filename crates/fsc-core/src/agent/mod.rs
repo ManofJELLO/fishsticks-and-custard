@@ -75,7 +75,7 @@ impl AgentHandle {
         F: Fn(AgentEvent) + Send + Sync + 'static,
     {
         let (tx, rx) = mpsc::unbounded_channel();
-        let memory = cfg.claude.memory;
+        let memory = cfg.memory();
         match cfg.agent.backend {
             AgentKind::Claude => {
                 tokio::spawn(actor(claude::ClaudeCli::new(cfg.claude.clone()), memory, home, rx, emit));

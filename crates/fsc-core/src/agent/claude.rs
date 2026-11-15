@@ -459,7 +459,8 @@ mod real {
         let _ = std::fs::remove_dir_all(&home);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let cfg = crate::config::Config {
-            claude: ClaudeConfig { model: "haiku".into(), memory: false, ..Default::default() },
+            claude: ClaudeConfig { model: "haiku".into(), ..Default::default() },
+            agent: crate::config::AgentConfig { memory: Some(false), ..Default::default() },
             ..Default::default()
         };
         let agent = AgentHandle::spawn(&cfg, home.clone(), move |e| {

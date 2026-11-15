@@ -7,7 +7,7 @@
 pkgname=fishsticks-and-custard
 pkgver=0.6.6
 pkgrel=1
-pkgdesc="Voice-activated Claude desktop assistant for Hyprland (wake word, push-to-talk, tray)"
+pkgdesc="Voice desktop assistant for Hyprland on Claude, Codex or Antigravity (wake word, push-to-talk, tray)"
 arch=(x86_64)
 url="https://github.com/ManofJELLO/fishsticks-and-custard"
 license=(MIT)
@@ -20,6 +20,8 @@ makedepends=(git cargo clang cmake vulkan-headers shaderc)
 optdepends=(
   'hyprland: the compositor this is designed for (any wlroots-style layer-shell compositor works)'
   'libnotify: desktop notifications when a reply finishes while the popup is hidden'
+  'codex-acp: Codex (ChatGPT) as the agent (AUR; needs nodejs)'
+  'antigravity-cli: Antigravity (Google) as the agent (AUR)'
 )
 install=fishsticks-and-custard.install
 # whisper.cpp and onnxruntime are linked statically; makepkg's LTO flags break them.

@@ -31,7 +31,7 @@ pub enum Command {
     Allow { always: bool },
     /// Refuse the oldest open permission question.
     Deny,
-    /// Throw away the conversation and start a fresh Claude session.
+    /// Throw away the conversation and start a fresh agent session.
     New,
     /// Mute the wake word. `None` toggles.
     Mute { on: Option<bool> },

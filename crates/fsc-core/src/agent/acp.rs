@@ -816,7 +816,7 @@ mod real {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut cfg = Config::default();
         cfg.agent.backend = kind;
-        cfg.claude.memory = false;
+        cfg.agent.memory = Some(false);
         let agent = AgentHandle::spawn(&cfg, home.clone(), move |e| {
             let _ = tx.send(e);
         });
@@ -865,7 +865,7 @@ mod real {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut cfg = Config::default();
         cfg.agent.backend = kind;
-        cfg.claude.memory = false;
+        cfg.agent.memory = Some(false);
         let agent = AgentHandle::spawn(&cfg, home.clone(), move |e| {
             let _ = tx.send(e);
         });

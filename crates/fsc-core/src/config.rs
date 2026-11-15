@@ -115,6 +115,16 @@ pub struct AgentConfig {
     /// Tool kinds that run without asking. The rest (edit, delete, move,
     /// execute, other) are asked about, when the agent asks at all.
     pub auto_allow: Vec<String>,
+    /// The assistant's home: persona, memory, and the agent's own settings
+    /// (ACP agents work in its `workspace` folder). Defaults to
+    /// `~/.local/share/fsc/home`. See `Config::home`.
+    pub home: Option<PathBuf>,
+    /// Start a fresh session when this many minutes have passed since the
+    /// last exchange, so context doesn't grow forever. 0 = never. Default 20.
+    pub session_idle_minutes: Option<u32>,
+    /// Before a session ends, save durable facts about the user to
+    /// `<home>/memory.md` and load them into new sessions. Default on.
+    pub memory: Option<bool>,
 }
 
 impl Default for AgentConfig {
@@ -127,6 +137,9 @@ impl Default for AgentConfig {
             model: String::new(),
             mode: String::new(),
             auto_allow: ["read", "search", "fetch", "think"].map(String::from).to_vec(),
+            home: None,
+            session_idle_minutes: None,
+            memory: None,
         }
     }
 }
@@ -138,21 +151,17 @@ pub struct ClaudeConfig {
     pub bin: String,
     /// Model alias or full id passed to `--model`.
     pub model: String,
-    /// Working directory for the assistant's Claude session. Holds
-    /// `persona.md` and `.claude/settings.local.json` (the tool allow-list).
-    /// Defaults to `~/.local/share/fsc/home`.
+    /// Old place for `[agent] home`, still read when that isn't set.
     pub home: Option<PathBuf>,
     /// Passed to `--setting-sources`. "project" keeps your personal
     /// Claude Code settings/hooks out of the voice assistant.
     pub setting_sources: String,
     /// Extra CLI arguments appended verbatim.
     pub extra_args: Vec<String>,
-    /// Start a fresh Claude session when this many minutes have passed since
-    /// the last exchange, so context doesn't grow forever. 0 = never.
-    pub session_idle_minutes: u32,
-    /// Before a session ends, save durable facts about the user to
-    /// `<home>/memory.md` and load them into new sessions.
-    pub memory: bool,
+    /// Old place for `[agent] session_idle_minutes`.
+    pub session_idle_minutes: Option<u32>,
+    /// Old place for `[agent] memory`.
+    pub memory: Option<bool>,
 }
 
 impl Default for ClaudeConfig {
@@ -163,8 +172,8 @@ impl Default for ClaudeConfig {
             home: None,
             setting_sources: "project,local".into(),
             extra_args: Vec::new(),
-            session_idle_minutes: 20,
-            memory: true,
+            session_idle_minutes: None,
+            memory: None,
         }
     }
 }
@@ -316,9 +325,39 @@ impl Config {
         }
     }
 
-    pub fn claude_home(&self) -> PathBuf {
+    /// Whether long-term memory is kept (`[agent] memory`).
+    pub fn memory(&self) -> bool {
+        self.agent.memory.or(self.claude.memory).unwrap_or(true)
+    }
+
+    /// `[agent] session_idle_minutes`.
+    pub fn session_idle_minutes(&self) -> u32 {
+        self.agent.session_idle_minutes.or(self.claude.session_idle_minutes).unwrap_or(20)
+    }
+
+    /// The agent's name, for messages: "Claude wants to ...".
+    pub fn agent_name(&self) -> &'static str {
+        match self.agent.backend {
+            AgentKind::Claude => "Claude",
+            AgentKind::Codex => "Codex",
+            AgentKind::Antigravity => "Antigravity",
+            AgentKind::Acp => "The assistant",
+        }
+    }
+
+    /// The model to show before the agent says which it's using.
+    pub fn model_hint(&self) -> String {
+        match self.agent.backend {
+            AgentKind::Claude => self.claude.model.clone(),
+            _ if !self.agent.model.is_empty() => self.agent.model.clone(),
+            _ => self.agent_name().to_string(),
+        }
+    }
+
+    /// The assistant's home (`[agent] home`).
+    pub fn home(&self) -> PathBuf {
         let base = directories::BaseDirs::new();
-        match &self.claude.home {
+        match self.agent.home.as_ref().or(self.claude.home.as_ref()) {
             Some(p) => expand_tilde(p, base.as_ref().map(|d| d.home_dir())),
             None => base
                 .map(|d| d.data_dir().join("fsc").join("home"))
@@ -359,6 +398,21 @@ mod tests {
         assert_eq!(c.agent.backend, AgentKind::Codex);
         assert_eq!(c.agent.model, "gpt-6-luna[low]");
         assert!(c.agent.auto_allow.iter().any(|k| k == "read"));
+        assert_eq!(c.model_hint(), "gpt-6-luna[low]");
+        assert!(c.memory());
+        assert_eq!(c.session_idle_minutes(), 20);
+    }
+
+    #[test]
+    fn old_claude_keys_still_count() {
+        let c: Config = toml::from_str("[claude]\nmemory = false\nsession_idle_minutes = 5\nhome = \"/srv/a\"\n").unwrap();
+        assert!(!c.memory());
+        assert_eq!(c.session_idle_minutes(), 5);
+        assert_eq!(c.home(), PathBuf::from("/srv/a"));
+        // [agent] wins when both are set.
+        let c: Config = toml::from_str("[claude]\nmemory = false\n[agent]\nmemory = true\nhome = \"/srv/b\"\n").unwrap();
+        assert!(c.memory());
+        assert_eq!(c.home(), PathBuf::from("/srv/b"));
     }
 
     #[test]

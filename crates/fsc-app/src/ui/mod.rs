@@ -284,7 +284,7 @@ impl Ui {
             gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
         );
 
-        let model = pretty_model(&cfg.claude.model);
+        let model = pretty_model(&cfg.model_hint());
         let viz = Viz::new(&cfg.ui);
         let ui = Rc::new(Ui {
             cfg,
@@ -539,7 +539,7 @@ impl Ui {
                 return Reply::state(s);
             }
             Command::Memory => {
-                let home = self.cfg.claude_home();
+                let home = self.cfg.home();
                 let path = fsc_core::memory::path(&home);
                 let facts = fsc_core::memory::load(&home);
                 return Reply::state(if facts.is_empty() {
@@ -630,6 +630,9 @@ impl Ui {
                     if let Some(parent) = cur.reply.parent().and_downcast::<gtk::Box>() {
                         if interrupted {
                             parent.append(&label("— STOPPED", "note"));
+                        } else if ok && cur.text.trim().is_empty() {
+                            // Some agents end a turn silently, e.g. after a refusal.
+                            parent.append(&label("— NO REPLY", "note"));
                         }
                         if let Some(err) = &error {
                             parent.append(&label(&format!("! {err}"), "error"));
@@ -839,7 +842,7 @@ impl Ui {
     }
 
     fn session_idle(&self) -> bool {
-        let mins = self.cfg.claude.session_idle_minutes;
+        let mins = self.cfg.session_idle_minutes();
         let st = self.st.borrow();
         mins > 0
             && st.session_dirty
@@ -863,7 +866,7 @@ impl Ui {
         } else {
             self.claude.rotate(save);
         }
-        st.memory_saving |= save && self.cfg.claude.memory;
+        st.memory_saving |= save && self.cfg.memory();
         st.session_dirty = false;
         st.last_activity = None;
     }
@@ -894,7 +897,7 @@ impl Ui {
     fn quit(self: &Rc<Self>) {
         let wait = {
             let mut st = self.st.borrow_mut();
-            let wait = self.cfg.claude.memory && (st.session_dirty || st.memory_saving) && !st.quitting;
+            let wait = self.cfg.memory() && (st.session_dirty || st.memory_saving) && !st.quitting;
             st.quitting = true;
             wait
         };
@@ -1135,7 +1138,7 @@ impl Ui {
         if !self.is_open() || self.headless() {
             self.show(false);
             let how = if self.headless() { " (fsc allow / fsc deny)" } else { "" };
-            notify(&format!("Claude wants to {}.{how}", ask.action));
+            notify(&format!("{} wants to {}.{how}", self.cfg.agent_name(), ask.action));
         }
         let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
         card.add_css_class("ask");
