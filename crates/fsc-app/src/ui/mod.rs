@@ -21,13 +21,14 @@ use tokio::sync::mpsc;
 
 use fsc_audio::{AudioEvent, AudioHandle};
 use fsc_core::Phase;
-use fsc_core::claude::{ClaudeEvent, ClaudeHandle, pretty_model, pretty_tool};
-use fsc_core::config::{Config, SpeakMode, Surface};
+use fsc_core::agent::{AgentEvent, AgentHandle, Choices, Setting, pretty_model, pretty_tool};
+use fsc_core::config::{AgentKind, Config, SpeakMode, Surface};
 use fsc_core::ipc::{Command, Reply};
 use fsc_core::permission::{self, Answer, PermissionAsk};
 
 use crate::AppEvent;
 use crate::icon::IconState;
+use crate::tray::{self, TrayUpdate};
 use crate::style::{self, Palette, Rgb, ThemeMode};
 use speech_text::SentenceBuffer;
 use viz::Viz;
@@ -101,6 +102,14 @@ struct State {
     desktop_accent: Option<Rgb>,
     muted: bool,
     model: String,
+    /// The agent answering, and which are installed (`AgentKind::ALL` order).
+    agent: AgentKind,
+    agents: [bool; AgentKind::ALL.len()],
+    /// The models and modes the agent offers.
+    choices: Choices,
+    /// The running session keeps long-term memory.
+    memory_on: bool,
+    menu_sent: Option<tray::MenuState>,
     voice: Voice,
     viz: Viz,
     last_frame: Option<i64>,
@@ -153,9 +162,9 @@ impl State {
 
 pub struct Ui {
     cfg: Config,
-    claude: ClaudeHandle,
+    claude: AgentHandle,
     audio: AudioHandle,
-    tray_tx: mpsc::UnboundedSender<IconState>,
+    tray_tx: mpsc::UnboundedSender<TrayUpdate>,
     app: gtk::Application,
     window: gtk::ApplicationWindow,
     panel: gtk::DrawingArea,
@@ -180,9 +189,9 @@ impl Ui {
         cfg: Config,
         palette: Palette,
         accent_pin: Option<Rgb>,
-        claude: ClaudeHandle,
+        claude: AgentHandle,
         audio: AudioHandle,
-        tray_tx: mpsc::UnboundedSender<IconState>,
+        tray_tx: mpsc::UnboundedSender<TrayUpdate>,
     ) -> Rc<Self> {
         let window = gtk::ApplicationWindow::builder()
             .application(app)
@@ -284,7 +293,9 @@ impl Ui {
             gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
         );
 
-        let model = pretty_model(&cfg.claude.model);
+        let model = pretty_model(&cfg.model_hint());
+        let (agent, agents) = (cfg.agent.backend, AgentKind::ALL.map(|k| cfg.available(k)));
+        let memory_on = cfg.memory();
         let viz = Viz::new(&cfg.ui);
         let ui = Rc::new(Ui {
             cfg,
@@ -311,6 +322,11 @@ impl Ui {
                 desktop_accent: None,
                 muted: false,
                 model,
+                agent,
+                agents,
+                choices: Choices::default(),
+                memory_on,
+                menu_sent: None,
                 voice: Voice::default(),
                 viz,
                 last_frame: None,
@@ -475,7 +491,7 @@ impl Ui {
                     let _ = tx.send(r);
                 }
             }
-            AppEvent::Claude(e) => self.claude_event(e),
+            AppEvent::Agent(e) => self.agent_event(e),
             AppEvent::Audio(e) => self.audio_event(e),
             AppEvent::Theme(mode) => self.set_theme(mode),
             AppEvent::Accent(c) => {
@@ -539,7 +555,7 @@ impl Ui {
                 return Reply::state(s);
             }
             Command::Memory => {
-                let home = self.cfg.claude_home();
+                let home = self.cfg.home();
                 let path = fsc_core::memory::path(&home);
                 let facts = fsc_core::memory::load(&home);
                 return Reply::state(if facts.is_empty() {
@@ -557,20 +573,29 @@ impl Ui {
                 // Forgetting cancels any save in flight; it won't report back.
                 st.memory_saving = false;
             }
+            Command::Agent { backend: None } => return Reply::state(self.st.borrow().agent.key()),
+            Command::Agent { backend: Some(name) } => {
+                let Some(kind) = AgentKind::from_key(&name) else {
+                    return Reply::err(format!("no agent called {name:?}: try {}", AgentKind::all_keys()));
+                };
+                return self.switch_agent(kind);
+            }
+            Command::Model { value } => return self.set_choice(Setting::Model, value),
+            Command::Mode { value } => return self.set_choice(Setting::Mode, value),
             Command::Quit => self.quit(),
         }
         Reply::ok()
     }
 
-    fn claude_event(self: &Rc<Self>, e: ClaudeEvent) {
+    fn agent_event(self: &Rc<Self>, e: AgentEvent) {
         match e {
-            ClaudeEvent::Ready { model, .. } => {
+            AgentEvent::Ready { model, .. } => {
                 if !model.is_empty() {
                     self.st.borrow_mut().model = pretty_model(&model);
                     self.restore_meta();
                 }
             }
-            ClaudeEvent::TextDelta(t) => {
+            AgentEvent::TextDelta(t) => {
                 if self.st.borrow().claude != Phase::Responding {
                     self.set_claude(Phase::Responding);
                 }
@@ -588,7 +613,7 @@ impl Ui {
                 }
                 self.scroll_to_end();
             }
-            ClaudeEvent::ToolUse { name } => {
+            AgentEvent::ToolUse { name } => {
                 if self.st.borrow().asks.is_empty() {
                     self.set_claude(Phase::Working);
                 }
@@ -602,9 +627,9 @@ impl Ui {
                 }
                 self.scroll_to_end();
             }
-            ClaudeEvent::Permission(ask) => self.on_permission(ask),
-            ClaudeEvent::PermissionClosed { id } => self.close_ask(&id, "— WITHDRAWN"),
-            ClaudeEvent::TurnDone { ok, interrupted, error } => {
+            AgentEvent::Permission(ask) => self.on_permission(ask),
+            AgentEvent::PermissionClosed { id } => self.close_ask(&id, "— WITHDRAWN"),
+            AgentEvent::TurnDone { ok, interrupted, error } => {
                 // Questions still open when the turn ends were never answered.
                 let open: Vec<String> = self.st.borrow().asks.iter().map(|a| a.ask.id.clone()).collect();
                 for id in open {
@@ -630,6 +655,9 @@ impl Ui {
                     if let Some(parent) = cur.reply.parent().and_downcast::<gtk::Box>() {
                         if interrupted {
                             parent.append(&label("— STOPPED", "note"));
+                        } else if ok && cur.text.trim().is_empty() {
+                            // Some agents end a turn silently, e.g. after a refusal.
+                            parent.append(&label("— NO REPLY", "note"));
                         }
                         if let Some(err) = &error {
                             parent.append(&label(&format!("! {err}"), "error"));
@@ -660,10 +688,10 @@ impl Ui {
                 }
                 self.maybe_follow_up();
             }
-            ClaudeEvent::Exited { reason } => {
+            AgentEvent::Exited { reason } => {
                 eprintln!("fsc: {reason}");
             }
-            ClaudeEvent::MemorySaved { ok, facts, error } => {
+            AgentEvent::MemorySaved { ok, facts, error } => {
                 self.st.borrow_mut().memory_saving = false;
                 if ok {
                     self.flash_meta(&format!("MEMORY UPDATED · {facts} FACTS"));
@@ -675,7 +703,27 @@ impl Ui {
                     self.app.quit();
                 }
             }
-            ClaudeEvent::Forgotten => self.flash_meta("MEMORY CLEARED"),
+            AgentEvent::Forgotten => self.flash_meta("MEMORY CLEARED"),
+            AgentEvent::Notice(text) => {
+                eprintln!("fsc: {text}");
+                self.flash_meta_for(&text.to_uppercase(), Duration::from_secs(6));
+            }
+            AgentEvent::Choices(c) => {
+                {
+                    let mut st = self.st.borrow_mut();
+                    if let Some(m) = &c.model
+                        && !m.current.is_empty()
+                    {
+                        let name = m.current_name();
+                        st.model = if name == m.current { pretty_model(name) } else { name.to_uppercase() };
+                    }
+                    st.choices = c;
+                }
+                if self.st.borrow().meta_timer.is_none() {
+                    self.restore_meta();
+                }
+                self.push_tray();
+            }
         }
     }
 
@@ -839,7 +887,7 @@ impl Ui {
     }
 
     fn session_idle(&self) -> bool {
-        let mins = self.cfg.claude.session_idle_minutes;
+        let mins = self.cfg.session_idle_minutes();
         let st = self.st.borrow();
         mins > 0
             && st.session_dirty
@@ -863,9 +911,60 @@ impl Ui {
         } else {
             self.claude.rotate(save);
         }
-        st.memory_saving |= save && self.cfg.claude.memory;
+        st.memory_saving |= save && st.memory_on;
         st.session_dirty = false;
         st.last_activity = None;
+    }
+
+    /// Hand the conversation to another agent: this session ends (saving
+    /// memory) and the next prompt goes to `kind`. Remembered in the config.
+    fn switch_agent(self: &Rc<Self>, kind: AgentKind) -> Reply {
+        // Reread the config so edits to the agent's own table count.
+        let mut cfg = Config::load().unwrap_or_else(|e| {
+            eprintln!("fsc: {e:#}; using the settings fscd started with");
+            self.cfg.clone()
+        });
+        let agents = AgentKind::ALL.map(|k| cfg.available(k));
+        self.st.borrow_mut().agents = agents;
+        if kind == self.st.borrow().agent {
+            self.push_tray();
+            return Reply::state(format!("already using {}", kind.name()));
+        }
+        if !cfg.available(kind) {
+            self.push_tray();
+            let prog = cfg.program(kind);
+            return Reply::err(if prog.is_empty() {
+                "set `command` in the [acp] section of config.toml first".to_string()
+            } else {
+                format!("{} isn't installed (no `{prog}` found)", kind.name())
+            });
+        }
+        cfg.agent.backend = kind;
+        let saved = Config::save_backend(kind);
+        if let Err(e) = &saved {
+            eprintln!("fsc: could not save the agent choice: {e:#}");
+        }
+        {
+            let mut st = self.st.borrow_mut();
+            self.claude.switch(&cfg, st.session_dirty);
+            // Whether this session saves follows the setting it started
+            // with; the next one goes by the config as it is now.
+            st.memory_saving |= st.session_dirty && st.memory_on;
+            st.memory_on = cfg.memory();
+            st.session_dirty = false;
+            st.last_activity = None;
+            st.agent = kind;
+            st.model = pretty_model(&cfg.model_hint());
+            // The new agent says what it offers once it's up.
+            st.choices = Choices::default();
+        }
+        self.add_divider(&format!("NOW {}", kind.name().to_uppercase()));
+        self.flash_meta(&format!("AGENT: {}", kind.name().to_uppercase()));
+        self.push_tray();
+        match saved {
+            Ok(()) => Reply::state(format!("switched to {}", kind.name())),
+            Err(e) => Reply::state(format!("switched to {} for now (not saved: {e:#})", kind.name())),
+        }
     }
 
     /// Called every minute: rotate an idle session in the background so the
@@ -894,7 +993,7 @@ impl Ui {
     fn quit(self: &Rc<Self>) {
         let wait = {
             let mut st = self.st.borrow_mut();
-            let wait = self.cfg.claude.memory && (st.session_dirty || st.memory_saving) && !st.quitting;
+            let wait = (st.memory_on && st.session_dirty || st.memory_saving) && !st.quitting;
             st.quitting = true;
             wait
         };
@@ -1135,7 +1234,7 @@ impl Ui {
         if !self.is_open() || self.headless() {
             self.show(false);
             let how = if self.headless() { " (fsc allow / fsc deny)" } else { "" };
-            notify(&format!("Claude wants to {}.{how}", ask.action));
+            notify(&format!("{} wants to {}.{how}", self.st.borrow().agent.name(), ask.action));
         }
         let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
         card.add_css_class("ask");
@@ -1398,13 +1497,61 @@ impl Ui {
         // Each update re-renders the icon at 6 sizes and signals the tray host.
         if st.tray_sent != Some(state) {
             st.tray_sent = Some(state);
-            let _ = self.tray_tx.send(state);
+            let _ = self.tray_tx.send(TrayUpdate::Icon(state));
+        }
+        let menu = tray::MenuState { agent: st.agent, agents: st.agents, choices: st.choices.clone() };
+        if st.menu_sent.as_ref() != Some(&menu) {
+            st.menu_sent = Some(menu.clone());
+            let _ = self.tray_tx.send(TrayUpdate::Menu(menu));
         }
     }
 
     fn restore_meta(&self) {
-        let model = self.st.borrow().model.clone();
-        self.meta.set_text(&format!("{model}  ·  ⏎ SEND  ·  ESC"));
+        let st = self.st.borrow();
+        let mode = st.choices.mode.as_ref().map(|m| format!("{}  ·  ", m.current_name().to_uppercase())).unwrap_or_default();
+        self.meta.set_text(&format!("{}  ·  {mode}⏎ SEND  ·  ESC", st.model));
+    }
+
+    /// `fsc model` / `fsc mode` and the tray's Model and Mode menus: list
+    /// what the agent offers, or switch (saved in the agent's config table).
+    fn set_choice(self: &Rc<Self>, which: Setting, value: Option<String>) -> Reply {
+        let (agent, sel) = {
+            let st = self.st.borrow();
+            (st.agent, st.choices.get(which).cloned())
+        };
+        let what = if which == Setting::Mode { "mode" } else { "model" };
+        let Some(value) = value else {
+            let Some(sel) = sel else {
+                return Reply::err(format!("{} hasn't offered any {what}s (it does once its session is up)", agent.name()));
+            };
+            let lines: Vec<String> = sel
+                .options
+                .iter()
+                .map(|o| {
+                    let mark = if o.id == sel.current { "*" } else { " " };
+                    if o.name == o.id { format!("{mark} {}", o.id) } else { format!("{mark} {}  ({})", o.id, o.name) }
+                })
+                .collect();
+            return Reply::state(lines.join("\n"));
+        };
+        let name = match &sel {
+            Some(sel) => match sel.options.iter().find(|o| o.id == value) {
+                Some(o) => o.name.clone(),
+                None => return Reply::err(format!("{} has no {what} {value:?} (`fsc {what}` lists them)", agent.name())),
+            },
+            None => value.clone(),
+        };
+        self.claude.set(which, &value);
+        let (table, key) = Config::setting_key(agent, which == Setting::Mode);
+        let saved = Config::save_value(table, key, &value);
+        if let Err(e) = &saved {
+            eprintln!("fsc: could not save the {what}: {e:#}");
+        }
+        self.flash_meta(&format!("{}: {}", what.to_uppercase(), name.to_uppercase()));
+        match saved {
+            Ok(()) => Reply::state(format!("{what} is now {name}")),
+            Err(e) => Reply::state(format!("{what} is now {name} (not saved: {e:#})")),
+        }
     }
 
     fn flash_meta(self: &Rc<Self>, text: &str) {

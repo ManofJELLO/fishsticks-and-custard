@@ -33,13 +33,13 @@ enum Cmd {
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
     },
-    /// Allow what Claude is asking permission for
+    /// Allow what the assistant is asking permission for
     Allow {
         /// Also allow it from now on
         #[arg(long)]
         always: bool,
     },
-    /// Refuse what Claude is asking permission for
+    /// Refuse what the assistant is asking permission for
     Deny,
     /// Start a fresh conversation
     New,
@@ -54,6 +54,21 @@ enum Cmd {
     Memory,
     /// Delete everything the assistant remembers and start a fresh session
     Forget,
+    /// Show which agent answers, or switch to another (saved in config.toml)
+    Agent {
+        /// claude, codex, antigravity, opencode or acp
+        backend: Option<String>,
+    },
+    /// List the agent's models, or switch to one (saved in config.toml)
+    Model {
+        /// An id from the list
+        id: Option<String>,
+    },
+    /// List the agent's modes (how much it asks first), or switch to one
+    Mode {
+        /// An id from the list
+        id: Option<String>,
+    },
     /// Quit the daemon
     Quit,
     /// Download any missing speech models (whisper, silero VAD, piper voice)
@@ -91,6 +106,9 @@ fn main() -> ExitCode {
         Cmd::Status => Command::Status,
         Cmd::Memory => Command::Memory,
         Cmd::Forget => Command::Forget,
+        Cmd::Agent { backend } => Command::Agent { backend },
+        Cmd::Model { id } => Command::Model { value: id },
+        Cmd::Mode { id } => Command::Mode { value: id },
         Cmd::Quit => Command::Quit,
     };
 

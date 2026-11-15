@@ -7,7 +7,13 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub agent: AgentConfig,
     pub claude: ClaudeConfig,
+    pub codex: AcpAgentConfig,
+    pub antigravity: AcpAgentConfig,
+    pub opencode: AcpAgentConfig,
+    /// Any other ACP agent.
+    pub acp: AcpAgentConfig,
     pub ui: UiConfig,
     pub voice: VoiceConfig,
 }
@@ -80,6 +86,155 @@ impl Default for VoiceConfig {
     }
 }
 
+/// An agent's usual program and set-up.
+#[derive(Debug, Clone, Copy)]
+pub struct Preset {
+    pub program: &'static str,
+    pub args: &'static [&'static str],
+    /// Sign-in command to suggest when the agent says it needs one.
+    pub login: Option<&'static str>,
+    /// What to install when the program can't be found.
+    pub install: Option<&'static str>,
+    /// The session mode to ask for unless the config names one.
+    pub mode: &'static str,
+}
+
+/// Which agent answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentKind {
+    /// Claude Code, settings in `[claude]`.
+    #[default]
+    Claude,
+    /// OpenAI Codex through `codex-acp` (sign in with `codex login`).
+    Codex,
+    /// Google Antigravity CLI through `agy acp` (sign in with `agy acp --login`).
+    Antigravity,
+    /// OpenCode through `opencode acp`: free models, or your own providers
+    /// (`opencode auth login`).
+    #[serde(rename = "opencode")]
+    OpenCode,
+    /// Any other Agent Client Protocol agent: set `[acp] command`.
+    Acp,
+}
+
+impl AgentKind {
+    pub const ALL: [AgentKind; 5] =
+        [AgentKind::Claude, AgentKind::Codex, AgentKind::Antigravity, AgentKind::OpenCode, AgentKind::Acp];
+
+    /// As written in the config and on the command line.
+    pub fn key(self) -> &'static str {
+        match self {
+            AgentKind::Claude => "claude",
+            AgentKind::Codex => "codex",
+            AgentKind::Antigravity => "antigravity",
+            AgentKind::OpenCode => "opencode",
+            AgentKind::Acp => "acp",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.key().eq_ignore_ascii_case(s.trim()))
+    }
+
+    /// How this agent is usually run. (Claude's program is `[claude] bin`.)
+    pub fn preset(self) -> Preset {
+        match self {
+            AgentKind::Codex => Preset {
+                program: "codex-acp",
+                args: &[],
+                login: Some("codex login"),
+                install: Some("codex-acp (npm i -g @agentclientprotocol/codex-acp)"),
+                // Ask before edits, commands and network use.
+                mode: "read-only",
+            },
+            AgentKind::Antigravity => Preset {
+                program: "agy",
+                args: &["acp"],
+                login: Some("agy acp --login"),
+                install: Some("antigravity-cli"),
+                mode: "",
+            },
+            AgentKind::OpenCode => Preset {
+                program: "opencode",
+                args: &["acp"],
+                login: Some("opencode auth login"),
+                install: Some("opencode"),
+                mode: "",
+            },
+            AgentKind::Claude => Preset { program: "claude", args: &[], login: None, install: None, mode: "" },
+            AgentKind::Acp => Preset { program: "", args: &[], login: None, install: None, mode: "" },
+        }
+    }
+
+    /// "claude, codex, antigravity, opencode or acp".
+    pub fn all_keys() -> String {
+        let keys: Vec<&str> = Self::ALL.iter().map(|k| k.key()).collect();
+        let (last, rest) = keys.split_last().expect("there are agents");
+        format!("{} or {last}", rest.join(", "))
+    }
+
+    /// For people: "Codex wants to ...".
+    pub fn name(self) -> &'static str {
+        match self {
+            AgentKind::Claude => "Claude",
+            AgentKind::Codex => "Codex",
+            AgentKind::Antigravity => "Antigravity",
+            AgentKind::OpenCode => "OpenCode",
+            AgentKind::Acp => "Custom agent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    pub backend: AgentKind,
+    /// ACP agents only: tool kinds that run without asking. The rest (edit, delete, move,
+    /// execute, other) are asked about, when the agent asks at all.
+    pub auto_allow: Vec<String>,
+    /// The assistant's home: persona, memory, and the agent's own settings
+    /// (ACP agents work in its `workspace` folder). Defaults to
+    /// `~/.local/share/fsc/home`. See `Config::home`.
+    pub home: Option<PathBuf>,
+    /// Start a fresh session when this many minutes have passed since the
+    /// last exchange, so context doesn't grow forever. 0 = never. Default 20.
+    pub session_idle_minutes: Option<u32>,
+    /// Before a session ends, save durable facts about the user to
+    /// `<home>/memory.md` and load them into new sessions. Default on.
+    pub memory: Option<bool>,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            backend: AgentKind::Claude,
+            auto_allow: ["read", "search", "fetch", "think"].map(String::from).to_vec(),
+            home: None,
+            session_idle_minutes: None,
+            memory: None,
+        }
+    }
+}
+
+/// `[codex]`, `[antigravity]` and `[acp]`: one ACP agent's settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AcpAgentConfig {
+    /// The agent's program. Empty: the usual one (`codex-acp`, `agy`).
+    pub command: String,
+    /// Arguments. With `command` set, the whole list (agy needs "acp");
+    /// otherwise added after the usual ones.
+    pub args: Vec<String>,
+    /// Extra environment variables for the agent.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Model id as the agent lists it. Empty: the agent's default.
+    pub model: String,
+    /// The agent's session mode (its approval preset), e.g. Codex's
+    /// "read-only" or Antigravity's "default". Empty: the usual one.
+    pub mode: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ClaudeConfig {
@@ -87,21 +242,20 @@ pub struct ClaudeConfig {
     pub bin: String,
     /// Model alias or full id passed to `--model`.
     pub model: String,
-    /// Working directory for the assistant's Claude session. Holds
-    /// `persona.md` and `.claude/settings.local.json` (the tool allow-list).
-    /// Defaults to `~/.local/share/fsc/home`.
+    /// Claude Code's permission mode: "default" (ask), "acceptEdits",
+    /// "auto" or "plan". Empty: default.
+    pub permission_mode: String,
+    /// Old place for `[agent] home`, still read when that isn't set.
     pub home: Option<PathBuf>,
     /// Passed to `--setting-sources`. "project" keeps your personal
     /// Claude Code settings/hooks out of the voice assistant.
     pub setting_sources: String,
     /// Extra CLI arguments appended verbatim.
     pub extra_args: Vec<String>,
-    /// Start a fresh Claude session when this many minutes have passed since
-    /// the last exchange, so context doesn't grow forever. 0 = never.
-    pub session_idle_minutes: u32,
-    /// Before a session ends, save durable facts about the user to
-    /// `<home>/memory.md` and load them into new sessions.
-    pub memory: bool,
+    /// Old place for `[agent] session_idle_minutes`.
+    pub session_idle_minutes: Option<u32>,
+    /// Old place for `[agent] memory`.
+    pub memory: Option<bool>,
 }
 
 impl Default for ClaudeConfig {
@@ -109,11 +263,12 @@ impl Default for ClaudeConfig {
         Self {
             bin: "claude".into(),
             model: "sonnet".into(),
+            permission_mode: String::new(),
             home: None,
             setting_sources: "project,local".into(),
             extra_args: Vec::new(),
-            session_idle_minutes: 20,
-            memory: true,
+            session_idle_minutes: None,
+            memory: None,
         }
     }
 }
@@ -265,15 +420,158 @@ impl Config {
         }
     }
 
-    pub fn claude_home(&self) -> PathBuf {
+    /// Whether long-term memory is kept (`[agent] memory`).
+    pub fn memory(&self) -> bool {
+        self.agent.memory.or(self.claude.memory).unwrap_or(true)
+    }
+
+    /// `[agent] session_idle_minutes`.
+    pub fn session_idle_minutes(&self) -> u32 {
+        self.agent.session_idle_minutes.or(self.claude.session_idle_minutes).unwrap_or(20)
+    }
+
+    /// The agent's name, for messages: "Claude wants to ...".
+    pub fn agent_name(&self) -> &'static str {
+        self.agent.backend.name()
+    }
+
+    /// The settings of an ACP agent (`Claude` has none: `[acp]`'s are given).
+    pub fn acp_agent(&self, kind: AgentKind) -> &AcpAgentConfig {
+        match kind {
+            AgentKind::Codex => &self.codex,
+            AgentKind::Antigravity => &self.antigravity,
+            AgentKind::OpenCode => &self.opencode,
+            AgentKind::Acp | AgentKind::Claude => &self.acp,
+        }
+    }
+
+    /// The program that runs `kind`. Empty: none configured.
+    pub fn program(&self, kind: AgentKind) -> String {
+        if kind == AgentKind::Claude {
+            return self.claude.bin.clone();
+        }
+        let own = &self.acp_agent(kind).command;
+        if own.is_empty() { kind.preset().program.to_string() } else { own.clone() }
+    }
+
+    /// Use `value` as `kind`'s model (or mode) from now on, in this config.
+    pub fn set_choice(&mut self, kind: AgentKind, mode: bool, value: &str) {
+        let slot = match (kind, mode) {
+            (AgentKind::Claude, false) => &mut self.claude.model,
+            (AgentKind::Claude, true) => &mut self.claude.permission_mode,
+            (k, false) => &mut self.acp_agent_mut(k).model,
+            (k, true) => &mut self.acp_agent_mut(k).mode,
+        };
+        *slot = value.to_string();
+    }
+
+    fn acp_agent_mut(&mut self, kind: AgentKind) -> &mut AcpAgentConfig {
+        match kind {
+            AgentKind::Codex => &mut self.codex,
+            AgentKind::Antigravity => &mut self.antigravity,
+            AgentKind::OpenCode => &mut self.opencode,
+            AgentKind::Acp | AgentKind::Claude => &mut self.acp,
+        }
+    }
+
+    /// Whether `kind` can run here: its program is configured and found.
+    pub fn available(&self, kind: AgentKind) -> bool {
+        let prog = self.program(kind);
+        !prog.is_empty() && find_program(&prog).is_some()
+    }
+
+    /// The model to show before the agent says which it's using.
+    pub fn model_hint(&self) -> String {
+        match self.agent.backend {
+            AgentKind::Claude => self.claude.model.clone(),
+            k if !self.acp_agent(k).model.is_empty() => self.acp_agent(k).model.clone(),
+            k => k.name().to_string(),
+        }
+    }
+
+    /// Switch to `kind` from now on: set `[agent] backend` in the config
+    /// file, keeping the rest of it (comments included) as it is.
+    pub fn save_backend(kind: AgentKind) -> Result<()> {
+        Self::save_value("agent", "backend", kind.key())
+    }
+
+    /// Where `kind`'s model or mode is kept: (table, key).
+    pub fn setting_key(kind: AgentKind, mode: bool) -> (&'static str, &'static str) {
+        match (kind, mode) {
+            (AgentKind::Claude, false) => ("claude", "model"),
+            (AgentKind::Claude, true) => ("claude", "permission_mode"),
+            (k, false) => (k.key(), "model"),
+            (k, true) => (k.key(), "mode"),
+        }
+    }
+
+    /// Set `[table] key = value` in the config file, keeping the rest of it
+    /// (comments included) as it is.
+    pub fn save_value(table: &str, key: &str, value: &str) -> Result<()> {
+        let path = Self::path().context("no config directory")?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let new = set_value(&text, table, key, value).with_context(|| format!("parsing {}", path.display()))?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        // Write a copy and rename it over, so a crash can't leave half a file.
+        let tmp = path.with_extension("toml.new");
+        std::fs::write(&tmp, new).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
+        Ok(())
+    }
+
+    /// The assistant's home (`[agent] home`).
+    pub fn home(&self) -> PathBuf {
         let base = directories::BaseDirs::new();
-        match &self.claude.home {
+        match self.agent.home.as_ref().or(self.claude.home.as_ref()) {
             Some(p) => expand_tilde(p, base.as_ref().map(|d| d.home_dir())),
             None => base
                 .map(|d| d.data_dir().join("fsc").join("home"))
                 .unwrap_or_else(|| PathBuf::from(".fsc-home")),
         }
     }
+}
+
+/// `text` (a config file) with `[table] key` set to `value`.
+fn set_value(text: &str, table: &str, key: &str, value: &str) -> Result<String> {
+    let mut doc: toml_edit::DocumentMut = text.parse()?;
+    let t = doc.entry(table).or_insert_with(toml_edit::table);
+    let t = t.as_table_like_mut().with_context(|| format!("`{table}` isn't a table"))?;
+    match t.get_mut(key) {
+        // Keep the comment that follows the value.
+        Some(item) if item.is_value() => {
+            let decor = item.as_value().map(|v| v.decor().clone());
+            *item = toml_edit::value(value);
+            if let (Some(d), Some(v)) = (decor, item.as_value_mut()) {
+                *v.decor_mut() = d;
+            }
+        }
+        _ => {
+            t.insert(key, toml_edit::value(value));
+        }
+    }
+    Ok(doc.to_string())
+}
+
+#[cfg(test)]
+fn set_backend(text: &str, kind: AgentKind) -> Result<String> {
+    set_value(text, "agent", "backend", kind.key())
+}
+
+/// Look `prog` up like a shell would: a path as given, a name on `$PATH`.
+pub fn find_program(prog: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let runnable = |p: &std::path::Path| p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+    if prog.contains('/') {
+        let p = PathBuf::from(prog);
+        return runnable(&p).then_some(p);
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(prog)).find(|p| runnable(p))
 }
 
 /// "~" or "~/x" -> under the home directory, as a shell would. TOML has no
@@ -298,6 +596,57 @@ mod tests {
         let c: Config = toml::from_str("[ui]\nsurface = \"layer\"\nanchor = \"bottom-right\"\n").unwrap();
         assert_eq!((c.ui.surface, c.ui.anchor), (Surface::Layer, Anchor::BottomRight));
         assert_eq!(c.ui.anchor.edges(), (false, true, false, true));
+    }
+
+    #[test]
+    fn agent_section() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.agent.backend, AgentKind::Claude);
+        let c: Config = toml::from_str("[agent]\nbackend = \"codex\"\n[codex]\nmodel = \"gpt-6-luna[low]\"\n").unwrap();
+        assert_eq!(c.agent.backend, AgentKind::Codex);
+        assert_eq!(c.codex.model, "gpt-6-luna[low]");
+        assert_eq!(c.program(AgentKind::Antigravity), "agy");
+        assert_eq!(c.program(AgentKind::Acp), "");
+        assert!(!c.available(AgentKind::Acp));
+        assert!(c.agent.auto_allow.iter().any(|k| k == "read"));
+        assert_eq!(c.model_hint(), "gpt-6-luna[low]");
+        assert!(c.memory());
+        assert_eq!(c.session_idle_minutes(), 20);
+    }
+
+    #[test]
+    fn saving_the_backend_keeps_the_file() {
+        let text = "# my settings\n[agent]\nbackend = \"claude\"   # which agent\nmemory = true\n\n[ui]\nwidth = 700\n";
+        let new = set_backend(text, AgentKind::Codex).unwrap();
+        assert_eq!(new, text.replace("\"claude\"", "\"codex\""));
+        // No [agent] table yet: one is added.
+        let new = set_backend("[ui]\nwidth = 700\n", AgentKind::Antigravity).unwrap();
+        let c: Config = toml::from_str(&new).unwrap();
+        assert_eq!((c.agent.backend, c.ui.width), (AgentKind::Antigravity, 700));
+        assert_eq!(set_backend("", AgentKind::Acp).unwrap().trim(), "[agent]\nbackend = \"acp\"");
+        assert!(set_backend("not = [toml", AgentKind::Acp).is_err());
+        assert_eq!(AgentKind::from_key(" Codex "), Some(AgentKind::Codex));
+        assert_eq!(AgentKind::all_keys(), "claude, codex, antigravity, opencode or acp");
+        assert_eq!(AgentKind::from_key("gemini"), None);
+    }
+
+    #[test]
+    fn programs_are_found() {
+        assert!(find_program("sh").is_some());
+        assert!(find_program("/bin/sh").is_some());
+        assert!(find_program("surely-not-a-program-here").is_none());
+    }
+
+    #[test]
+    fn old_claude_keys_still_count() {
+        let c: Config = toml::from_str("[claude]\nmemory = false\nsession_idle_minutes = 5\nhome = \"/srv/a\"\n").unwrap();
+        assert!(!c.memory());
+        assert_eq!(c.session_idle_minutes(), 5);
+        assert_eq!(c.home(), PathBuf::from("/srv/a"));
+        // [agent] wins when both are set.
+        let c: Config = toml::from_str("[claude]\nmemory = false\n[agent]\nmemory = true\nhome = \"/srv/b\"\n").unwrap();
+        assert!(c.memory());
+        assert_eq!(c.home(), PathBuf::from("/srv/b"));
     }
 
     #[test]

@@ -1,8 +1,10 @@
 # Fishsticks & Custard
 
-A Claude desktop assistant for Arch + Hyprland, written in Rust. You summon it with the
+A voice desktop assistant for Arch + Hyprland, written in Rust. You summon it with the
 wake phrase *"fishsticks and custard"*, a hotkey, or the tray icon.
-It runs on your Claude subscription through Claude Code's headless stream-json mode.
+It runs on the AI subscription you already have: Claude (through Claude Code), ChatGPT
+(through Codex) or Google (through Antigravity CLI), or on OpenCode's free models.
+See [Choosing an agent](#choosing-an-agent).
 
 ## Status
 
@@ -12,12 +14,13 @@ It runs on your Claude subscription through Claude Code's headless stream-json m
 | 2 | Push-to-talk: cpal (PipeWire) → Silero VAD → whisper-rs (Vulkan) → Claude → Piper, spoken sentence by sentence; real FFT in the visualiser | **done** |
 | 3 | Wake phrase "fishsticks and custard" (VAD-gated whisper, say a command in the same breath) | **done** |
 | 4 | Safe system control: permission prompts routed to the popup | **done** |
-| 5 | Polish: police-box tray icon, LED-segment visualiser, window/layer/headless modes, spoken-reply cleanup | in progress |
+| 5 | Polish: police-box tray icon, LED-segment visualiser, window/layer/headless modes, spoken-reply cleanup | **done** |
+| 6 | Any agent: Codex and Antigravity through the Agent Client Protocol, beside Claude Code | in progress |
 
 ## Layout
 
 ```
-crates/fsc-core   IPC protocol, config, model registry, Claude stream-json session (no GTK)
+crates/fsc-core   IPC protocol, config, model registry, agent sessions: Claude stream-json, ACP (no GTK)
 crates/fsc-audio  mic/speaker (cpal), Silero VAD + Piper (ONNX Runtime), whisper.cpp STT, spectrum
 crates/fsc-app    `fscd`: GTK4 popup (window or layer-shell), ksni tray, portal theme/accent watcher, socket server
 crates/fsc-cli    `fsc`: control CLI for Hyprland binds and scripts
@@ -48,10 +51,67 @@ Updates then arrive with a normal `pacman -Syu`.
    ```
 
 3. Install: `sudo pacman -Sy fishsticks-and-custard`, then follow the printed setup steps
-   (Claude Code login, `fsc fetch-models`, Hyprland lines).
+   (agent login, `fsc fetch-models`, Hyprland lines).
 
-You also need the [Claude Code](https://claude.com/claude-code) CLI, logged in with your
-Claude account. It isn't a pacman package, so it isn't a declared dependency.
+You also need an agent, signed in with your account: the [Claude Code](https://claude.com/claude-code)
+CLI by default, or one of the others in [Choosing an agent](#choosing-an-agent).
+
+## Choosing an agent
+
+Pick one from the tray icon's **Agent** menu, or run `fsc agent codex` (plain `fsc agent`
+says which one answers). The current conversation ends, saving what's worth remembering,
+and your next question goes to the new agent, which starts with the same memory. The
+choice is saved as `backend` in the `[agent]` section of `~/.config/fsc/config.toml`; agents
+that aren't installed are greyed out in the menu.
+
+The tray menu's **Model** and **Mode** submenus list what the current agent offers
+(`fsc model` and `fsc mode` print the same lists, and `fsc model <id>` switches). A change
+applies to the conversation you're in, and is saved in that agent's section of the config
+so later sessions keep it. The mode is the agent's own idea of how much to ask first: for
+Claude, Ask (default), Accept edits, Auto or Plan; Codex's read-only asks before edits,
+commands and network use. The popup shows the model and mode in its top line.
+
+| `backend` | Needs | Sign in with |
+|---|---|---|
+| `"claude"` (default) | Claude Code CLI (`claude`) | `claude`, once, interactively |
+| `"codex"` | Codex CLI and `codex-acp` (AUR `codex-acp`, or `npm i -g @agentclientprotocol/codex-acp`) | `codex login` |
+| `"antigravity"` | Antigravity CLI `agy` 1.5 or newer (AUR `antigravity-cli`) | `agy acp --login` |
+| `"opencode"` | OpenCode (`pacman -S opencode`) | nothing for its free models; `opencode auth login` for your own providers |
+| `"acp"` | any [Agent Client Protocol](https://agentclientprotocol.com) agent: set `command` and `args` in `[acp]` | the agent's own way |
+
+Each agent has its own section for its settings, so switching back and forth keeps them:
+
+```toml
+[agent]
+backend = "codex"
+
+[codex]
+# model = "gpt-6-luna[low]"     # as the agent lists it; empty = its default
+# mode = "read-only"            # its approval mode; read-only (the default here) asks before edits and commands
+
+[antigravity]
+# model = "gemini-3.8-flash-low"
+
+[opencode]
+# model = "opencode/big-pickle"
+
+[acp]
+# command = "my-agent"
+# args = ["--acp"]
+```
+
+Claude runs through Claude Code's own stream-json mode, with its settings in `[claude]`.
+The others speak ACP: each session gets the persona as a system prompt, conversations
+rotate to fresh sessions in the same agent process, and permission questions arrive
+on the same card (see [Permission questions](#permission-questions)). ACP agents work in
+`~/.local/share/fsc/home/workspace`, an empty folder of their own. Agents let themselves
+write there freely (Antigravity also writes in `/tmp` without asking), but changes to the
+assistant's own files and to anything of yours are asked about. Reading, searching, web
+fetches and thinking run without asking; set `auto_allow` to change which tool kinds do.
+OpenCode lets itself do anything by default, so FSC gives it a project config of its own,
+`~/.local/share/fsc/home/workspace/.opencode/opencode.json`, that asks about every action
+(your own OpenCode settings are left alone; edit that file to change what's asked).
+If an agent isn't signed in, the popup says which command to run.
 
 ## Build from source
 
@@ -116,11 +176,14 @@ show in rofi with `rofi -show drun -drun-show-actions`.
 | `fsc status` | `ready`, `thinking`, `listening`, … |
 | `fsc memory` | show what it remembers between sessions |
 | `fsc forget` / tray **Forget memories** | delete that memory and start a fresh session |
+| `fsc agent [name]` / tray **Agent** | say which agent answers, or switch (claude, codex, antigravity, opencode, acp) |
+| `fsc model [id]` / `fsc mode [id]` / tray **Model**, **Mode** | list the agent's models or modes, or switch |
 
 ## Customise
 
 - **Persona and reply style:** `~/.local/share/fsc/home/persona.md`
-- **What Claude may run:** `~/.local/share/fsc/home/.claude/settings.local.json`. Anything
+- **What Claude may run** (Claude only; ACP agents keep their own rules):
+  `~/.local/share/fsc/home/.claude/settings.local.json`. Anything
   on `allow` just runs, anything on `deny` never does, and anything else is asked about (see
   below). **ALWAYS** answers are added here. Run `fsc new` after editing it or the persona.
   (Local settings are used because Claude Code ignores a folder's shared `settings.json`
@@ -132,26 +195,28 @@ show in rofi with `rofi -show drun -drun-show-actions`.
 
 ## Permission questions
 
-When Claude wants a tool that isn't allowed or denied (a command, a web page, a file
+When the agent wants a tool that isn't allowed or denied (a command, a web page, a file
 write), the reply pauses: the status turns red (**ALLOW?**) and a card shows what it wants
 to do and the exact command, URL or path, with **ALLOW**, **ALWAYS** and **DENY**. After a
 spoken question it also asks out loud ("May I search the web for…? Yes, always, or no?")
 and listens for the answer. Closing the popup counts as no. **ALWAYS** saves the rule
-Claude Code suggests, so the same kind of request just runs next time.
+Claude Code suggests, so the same kind of request just runs next time. With ACP agents it
+picks the agent's own "always allow" option, when it offers one.
 
 ## Sessions and memory
 
-One Claude session lasts while you're actively talking to it. After
-`claude.session_idle_minutes` (default 20) without an exchange, or on `fsc new` / Ctrl+N,
+One session lasts while you're actively talking to it. After
+`agent.session_idle_minutes` (default 20) without an exchange, or on `fsc new` / Ctrl+N,
 or when `fscd` quits, the session ends and a new one starts, so context doesn't grow
 forever. Older exchanges stay visible in the popup above a **NEW SESSION** divider.
 
-Before a session ends, Claude is asked (hidden) to update a short list of durable facts
+Before a session ends, the agent is asked (hidden) to update a short list of durable facts
 about you: preferences, location, people, setup, ongoing plans, things you asked it to
 remember. It leaves out one-off questions and sensitive details. The list is saved to
 `~/.local/share/fsc/home/memory.md`, a plain file you can read or edit, and is loaded
 into every new session. `fsc memory` shows it, `fsc forget` deletes it, and
-`claude.memory = false` turns the feature off. Saving costs one small extra turn per
+`agent.memory = false` turns the feature off. (Both were in `[claude]` before 0.7,
+and are still read from there.) Saving costs one small extra turn per
 session.
 
 ## Wake phrase

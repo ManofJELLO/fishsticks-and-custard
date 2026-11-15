@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::sync::{mpsc, oneshot};
 
-use fsc_core::claude::{ClaudeEvent, ClaudeHandle};
+use fsc_core::agent::{AgentEvent, AgentHandle};
 use fsc_core::config::{Config, ThemePref};
 use fsc_core::ipc::{Command, Reply};
 
@@ -27,7 +27,7 @@ use crate::style::{Palette, Rgb, ThemeMode};
 
 pub enum AppEvent {
     Command(Command, Option<oneshot::Sender<Reply>>),
-    Claude(ClaudeEvent),
+    Agent(AgentEvent),
     Audio(fsc_audio::AudioEvent),
     Theme(ThemeMode),
     /// The desktop's accent colour changed (`None`: it has none).
@@ -100,14 +100,15 @@ fn main() -> Result<()> {
             accent: style::NOTHING_RED,
             shape: cfg.ui.tray_icon,
         },
+        tray::MenuState::new(&cfg),
         tray_rx,
         ev_tx.clone(),
     ));
 
     let claude = {
         let tx = ev_tx.clone();
-        ClaudeHandle::spawn(cfg.claude.clone(), cfg.claude_home(), move |e| {
-            let _ = tx.try_send(AppEvent::Claude(e));
+        AgentHandle::spawn(&cfg, cfg.home(), move |e| {
+            let _ = tx.try_send(AppEvent::Agent(e));
         })
     };
 
@@ -146,7 +147,7 @@ fn main() -> Result<()> {
             );
             *ui_cell.borrow_mut() = Some(ui.clone());
 
-            if cfg.claude.session_idle_minutes > 0 {
+            if cfg.session_idle_minutes() > 0 {
                 let ui = ui.clone();
                 glib::timeout_add_seconds_local(60, move || {
                     ui.tick_idle();
@@ -194,7 +195,13 @@ fn dump_icons(dir: &str) -> Result<()> {
     for shape in [TrayIcon::PoliceBox, TrayIcon::Fishbone] {
         for theme in [ThemeMode::Dark, ThemeMode::Light] {
             for (name, phase, muted) in [("idle", Phase::Idle, false), ("rec", Phase::Listening, false), ("muted", Phase::Idle, true)] {
-                let st = icon::IconState { phase, theme, muted, accent: style::NOTHING_RED, shape };
+                let st = icon::IconState {
+                    phase,
+                    theme,
+                    muted,
+                    accent: style::NOTHING_RED,
+                    shape,
+                };
                 for size in [22u32, 64] {
                     let path = format!("{dir}/{shape:?}-{theme:?}-{name}-{size}.png").to_lowercase();
                     icon::render(size, &st).save_png(&path)?;

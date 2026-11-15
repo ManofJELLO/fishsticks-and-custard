@@ -1,7 +1,8 @@
 post_install() {
   cat <<'MSG'
 ==> Fishsticks & Custard installed. To finish setting up (as your user):
-    1. Install and log in to the Claude Code CLI (`claude`) if you haven't.
+    1. Install and sign in to an agent: the Claude Code CLI (`claude`) by default,
+       or Codex / Antigravity (see "Choosing an agent" in the README).
     2. Download the speech models (~640 MB):     fsc fetch-models
        and check them:                            fscd --self-test
     3. Add the Hyprland lines from /usr/share/fishsticks-and-custard/hyprland/fsc.lua

@@ -31,7 +31,7 @@ pub enum Command {
     Allow { always: bool },
     /// Refuse the oldest open permission question.
     Deny,
-    /// Throw away the conversation and start a fresh Claude session.
+    /// Throw away the conversation and start a fresh agent session.
     New,
     /// Mute the wake word. `None` toggles.
     Mute { on: Option<bool> },
@@ -40,6 +40,13 @@ pub enum Command {
     Memory,
     /// Delete long-term memory and start a fresh session.
     Forget,
+    /// Switch to another agent (a `config::AgentKind` key: "claude", "codex", ...)
+    /// from now on, or say which one answers (`None`).
+    Agent { backend: Option<String> },
+    /// Use another model (an id the agent lists), or list them (`None`).
+    Model { value: Option<String> },
+    /// Use another mode (an id the agent lists), or list them (`None`).
+    Mode { value: Option<String> },
     Quit,
 }
 
