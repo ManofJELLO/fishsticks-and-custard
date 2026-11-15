@@ -86,6 +86,19 @@ impl Default for VoiceConfig {
     }
 }
 
+/// An agent's usual program and set-up.
+#[derive(Debug, Clone, Copy)]
+pub struct Preset {
+    pub program: &'static str,
+    pub args: &'static [&'static str],
+    /// Sign-in command to suggest when the agent says it needs one.
+    pub login: Option<&'static str>,
+    /// What to install when the program can't be found.
+    pub install: Option<&'static str>,
+    /// The session mode to ask for unless the config names one.
+    pub mode: &'static str,
+}
+
 /// Which agent answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -122,6 +135,43 @@ impl AgentKind {
 
     pub fn from_key(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|k| k.key().eq_ignore_ascii_case(s.trim()))
+    }
+
+    /// How this agent is usually run. (Claude's program is `[claude] bin`.)
+    pub fn preset(self) -> Preset {
+        match self {
+            AgentKind::Codex => Preset {
+                program: "codex-acp",
+                args: &[],
+                login: Some("codex login"),
+                install: Some("codex-acp (npm i -g @agentclientprotocol/codex-acp)"),
+                // Ask before edits, commands and network use.
+                mode: "read-only",
+            },
+            AgentKind::Antigravity => Preset {
+                program: "agy",
+                args: &["acp"],
+                login: Some("agy acp --login"),
+                install: Some("antigravity-cli"),
+                mode: "",
+            },
+            AgentKind::OpenCode => Preset {
+                program: "opencode",
+                args: &["acp"],
+                login: Some("opencode auth login"),
+                install: Some("opencode"),
+                mode: "",
+            },
+            AgentKind::Claude => Preset { program: "claude", args: &[], login: None, install: None, mode: "" },
+            AgentKind::Acp => Preset { program: "", args: &[], login: None, install: None, mode: "" },
+        }
+    }
+
+    /// "claude, codex, antigravity, opencode or acp".
+    pub fn all_keys() -> String {
+        let keys: Vec<&str> = Self::ALL.iter().map(|k| k.key()).collect();
+        let (last, rest) = keys.split_last().expect("there are agents");
+        format!("{} or {last}", rest.join(", "))
     }
 
     /// For people: "Codex wants to ...".
@@ -397,15 +447,31 @@ impl Config {
 
     /// The program that runs `kind`. Empty: none configured.
     pub fn program(&self, kind: AgentKind) -> String {
-        let usual = match kind {
-            AgentKind::Claude => return self.claude.bin.clone(),
-            AgentKind::Codex => "codex-acp",
-            AgentKind::Antigravity => "agy",
-            AgentKind::OpenCode => "opencode",
-            AgentKind::Acp => "",
-        };
+        if kind == AgentKind::Claude {
+            return self.claude.bin.clone();
+        }
         let own = &self.acp_agent(kind).command;
-        if own.is_empty() { usual.to_string() } else { own.clone() }
+        if own.is_empty() { kind.preset().program.to_string() } else { own.clone() }
+    }
+
+    /// Use `value` as `kind`'s model (or mode) from now on, in this config.
+    pub fn set_choice(&mut self, kind: AgentKind, mode: bool, value: &str) {
+        let slot = match (kind, mode) {
+            (AgentKind::Claude, false) => &mut self.claude.model,
+            (AgentKind::Claude, true) => &mut self.claude.permission_mode,
+            (k, false) => &mut self.acp_agent_mut(k).model,
+            (k, true) => &mut self.acp_agent_mut(k).mode,
+        };
+        *slot = value.to_string();
+    }
+
+    fn acp_agent_mut(&mut self, kind: AgentKind) -> &mut AcpAgentConfig {
+        match kind {
+            AgentKind::Codex => &mut self.codex,
+            AgentKind::Antigravity => &mut self.antigravity,
+            AgentKind::OpenCode => &mut self.opencode,
+            AgentKind::Acp | AgentKind::Claude => &mut self.acp,
+        }
     }
 
     /// Whether `kind` can run here: its program is configured and found.
@@ -560,6 +626,7 @@ mod tests {
         assert_eq!(set_backend("", AgentKind::Acp).unwrap().trim(), "[agent]\nbackend = \"acp\"");
         assert!(set_backend("not = [toml", AgentKind::Acp).is_err());
         assert_eq!(AgentKind::from_key(" Codex "), Some(AgentKind::Codex));
+        assert_eq!(AgentKind::all_keys(), "claude, codex, antigravity, opencode or acp");
         assert_eq!(AgentKind::from_key("gemini"), None);
     }
 

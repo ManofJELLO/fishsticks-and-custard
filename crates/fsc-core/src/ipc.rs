@@ -40,7 +40,7 @@ pub enum Command {
     Memory,
     /// Delete long-term memory and start a fresh session.
     Forget,
-    /// Switch to another agent ("claude", "codex", "antigravity", "acp")
+    /// Switch to another agent (a `config::AgentKind` key: "claude", "codex", ...)
     /// from now on, or say which one answers (`None`).
     Agent { backend: Option<String> },
     /// Use another model (an id the agent lists), or list them (`None`).

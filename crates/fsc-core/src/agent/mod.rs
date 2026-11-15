@@ -53,6 +53,9 @@ pub enum AgentEvent {
     Forgotten,
     /// The models and modes this agent offers, and which are in use.
     Choices(Choices),
+    /// Something the user should know that isn't part of a reply ("the agent
+    /// wouldn't change its mode").
+    Notice(String),
 }
 
 /// What can be picked for the session (an agent may offer neither).
@@ -189,13 +192,17 @@ pub(crate) enum Event {
     Text(String),
     ToolUse { name: String },
     /// A permission question. The backend keeps what it needs to answer it.
-    Permission(PermissionAsk),
+    /// `auto`: it may be allowed without asking (an `auto_allow` kind), if
+    /// the turn may use tools at all.
+    Permission { ask: PermissionAsk, auto: bool },
     /// The agent withdrew an open permission question.
     PermissionClosed { id: String },
     /// The turn ended. `error` says why when `ok` is false.
     TurnEnd { ok: bool, error: Option<String> },
     /// What the session offers, or a change to which is in use.
     Choices(Choices),
+    /// For the user: see `AgentEvent::Notice`.
+    Notice(String),
 }
 
 /// How a backend took a new setting.
@@ -244,6 +251,9 @@ pub(crate) trait Conn: Send {
     fn deny_all(&mut self);
     /// Change the running session's model or mode.
     fn set(&mut self, which: Setting, value: &str) -> impl Future<Output = Result<Applied, String>> + Send;
+    /// Use this model or mode for sessions this agent starts from now on,
+    /// without changing the running one.
+    fn remember(&mut self, which: Setting, value: &str);
     /// Start a fresh session in the running agent, as `Backend::start` does
     /// for a new one. `Err` if it can't: the agent is then restarted.
     fn new_session(&mut self, home: &Path, prompt: &str) -> impl Future<Output = Result<Vec<Event>, String>> + Send;
@@ -288,6 +298,8 @@ enum After {
     Nothing,
     /// Refuse this permission question: it came during a hidden turn.
     Refuse(String),
+    /// Allow it without asking: an `auto_allow` kind in a visible turn.
+    Allow(String),
     /// The interrupted user turn ended: the memory update can be sent now.
     Drained,
     /// The memory update finished.
@@ -310,8 +322,9 @@ struct Session<B: Backend, F> {
     queued: VecDeque<String>,
     /// The app is quitting: sessions that end aren't replaced.
     closing: bool,
-    /// Why the agent last failed to start.
+    /// Why the agent last failed to start, and when.
     start_error: Option<String>,
+    start_failed: Option<std::time::Instant>,
     /// Hand over to this agent once the session has ended.
     switch_to: Option<Config>,
     /// What the session offers, as last reported.
@@ -325,11 +338,13 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
             Ok((conn, events)) => {
                 self.conn = Some(conn);
                 self.start_error = None;
+                self.start_failed = None;
                 self.apply(events);
             }
             Err(e) => {
                 eprintln!("fsc: could not start {}: {e}", self.backend.program());
                 self.start_error = Some(e);
+                self.start_failed = Some(std::time::Instant::now());
             }
         }
     }
@@ -380,7 +395,9 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
 
     /// Send a user prompt, starting the agent if needed.
     async fn ask(&mut self, text: &str) {
-        if self.conn.is_none() {
+        // Not again straight after a failure: a hung agent would make the
+        // prompt wait out a second handshake.
+        if self.conn.is_none() && self.start_failed.is_none_or(|t| t.elapsed() > START_RETRY_AFTER) {
             self.start().await;
         }
         let Some(c) = self.conn.as_mut() else {
@@ -448,7 +465,16 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
     }
 
     async fn set(&mut self, which: Setting, value: String) {
+        if let Some(next) = self.switch_to.as_mut() {
+            // Switching: it's for the agent that's taking over.
+            eprintln!("fsc: {which:?} will be {value} for {}", next.agent_name());
+            next.set_choice(next.agent.backend, which == Setting::Mode, &value);
+            return;
+        }
         self.backend.remember(which, &value);
+        if let Some(c) = self.conn.as_mut() {
+            c.remember(which, &value);
+        }
         let applied = match self.conn.as_mut() {
             // A save is running: the next session gets it.
             Some(_) if self.turn.active && self.turn.internal => Ok(Applied::NextSession),
@@ -477,6 +503,14 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
         }
     }
 
+    /// Answer a permission question the user isn't asked.
+    async fn reply_to(&mut self, id: &str, answer: Answer) {
+        if let Some(c) = self.conn.as_mut() {
+            c.answer(id, answer);
+            c.flush().await;
+        }
+    }
+
     async fn interrupt(&mut self) -> bool {
         match self.conn.as_mut() {
             Some(c) => c.interrupt().await.is_ok(),
@@ -489,6 +523,11 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
             // Like quitting, but another agent takes over afterwards.
             Req::Switch { cfg, save } => {
                 self.switch_to = Some(*cfg);
+                Req::Rotate { save, last: true }
+            }
+            // Quitting: a switch under way is called off.
+            Req::Rotate { last: true, save } => {
+                self.switch_to = None;
                 Req::Rotate { save, last: true }
             }
             req => req,
@@ -592,10 +631,11 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
                     continue;
                 }
                 After::Refuse(id) => {
-                    if let Some(c) = self.conn.as_mut() {
-                        c.answer(&id, Answer::Deny);
-                        c.flush().await;
-                    }
+                    self.reply_to(&id, Answer::Deny).await;
+                    continue;
+                }
+                After::Allow(id) => {
+                    self.reply_to(&id, Answer::Once).await;
                     continue;
                 }
                 After::Drained => self.begin_save().await,
@@ -695,6 +735,7 @@ where
         queued,
         closing: false,
         start_error: None,
+        start_failed: None,
         switch_to: None,
         choices: Choices::default(),
     };
@@ -756,15 +797,20 @@ fn on_event<F: Fn(AgentEvent)>(event: Event, turn: &mut Turn, emit: &F) -> After
                 emit(AgentEvent::ToolUse { name });
             }
         }
-        Event::Permission(ask) => {
-            if turn.active && !turn.internal && !turn.draining {
-                eprintln!("fsc: permission asked: {} · {}", ask.tool, ask.action);
-                emit(AgentEvent::Permission(ask));
-            } else {
-                // A hidden turn (memory update) never gets to use tools.
+        Event::Permission { ask, auto } => {
+            if !(turn.active && !turn.internal && !turn.draining) {
+                // A hidden turn (memory update, or a reply winding down)
+                // never gets to use tools, not even ones allowed outright.
                 return After::Refuse(ask.id);
             }
+            if auto {
+                eprintln!("fsc: allowed without asking: {} · {}", ask.tool, ask.action);
+                return After::Allow(ask.id);
+            }
+            eprintln!("fsc: permission asked: {} · {}", ask.tool, ask.action);
+            emit(AgentEvent::Permission(ask));
         }
+        Event::Notice(text) => emit(AgentEvent::Notice(text)),
         Event::PermissionClosed { id } => emit(AgentEvent::PermissionClosed { id }),
         Event::Choices(c) => return After::Choices(c),
         Event::TurnEnd { ok: success, error } => {
@@ -807,6 +853,9 @@ fn finish_save(home: &Path, ok: bool, reply: String) -> AgentEvent {
         (false, _) => AgentEvent::MemorySaved { ok: false, facts: current.len(), error: Some(reply) },
     }
 }
+
+/// A start that failed this recently isn't retried for a prompt.
+const START_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Longest a hidden end-of-session turn (drain + memory update) may take.
 const INTERNAL_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -892,7 +941,13 @@ mod tests {
             spoken: "May I run a command?".into(),
             can_always: false,
         };
-        assert!(matches!(on_event(Event::Permission(ask), &mut turn, &emit), After::Refuse(id) if id == "p1"));
+        // ...even ones that would be allowed outright in a visible turn.
+        assert!(matches!(on_event(Event::Permission { ask: ask.clone(), auto: true }, &mut turn, &emit), After::Refuse(id) if id == "p1"));
+        assert!(matches!(on_event(Event::Permission { ask: ask.clone(), auto: false }, &mut turn, &emit), After::Refuse(_)));
+        let mut turn = Turn { active: true, internal: true, draining: true, ..Default::default() };
+        assert!(matches!(on_event(Event::Permission { ask: ask.clone(), auto: true }, &mut turn, &emit), After::Refuse(_)));
+        let mut turn = Turn { active: true, ..Default::default() };
+        assert!(matches!(on_event(Event::Permission { ask, auto: true }, &mut turn, &emit), After::Allow(id) if id == "p1"));
         assert!(shown.borrow().is_empty());
     }
 
@@ -973,16 +1028,17 @@ mod tests {
                 vec![match kind {
                     "text" => Event::Text(arg.into()),
                     "start" => Event::TextStart,
-                    "ask" => {
+                    "ask" | "auto" => {
                         self.pending.push(arg.into());
-                        Event::Permission(PermissionAsk {
+                        let ask = PermissionAsk {
                             id: arg.into(),
                             tool: "Bash".into(),
                             action: "run a command".into(),
                             detail: None,
                             spoken: "May I run a command?".into(),
                             can_always: false,
-                        })
+                        };
+                        Event::Permission { ask, auto: kind == "auto" }
                     }
                     "end" => Event::TurnEnd { ok: true, error: None },
                     "fail" => Event::TurnEnd { ok: false, error: Some(arg.into()) },
@@ -1020,6 +1076,9 @@ mod tests {
             async fn set(&mut self, which: Setting, value: &str) -> Result<Applied, String> {
                 self.fake.note(format!("set {which:?} {value}"));
                 Ok(Applied::Live)
+            }
+            fn remember(&mut self, which: Setting, value: &str) {
+                self.fake.note(format!("conn remember {which:?} {value}"));
             }
             async fn close(self) -> String {
                 self.fake.note("close".into());
@@ -1180,6 +1239,72 @@ mod tests {
         assert_eq!(queued, ["hello codex"]);
         // The old agent was stopped, not given a new session.
         assert_eq!(h.fake.log(), ["start false", "prompt I like tea", "prompt <memory update>", "close"]);
+    }
+
+    #[tokio::test]
+    async fn choices_during_a_switch_are_for_the_next_agent() {
+        let mut h = Harness::new("switch-set");
+        h.send(Req::Ask("hi".into()));
+        h.settle().await;
+        h.fake.say("end");
+        assert!(matches!(h.next().await, AgentEvent::TurnDone { .. }));
+        let mut next = Config::default();
+        next.agent.backend = AgentKind::Codex;
+        h.send(Req::Switch { cfg: Box::new(next), save: true });
+        h.send(Req::Set { which: Setting::Model, value: "gpt-x".into() });
+        h.settle().await;
+        h.fake.say("text:NONE");
+        h.fake.say("end");
+        let (cfg, _) = tokio::time::timeout(std::time::Duration::from_secs(2), &mut h.done).await.unwrap().unwrap().unwrap();
+        assert_eq!(cfg.codex.model, "gpt-x");
+        // The old agent never heard of it.
+        assert!(!h.fake.log().iter().any(|l| l.contains("gpt-x")));
+    }
+
+    #[tokio::test]
+    async fn quitting_calls_off_a_switch() {
+        let mut h = Harness::new("switch-quit");
+        h.send(Req::Ask("hi".into()));
+        h.settle().await;
+        h.fake.say("end");
+        assert!(matches!(h.next().await, AgentEvent::TurnDone { .. }));
+        h.send(Req::Switch { cfg: Box::default(), save: true });
+        h.send(Req::Rotate { save: true, last: true });
+        h.settle().await;
+        h.fake.say("text:NONE");
+        h.fake.say("end");
+        assert!(matches!(h.next().await, AgentEvent::MemorySaved { .. }));
+        // The app is closing: no handing over, and the actor waits to end.
+        h.settle().await;
+        assert!(!h.done.is_finished());
+    }
+
+    #[tokio::test]
+    async fn reads_run_without_asking_in_visible_turns() {
+        let mut h = Harness::new("auto");
+        h.send(Req::Ask("look".into()));
+        h.settle().await;
+        h.fake.say("auto:r1");
+        h.fake.say("end");
+        assert!(matches!(h.next().await, AgentEvent::TurnDone { ok: true, .. }));
+        assert!(h.fake.log().contains(&"answer r1 Once".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_setting_during_a_save_reaches_the_next_session() {
+        let mut h = Harness::new("set-save");
+        h.send(Req::Ask("hi".into()));
+        h.settle().await;
+        h.fake.say("end");
+        assert!(matches!(h.next().await, AgentEvent::TurnDone { .. }));
+        h.send(Req::Rotate { save: true, last: false });
+        h.send(Req::Set { which: Setting::Model, value: "m2".into() });
+        h.settle().await;
+        // Both the backend and the running agent keep it for later sessions.
+        let log = h.fake.log();
+        assert!(log.contains(&"remember Model m2".to_string()), "{log:?}");
+        assert!(log.contains(&"conn remember Model m2".to_string()), "{log:?}");
+        assert!(!log.contains(&"set Model m2".to_string()), "{log:?}");
     }
 
     #[tokio::test]

@@ -39,6 +39,9 @@ use crate::permission::{Answer, PermissionAsk, phrase, truncate};
 /// signs in to its servers first.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_DETAIL: usize = 300;
+/// How `call` says the agent stopped answering.
+const GONE: &str = "the agent went away";
+const EXITED: &str = "the agent exited";
 /// JSON-RPC: the agent asked for something we don't offer.
 const METHOD_NOT_FOUND: i64 = -32601;
 /// ACP: the agent needs signing in.
@@ -68,21 +71,11 @@ struct Settings {
 impl Acp {
     /// `kind`'s usual set-up, changed by its own config table.
     pub(crate) fn new(kind: AgentKind, cfg: &AcpAgentConfig, auto_allow: &[String]) -> Self {
-        let (program, mut args, login, install, mode): (&str, Vec<String>, _, _, &str) = match kind {
-            AgentKind::Codex => (
-                "codex-acp",
-                Vec::new(),
-                Some("codex login"),
-                Some("codex-acp (npm i -g @agentclientprotocol/codex-acp)"),
-                // Ask before edits, commands and network use.
-                "read-only",
-            ),
-            AgentKind::Antigravity => ("agy", vec!["acp".into()], Some("agy acp --login"), Some("antigravity-cli"), ""),
-            AgentKind::OpenCode => ("opencode", vec!["acp".into()], Some("opencode auth login"), Some("opencode"), ""),
-            AgentKind::Acp | AgentKind::Claude => ("", Vec::new(), None, None, ""),
-        };
+        let preset = kind.preset();
+        let (login, install, mode) = (preset.login, preset.install, preset.mode);
+        let mut args: Vec<String> = preset.args.iter().map(|a| a.to_string()).collect();
         let program = if cfg.command.is_empty() {
-            program.to_string()
+            preset.program.to_string()
         } else {
             // Your own command replaces the preset's, arguments and all.
             args.clear();
@@ -173,8 +166,10 @@ impl Backend for Acp {
             Ok(events) => Ok((conn, events)),
             Err(e) => {
                 let reason = conn.close().await;
-                // A crash says more than the timeout or broken pipe that followed it.
-                Err(if e.starts_with("the agent") { reason } else { e })
+                // A crash says more than the broken pipe that followed it.
+                // (Not a timeout: close() kills the agent, so its exit
+                // status would only say it was killed.)
+                Err(if e.starts_with(GONE) || e.starts_with(EXITED) { reason } else { e })
             }
         }
     }
@@ -286,6 +281,7 @@ impl AcpConn {
 
         (self.choices, self.via) = session_choices(&r);
         let s = self.settings.clone();
+        let mut notices = Vec::new();
         for (which, value) in [(Setting::Mode, &s.mode), (Setting::Model, &s.model)] {
             if value.is_empty() || self.choices.get(which).is_some_and(|c| &c.current == value) {
                 continue;
@@ -297,7 +293,23 @@ impl AcpConn {
                         sel.current = value.clone();
                     }
                 }
-                Err(e) => eprintln!("fsc: could not set the agent's {which:?} to {value:?}: {e}"),
+                // The mode decides what's asked about first (Codex's
+                // read-only is why it asks before edits and commands), so a
+                // session in some other mode isn't one to carry on with.
+                Err(e) if which == Setting::Mode => {
+                    let offered = match &self.choices.mode {
+                        Some(m) => m.options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>().join(", "),
+                        None => "none listed".into(),
+                    };
+                    return Err(format!(
+                        "it wouldn't use its {value:?} mode ({e}); set `mode` in its section of config.toml \
+                         to one it offers ({offered})"
+                    ));
+                }
+                Err(e) => {
+                    eprintln!("fsc: could not set the agent's model to {value:?}: {e}");
+                    notices.push(Event::Notice(format!("model {value} unavailable: {e}")));
+                }
             }
         }
         let model = match &self.choices.model {
@@ -305,7 +317,9 @@ impl AcpConn {
             None if !s.model.is_empty() => s.model,
             None => current_model(&r),
         };
-        Ok(vec![Event::Ready { session_id: self.session.clone(), model }, Event::Choices(self.choices.clone())])
+        let mut events = vec![Event::Ready { session_id: self.session.clone(), model }, Event::Choices(self.choices.clone())];
+        events.extend(notices);
+        Ok(events)
     }
 
     /// The request that sets a session setting: its config option where
@@ -338,12 +352,12 @@ impl AcpConn {
     /// sessions, while no turn is running: anything else that arrives
     /// meanwhile is answered or dropped.
     async fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
-        let gone = |e: std::io::Error| format!("the agent went away ({e})");
+        let gone = |e: std::io::Error| format!("{GONE} ({e})");
         let id = self.request(method, params).await.map_err(gone)?;
         let wait = async {
             loop {
                 let Some(line) = self.lines.next_line().await.map_err(gone)? else {
-                    return Err("the agent exited".to_string());
+                    return Err(EXITED.to_string());
                 };
                 let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
                 if v.get("method").is_some() {
@@ -406,16 +420,12 @@ impl AcpConn {
         let kind = tool_kind(call);
         let rpc = v["id"].as_str().map(str::to_string).unwrap_or_else(|| v["id"].to_string());
         let pending = Pending { id: format!("acp-{rpc}"), rpc_id: v["id"].clone(), options };
-        if self.settings.auto_allow.iter().any(|k| k == kind)
-            && let Some(opt) = pick(&pending.options, &["allow_once"])
-        {
-            eprintln!("fsc: auto-allowed a {kind} tool");
-            self.outbox.push(selected(&pending.rpc_id, &opt));
-            return Vec::new();
-        }
+        // The session decides: a hidden turn refuses even these.
+        let auto =
+            self.settings.auto_allow.iter().any(|k| k == kind) && pick(&pending.options, &["allow_once"]).is_some();
         let ask = describe_tool(&pending.id, call, pending.options.iter().any(|(_, k)| k == "allow_always"));
         self.pending.push(pending);
-        vec![Event::Permission(ask)]
+        vec![Event::Permission { ask, auto }]
     }
 
     fn on_update(&mut self, params: &Value) -> Vec<Event> {
@@ -441,6 +451,28 @@ impl AcpConn {
                 let name = u["title"].as_str().or(u["kind"].as_str()).unwrap_or("a tool");
                 vec![Event::ToolUse { name: name.to_string() }]
             }
+            // The agent changed its own mode (say, leaving plan mode).
+            Some("current_mode_update") => {
+                let (Some(id), Some(mode)) = (u["currentModeId"].as_str(), self.choices.mode.as_mut()) else {
+                    return Vec::new();
+                };
+                mode.current = id.to_string();
+                vec![Event::Choices(self.choices.clone())]
+            }
+            // Its options changed: new models, or a value it changed itself.
+            Some("config_option_update") => {
+                let (fresh, via) = session_choices(&json!({ "configOptions": u["configOptions"] }));
+                for (i, which) in [Setting::Model, Setting::Mode].into_iter().enumerate() {
+                    if let Some(sel) = fresh.get(which).cloned() {
+                        match which {
+                            Setting::Model => self.choices.model = Some(sel),
+                            Setting::Mode => self.choices.mode = Some(sel),
+                        }
+                        self.via[i] = via[i].clone();
+                    }
+                }
+                vec![Event::Choices(self.choices.clone())]
+            }
             _ => Vec::new(),
         }
     }
@@ -449,11 +481,13 @@ impl AcpConn {
         if let Some(i) = self.setting_requests.iter().position(|(id, ..)| v["id"] == json!(id)) {
             let (_, which, before) = self.setting_requests.remove(i);
             let Some(e) = v.get("error") else { return Vec::new() };
-            eprintln!("fsc: the agent wouldn't change its {which:?}: {}", self.describe(e));
+            let why = self.describe(e);
+            eprintln!("fsc: the agent wouldn't change its {which:?}: {why}");
             if let Some(sel) = self.choices.get_mut(which) {
                 sel.current = before;
             }
-            return vec![Event::Choices(self.choices.clone())];
+            let what = if which == Setting::Mode { "mode" } else { "model" };
+            return vec![Event::Choices(self.choices.clone()), Event::Notice(format!("{what} not changed: {why}"))];
         }
         if self.prompt_id.is_none() || v["id"] != json!(self.prompt_id) {
             if let Some(e) = v.get("error") {
@@ -540,11 +574,15 @@ impl Conn for AcpConn {
         }
     }
 
-    async fn set(&mut self, which: Setting, value: &str) -> Result<Applied, String> {
+    fn remember(&mut self, which: Setting, value: &str) {
         match which {
             Setting::Model => self.settings.model = value.into(),
             Setting::Mode => self.settings.mode = value.into(),
         }
+    }
+
+    async fn set(&mut self, which: Setting, value: &str) -> Result<Applied, String> {
+        Conn::remember(self, which, value);
         if self.session.is_empty() || self.choices.get(which).is_none() {
             return Ok(Applied::NextSession);
         }
@@ -830,7 +868,7 @@ mod tests {
         let opts = json!([{ "optionId": "y", "name": "Yes", "kind": "allow_once" },
                           { "optionId": "yy", "name": "Always", "kind": "allow_always" },
                           { "optionId": "n", "name": "No", "kind": "reject_once" }]);
-        // A read is allowed without asking...
+        // A read may be allowed without asking (the session decides)...
         a.send(json!({ "jsonrpc": "2.0", "id": 0, "method": "session/request_permission",
             "params": { "sessionId": "s1", "options": opts, "toolCall": { "toolCallId": "t1", "kind": "read", "title": "Read notes.txt" } } }))
             .await;
@@ -839,14 +877,18 @@ mod tests {
             "params": { "sessionId": "s1", "options": opts, "toolCall": { "toolCallId": "t2", "kind": "execute",
                 "title": "printf hi > hello.txt", "rawInput": { "command": "printf hi > hello.txt" } } } }))
             .await;
-        let ev = events(&mut c, 3).await;
+        let ev = events(&mut c, 4).await;
         assert!(matches!(&ev[0], Event::Text(t) if t == "Let me look."));
         assert!(matches!(&ev[1], Event::ToolUse { name } if name == "Read notes.txt"));
-        let Event::Permission(ask) = &ev[2] else { panic!("{ev:?}") };
+        let Event::Permission { ask: read, auto: true } = &ev[2] else { panic!("{ev:?}") };
+        let Event::Permission { ask, auto: false } = &ev[3] else { panic!("{ev:?}") };
         assert_eq!(ask.tool, "Command");
         assert_eq!(ask.spoken, "May I run a command?");
         assert_eq!(ask.detail.as_deref(), Some("printf hi > hello.txt"));
         assert!(ask.can_always);
+        // Nothing is sent until it's answered.
+        assert!(c.answer(&read.id, Answer::Once));
+        c.flush().await;
         let auto = a.read().await;
         assert_eq!((auto["id"].clone(), auto["result"]["outcome"]["optionId"].clone()), (json!(0), json!("y")));
 
@@ -881,7 +923,7 @@ mod tests {
                         "toolCall": { "kind": "edit", "title": "Edit a.txt", "locations": [{ "path": "/tmp/a.txt" }] } } }))
             .await;
         let ev = events(&mut c, 1).await;
-        assert!(matches!(&ev[0], Event::Permission(ask) if ask.detail.as_deref() == Some("/tmp/a.txt")));
+        assert!(matches!(&ev[0], Event::Permission { ask, auto: false } if ask.detail.as_deref() == Some("/tmp/a.txt")));
         let ask = describe_tool("x", &json!({ "kind": "execute", "title": "uname", "rawInput": { "CommandLine": "uname -r" } }), false);
         assert_eq!(ask.detail.as_deref(), Some("uname -r"));
 
@@ -962,10 +1004,55 @@ mod tests {
         assert_eq!(c.set(Setting::Mode, "plan").await, Ok(Applied::NextSession));
         // The agent says no: back to the one in use.
         a.send(json!({ "jsonrpc": "2.0", "id": req["id"], "error": { "code": -32602, "message": "unknown model" } })).await;
-        let ev = events(&mut c, 1).await;
-        assert!(matches!(&ev[..], [Event::Choices(ch)] if ch.model.as_ref().unwrap().current == "x"));
+        let ev = events(&mut c, 2).await;
+        assert!(matches!(&ev[..], [Event::Choices(ch), Event::Notice(n)]
+            if ch.model.as_ref().unwrap().current == "x" && n.contains("unknown model")));
         // ...but new sessions still ask for it (it may exist there).
         assert_eq!(c.settings.model, "y");
+    }
+
+    #[tokio::test]
+    async fn a_mode_that_wont_set_stops_the_session() {
+        let s = Settings { mode: "read-only".into(), ..settings() };
+        let (mut c, mut a) = pair(s);
+        let (opened, ()) = tokio::join!(c.open(Path::new("/tmp"), "p"), async {
+            let init = a.read().await;
+            a.reply(&init["id"], json!({ "protocolVersion": 1, "agentCapabilities": {} })).await;
+            let new = a.read().await;
+            a.reply(&new["id"], json!({ "sessionId": "s1", "configOptions": [{ "id": "mode", "category": "mode",
+                "currentValue": "agent", "options": [{ "value": "agent" }, { "value": "full" }] }] })).await;
+            let set = a.read().await;
+            assert_eq!((set["params"]["configId"].as_str(), set["params"]["value"].as_str()), (Some("mode"), Some("read-only")));
+            a.send(json!({ "jsonrpc": "2.0", "id": set["id"], "error": { "code": -32602, "message": "no such mode" } })).await;
+        });
+        let e = opened.unwrap_err();
+        assert!(e.contains("\"read-only\" mode") && e.contains("agent, full"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn the_agent_changing_its_own_settings() {
+        let (mut c, mut a) = pair(settings());
+        let (opened, ()) = tokio::join!(c.open(Path::new("/tmp"), "p"), async {
+            let init = a.read().await;
+            a.reply(&init["id"], json!({ "protocolVersion": 1, "agentCapabilities": {} })).await;
+            let new = a.read().await;
+            a.reply(&new["id"], json!({ "sessionId": "s1",
+                "modes": { "currentModeId": "plan", "availableModes": [{ "id": "plan" }, { "id": "build" }] } })).await;
+        });
+        opened.unwrap();
+        a.update("s1", json!({ "sessionUpdate": "current_mode_update", "currentModeId": "build" })).await;
+        let ev = events(&mut c, 1).await;
+        assert!(matches!(&ev[..], [Event::Choices(ch)] if ch.mode.as_ref().unwrap().current == "build"));
+        // New models arrive as config options; the modes it had are kept.
+        a.update("s1", json!({ "sessionUpdate": "config_option_update", "configOptions": [{ "id": "model", "category": "model",
+            "currentValue": "m2", "options": [{ "value": "m1" }, { "value": "m2", "name": "Model Two" }] }] })).await;
+        let ev = events(&mut c, 1).await;
+        let Event::Choices(ch) = &ev[0] else { panic!("{ev:?}") };
+        assert_eq!(ch.model.as_ref().unwrap().current_name(), "Model Two");
+        assert_eq!(ch.mode.as_ref().unwrap().current, "build");
+        // ...and later changes go through the config option.
+        c.set(Setting::Model, "m1").await.unwrap();
+        assert_eq!(a.read().await["method"], "session/set_config_option");
     }
 
     #[test]
@@ -1043,8 +1130,8 @@ mod real {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Changing the assistant's own files must be asked about. Refused
-    /// here, so the file must be unchanged.
+    /// Changing the assistant's own files needs a yes. Every question is
+    /// refused here, so the file must be unchanged.
     async fn asks_before_editing_home(kind: AgentKind) {
         // Not under /tmp: Antigravity writes there without asking.
         let cache = directories::BaseDirs::new().unwrap().cache_dir().to_path_buf();
@@ -1085,7 +1172,10 @@ mod real {
         let after = std::fs::read_to_string(&memory).unwrap();
         let _ = std::fs::remove_dir_all(&home);
         eprintln!("{kind:?} said: {text}");
-        assert!(!asked.is_empty(), "never asked");
+        // What matters is that nothing changed without a yes. Whether the
+        // agent asks or gives up (Codex's sandbox may simply refuse the
+        // write) is up to it.
+        eprintln!("{kind:?} asked about: {asked:?}");
         assert_eq!(after, "- old fact\n");
     }
 

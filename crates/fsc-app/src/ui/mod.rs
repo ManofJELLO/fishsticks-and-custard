@@ -107,6 +107,8 @@ struct State {
     agents: [bool; AgentKind::ALL.len()],
     /// The models and modes the agent offers.
     choices: Choices,
+    /// The running session keeps long-term memory.
+    memory_on: bool,
     menu_sent: Option<tray::MenuState>,
     voice: Voice,
     viz: Viz,
@@ -293,6 +295,7 @@ impl Ui {
 
         let model = pretty_model(&cfg.model_hint());
         let (agent, agents) = (cfg.agent.backend, AgentKind::ALL.map(|k| cfg.available(k)));
+        let memory_on = cfg.memory();
         let viz = Viz::new(&cfg.ui);
         let ui = Rc::new(Ui {
             cfg,
@@ -322,6 +325,7 @@ impl Ui {
                 agent,
                 agents,
                 choices: Choices::default(),
+                memory_on,
                 menu_sent: None,
                 voice: Voice::default(),
                 viz,
@@ -572,7 +576,7 @@ impl Ui {
             Command::Agent { backend: None } => return Reply::state(self.st.borrow().agent.key()),
             Command::Agent { backend: Some(name) } => {
                 let Some(kind) = AgentKind::from_key(&name) else {
-                    return Reply::err(format!("no agent called {name:?}: try claude, codex, antigravity or acp"));
+                    return Reply::err(format!("no agent called {name:?}: try {}", AgentKind::all_keys()));
                 };
                 return self.switch_agent(kind);
             }
@@ -700,6 +704,10 @@ impl Ui {
                 }
             }
             AgentEvent::Forgotten => self.flash_meta("MEMORY CLEARED"),
+            AgentEvent::Notice(text) => {
+                eprintln!("fsc: {text}");
+                self.flash_meta_for(&text.to_uppercase(), Duration::from_secs(6));
+            }
             AgentEvent::Choices(c) => {
                 {
                     let mut st = self.st.borrow_mut();
@@ -903,7 +911,7 @@ impl Ui {
         } else {
             self.claude.rotate(save);
         }
-        st.memory_saving |= save && self.cfg.memory();
+        st.memory_saving |= save && st.memory_on;
         st.session_dirty = false;
         st.last_activity = None;
     }
@@ -939,7 +947,10 @@ impl Ui {
         {
             let mut st = self.st.borrow_mut();
             self.claude.switch(&cfg, st.session_dirty);
-            st.memory_saving |= st.session_dirty && cfg.memory();
+            // Whether this session saves follows the setting it started
+            // with; the next one goes by the config as it is now.
+            st.memory_saving |= st.session_dirty && st.memory_on;
+            st.memory_on = cfg.memory();
             st.session_dirty = false;
             st.last_activity = None;
             st.agent = kind;
@@ -982,7 +993,7 @@ impl Ui {
     fn quit(self: &Rc<Self>) {
         let wait = {
             let mut st = self.st.borrow_mut();
-            let wait = self.cfg.memory() && (st.session_dirty || st.memory_saving) && !st.quitting;
+            let wait = (st.memory_on && st.session_dirty || st.memory_saving) && !st.quitting;
             st.quitting = true;
             wait
         };

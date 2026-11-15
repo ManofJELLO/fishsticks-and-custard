@@ -58,7 +58,14 @@ impl Backend for ClaudeCli {
 
     async fn start(&self, home: &Path, prompt: &str) -> Result<(ClaudeConn, Vec<Event>), String> {
         // The CLI says which model it's using once the first prompt is in.
-        start(&self.cfg, home, prompt).map(|c| (c, vec![Event::Choices(choices(&self.cfg))]))
+        let mut conn = start(&self.cfg, home, prompt)?;
+        // Ask for the models this account can use; until the answer comes
+        // the menu shows the usual three.
+        if let Err(e) = conn.control_as(INIT_ID, json!({ "subtype": "initialize" })).await {
+            eprintln!("fsc: could not ask claude for its models: {e}");
+        }
+        let fallback = choices(&conn.model, &conn.mode, None);
+        Ok((conn, vec![Event::Choices(fallback)]))
     }
 
     fn remember(&mut self, which: Setting, value: &str) {
@@ -69,24 +76,44 @@ impl Backend for ClaudeCli {
     }
 }
 
-/// The models and permission modes on offer. Modes that skip questions
-/// altogether (bypassPermissions, dontAsk) aren't: the user is asked.
-fn choices(cfg: &ClaudeConfig) -> Choices {
-    let list = |items: &[(&str, &str)], current: &str| {
-        let mut options: Vec<Choice> = items.iter().map(|(id, name)| Choice { id: (*id).into(), name: (*name).into() }).collect();
+/// Request id of our `initialize`, whose answer lists the models.
+const INIT_ID: &str = "fsc_init";
+
+/// The models and permission modes on offer. `models`: as the CLI lists
+/// them (`initialize`), else the usual aliases. Modes that skip questions
+/// altogether (bypassPermissions, dontAsk) aren't offered: the user is asked.
+fn choices(model: &str, mode: &str, models: Option<Vec<Choice>>) -> Choices {
+    let fixed = |items: &[(&str, &str)]| -> Vec<Choice> {
+        items.iter().map(|(id, name)| Choice { id: (*id).into(), name: (*name).into() }).collect()
+    };
+    let select = |mut options: Vec<Choice>, current: &str| {
         if !current.is_empty() && !options.iter().any(|o| o.id == current) {
             options.push(Choice { id: current.into(), name: current.into() });
         }
         Select { current: current.into(), options }
     };
-    let mode = if cfg.permission_mode.is_empty() { "default" } else { &cfg.permission_mode };
+    let models = models.filter(|m| !m.is_empty()).unwrap_or_else(|| fixed(&[("sonnet", "Sonnet"), ("opus", "Opus"), ("haiku", "Haiku")]));
     Choices {
-        model: Some(list(&[("sonnet", "Sonnet"), ("opus", "Opus"), ("haiku", "Haiku")], &cfg.model)),
-        mode: Some(list(
-            &[("default", "Ask"), ("acceptEdits", "Accept edits"), ("auto", "Auto"), ("plan", "Plan")],
-            mode,
+        model: Some(select(models, model)),
+        mode: Some(select(
+            fixed(&[("default", "Ask"), ("acceptEdits", "Accept edits"), ("auto", "Auto"), ("plan", "Plan")]),
+            if mode.is_empty() { "default" } else { mode },
         )),
     }
+}
+
+/// The models in an `initialize` answer: aliases ("opus", "fable") and
+/// pinned versions, named as Claude Code names them ("Opus 5.5").
+fn listed_models(response: &Value) -> Option<Vec<Choice>> {
+    let list = response["models"].as_array()?;
+    Some(
+        list.iter()
+            .filter_map(|m| {
+                let id = m["value"].as_str()?;
+                Some(Choice { id: id.into(), name: m["displayName"].as_str().unwrap_or(id).into() })
+            })
+            .collect(),
+    )
 }
 
 /// Seed the tool allow-list. An existing one is never overwritten, but older
@@ -153,13 +180,40 @@ pub(crate) struct ClaudeConn {
     /// A prompt has been sent. Before that, a model set over the control
     /// channel is overridden when the session starts.
     prompted: bool,
+    /// The model and permission mode in use, and the models on offer.
+    model: String,
+    mode: String,
+    models: Option<Vec<Choice>>,
 }
 
 impl ClaudeConn {
     async fn control(&mut self, request: Value) -> std::io::Result<()> {
         self.req_id += 1;
-        let msg = json!({ "type": "control_request", "request_id": format!("fsc_{}", self.req_id), "request": request });
+        let id = format!("fsc_{}", self.req_id);
+        self.control_as(&id, request).await
+    }
+
+    async fn control_as(&mut self, id: &str, request: Value) -> std::io::Result<()> {
+        let msg = json!({ "type": "control_request", "request_id": id, "request": request });
         write_line(&mut self.stdin, &msg).await
+    }
+
+    /// The answer to our `initialize`, if `line` is it: the menu with the
+    /// account's models.
+    fn init_reply(&mut self, line: &str) -> Option<Event> {
+        if !line.contains(INIT_ID) {
+            return None;
+        }
+        let v: Value = serde_json::from_str(line).ok()?;
+        let r = &v["response"];
+        if v["type"] != "control_response" || r["request_id"] != INIT_ID || r["subtype"] != "success" {
+            return None;
+        }
+        self.models = listed_models(&r["response"]);
+        if let Some(mode) = r["response"]["current_permission_mode"].as_str() {
+            self.mode = mode.to_string();
+        }
+        Some(Event::Choices(choices(&self.model, &self.mode, self.models.clone())))
     }
 }
 
@@ -169,6 +223,9 @@ impl Conn for ClaudeConn {
     }
 
     fn handle(&mut self, line: &str) -> Vec<Event> {
+        if let Some(e) = self.init_reply(line) {
+            return vec![e];
+        }
         let (event, reply) = parse_line(line, &mut self.pending);
         self.outbox.extend(reply);
         event.into_iter().collect()
@@ -202,8 +259,15 @@ impl Conn for ClaudeConn {
             Setting::Mode => json!({ "subtype": "set_permission_mode", "mode": value }),
         };
         self.control(request).await.map_err(|e| e.to_string())?;
+        match which {
+            Setting::Model => self.model = value.into(),
+            Setting::Mode => self.mode = value.into(),
+        }
         Ok(Applied::Live)
     }
+
+    /// Later sessions are new processes, started from the backend's config.
+    fn remember(&mut self, _: Setting, _: &str) {}
 
     fn answer(&mut self, id: &str, answer: Answer) -> bool {
         let Some(i) = self.pending.iter().position(|p| p.id == id) else { return false };
@@ -312,6 +376,9 @@ fn start(cfg: &ClaudeConfig, home: &Path, prompt: &str) -> Result<ClaudeConn, St
         outbox: Vec::new(),
         req_id: 0,
         prompted: false,
+        model: cfg.model.clone(),
+        mode: cfg.permission_mode.clone(),
+        models: None,
     })
 }
 
@@ -357,7 +424,8 @@ fn parse_line(line: &str, pending: &mut Vec<Pending>) -> (Option<Event>, Option<
             }
             let (ask, p) = claude_ask::parse(&id, req);
             pending.push(p);
-            Event::Permission(ask)
+            // Claude's own allow-list decides what runs without asking.
+            Event::Permission { ask, auto: false }
         }
         Some("control_cancel_request") => {
             let id = s(&v["request_id"]);
@@ -477,7 +545,7 @@ mod tests {
         // Permission asked, withdrawn; unknown requests are refused.
         let (e, r) = parse(json!({"type": "control_request", "request_id": "r1",
             "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "ls"}}}));
-        assert!(matches!(e, Some(Event::Permission(a)) if a.id == "r1"));
+        assert!(matches!(e, Some(Event::Permission { ask, .. }) if ask.id == "r1"));
         assert!(r.is_none());
         let (e, _) = parse(json!({"type": "control_cancel_request", "request_id": "r1"}));
         assert!(matches!(e, Some(Event::PermissionClosed { id }) if id == "r1"));
@@ -492,6 +560,23 @@ mod tests {
         let (e, _) = parse(json!({"type": "result", "subtype": "success", "is_error": false, "result": "done"}));
         assert!(matches!(e, Some(Event::TurnEnd { ok: true, error: None })));
         assert!(parse_line("not json", &mut Vec::new()).0.is_none());
+    }
+
+    #[test]
+    fn models_come_from_the_cli() {
+        let init = json!({ "models": [
+            { "value": "default", "displayName": "Default (recommended)" },
+            { "value": "fable", "displayName": "Fable 5.2" },
+            { "value": "claude-opus-4-8", "displayName": "Opus 4.8" } ] });
+        let c = choices("sonnet", "", listed_models(&init));
+        let m = c.model.unwrap();
+        assert_eq!(m.options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(), ["default", "fable", "claude-opus-4-8", "sonnet"]);
+        assert_eq!(m.current_name(), "sonnet");
+        assert_eq!(c.mode.unwrap().current, "default");
+        // No list: the usual aliases.
+        let c = choices("opus", "plan", None);
+        assert_eq!(c.model.unwrap().current_name(), "Opus");
+        assert_eq!(c.mode.unwrap().current_name(), "Plan");
     }
 
     #[test]
