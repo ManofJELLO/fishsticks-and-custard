@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::sync::{mpsc, oneshot};
 
-use fsc_core::claude::{ClaudeEvent, ClaudeHandle};
+use fsc_core::agent::{AgentEvent, AgentHandle};
 use fsc_core::config::{Config, ThemePref};
 use fsc_core::ipc::{Command, Reply};
 
@@ -27,7 +27,7 @@ use crate::style::{Palette, Rgb, ThemeMode};
 
 pub enum AppEvent {
     Command(Command, Option<oneshot::Sender<Reply>>),
-    Claude(ClaudeEvent),
+    Agent(AgentEvent),
     Audio(fsc_audio::AudioEvent),
     Theme(ThemeMode),
     /// The desktop's accent colour changed (`None`: it has none).
@@ -106,8 +106,8 @@ fn main() -> Result<()> {
 
     let claude = {
         let tx = ev_tx.clone();
-        ClaudeHandle::spawn(cfg.claude.clone(), cfg.claude_home(), move |e| {
-            let _ = tx.try_send(AppEvent::Claude(e));
+        AgentHandle::spawn(cfg.claude.clone(), cfg.claude_home(), move |e| {
+            let _ = tx.try_send(AppEvent::Agent(e));
         })
     };
 

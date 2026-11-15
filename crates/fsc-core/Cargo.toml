@@ -1,6 +1,6 @@
 [package]
 name = "fsc-core"
-description = "Shared types for Fishsticks & Custard: IPC protocol, config, Claude session client"
+description = "Shared types for Fishsticks & Custard: IPC protocol, config, agent session client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

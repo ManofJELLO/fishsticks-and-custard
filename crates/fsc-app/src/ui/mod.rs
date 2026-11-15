@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 
 use fsc_audio::{AudioEvent, AudioHandle};
 use fsc_core::Phase;
-use fsc_core::claude::{ClaudeEvent, ClaudeHandle, pretty_model, pretty_tool};
+use fsc_core::agent::{AgentEvent, AgentHandle, pretty_model, pretty_tool};
 use fsc_core::config::{Config, SpeakMode, Surface};
 use fsc_core::ipc::{Command, Reply};
 use fsc_core::permission::{self, Answer, PermissionAsk};
@@ -153,7 +153,7 @@ impl State {
 
 pub struct Ui {
     cfg: Config,
-    claude: ClaudeHandle,
+    claude: AgentHandle,
     audio: AudioHandle,
     tray_tx: mpsc::UnboundedSender<IconState>,
     app: gtk::Application,
@@ -180,7 +180,7 @@ impl Ui {
         cfg: Config,
         palette: Palette,
         accent_pin: Option<Rgb>,
-        claude: ClaudeHandle,
+        claude: AgentHandle,
         audio: AudioHandle,
         tray_tx: mpsc::UnboundedSender<IconState>,
     ) -> Rc<Self> {
@@ -475,7 +475,7 @@ impl Ui {
                     let _ = tx.send(r);
                 }
             }
-            AppEvent::Claude(e) => self.claude_event(e),
+            AppEvent::Agent(e) => self.agent_event(e),
             AppEvent::Audio(e) => self.audio_event(e),
             AppEvent::Theme(mode) => self.set_theme(mode),
             AppEvent::Accent(c) => {
@@ -562,15 +562,15 @@ impl Ui {
         Reply::ok()
     }
 
-    fn claude_event(self: &Rc<Self>, e: ClaudeEvent) {
+    fn agent_event(self: &Rc<Self>, e: AgentEvent) {
         match e {
-            ClaudeEvent::Ready { model, .. } => {
+            AgentEvent::Ready { model, .. } => {
                 if !model.is_empty() {
                     self.st.borrow_mut().model = pretty_model(&model);
                     self.restore_meta();
                 }
             }
-            ClaudeEvent::TextDelta(t) => {
+            AgentEvent::TextDelta(t) => {
                 if self.st.borrow().claude != Phase::Responding {
                     self.set_claude(Phase::Responding);
                 }
@@ -588,7 +588,7 @@ impl Ui {
                 }
                 self.scroll_to_end();
             }
-            ClaudeEvent::ToolUse { name } => {
+            AgentEvent::ToolUse { name } => {
                 if self.st.borrow().asks.is_empty() {
                     self.set_claude(Phase::Working);
                 }
@@ -602,9 +602,9 @@ impl Ui {
                 }
                 self.scroll_to_end();
             }
-            ClaudeEvent::Permission(ask) => self.on_permission(ask),
-            ClaudeEvent::PermissionClosed { id } => self.close_ask(&id, "— WITHDRAWN"),
-            ClaudeEvent::TurnDone { ok, interrupted, error } => {
+            AgentEvent::Permission(ask) => self.on_permission(ask),
+            AgentEvent::PermissionClosed { id } => self.close_ask(&id, "— WITHDRAWN"),
+            AgentEvent::TurnDone { ok, interrupted, error } => {
                 // Questions still open when the turn ends were never answered.
                 let open: Vec<String> = self.st.borrow().asks.iter().map(|a| a.ask.id.clone()).collect();
                 for id in open {
@@ -660,10 +660,10 @@ impl Ui {
                 }
                 self.maybe_follow_up();
             }
-            ClaudeEvent::Exited { reason } => {
+            AgentEvent::Exited { reason } => {
                 eprintln!("fsc: {reason}");
             }
-            ClaudeEvent::MemorySaved { ok, facts, error } => {
+            AgentEvent::MemorySaved { ok, facts, error } => {
                 self.st.borrow_mut().memory_saving = false;
                 if ok {
                     self.flash_meta(&format!("MEMORY UPDATED · {facts} FACTS"));
@@ -675,7 +675,7 @@ impl Ui {
                     self.app.quit();
                 }
             }
-            ClaudeEvent::Forgotten => self.flash_meta("MEMORY CLEARED"),
+            AgentEvent::Forgotten => self.flash_meta("MEMORY CLEARED"),
         }
     }
 
