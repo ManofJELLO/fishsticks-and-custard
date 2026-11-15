@@ -9,6 +9,10 @@ use std::path::PathBuf;
 pub struct Config {
     pub agent: AgentConfig,
     pub claude: ClaudeConfig,
+    pub codex: AcpAgentConfig,
+    pub antigravity: AcpAgentConfig,
+    /// Any other ACP agent.
+    pub acp: AcpAgentConfig,
     pub ui: UiConfig,
     pub voice: VoiceConfig,
 }
@@ -92,27 +96,43 @@ pub enum AgentKind {
     Codex,
     /// Google Antigravity CLI through `agy acp` (sign in with `agy acp --login`).
     Antigravity,
-    /// Any other Agent Client Protocol agent: set `command`.
+    /// Any other Agent Client Protocol agent: set `[acp] command`.
     Acp,
+}
+
+impl AgentKind {
+    pub const ALL: [AgentKind; 4] = [AgentKind::Claude, AgentKind::Codex, AgentKind::Antigravity, AgentKind::Acp];
+
+    /// As written in the config and on the command line.
+    pub fn key(self) -> &'static str {
+        match self {
+            AgentKind::Claude => "claude",
+            AgentKind::Codex => "codex",
+            AgentKind::Antigravity => "antigravity",
+            AgentKind::Acp => "acp",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.key().eq_ignore_ascii_case(s.trim()))
+    }
+
+    /// For people: "Codex wants to ...".
+    pub fn name(self) -> &'static str {
+        match self {
+            AgentKind::Claude => "Claude",
+            AgentKind::Codex => "Codex",
+            AgentKind::Antigravity => "Antigravity",
+            AgentKind::Acp => "Custom agent",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
     pub backend: AgentKind,
-    /// The agent's program. Empty: the backend's usual one (`codex-acp`, `agy`).
-    pub command: String,
-    /// Arguments: the backend's usual ones (`acp` for agy) are kept unless
-    /// `command` is set.
-    pub args: Vec<String>,
-    /// Extra environment variables for the agent.
-    pub env: std::collections::BTreeMap<String, String>,
-    /// Model id as the agent lists it. Empty: the agent's default.
-    pub model: String,
-    /// The agent's session mode (its approval preset), e.g. Codex's
-    /// "read-only" or Antigravity's "default". Empty: the backend's usual one.
-    pub mode: String,
-    /// Tool kinds that run without asking. The rest (edit, delete, move,
+    /// ACP agents only: tool kinds that run without asking. The rest (edit, delete, move,
     /// execute, other) are asked about, when the agent asks at all.
     pub auto_allow: Vec<String>,
     /// The assistant's home: persona, memory, and the agent's own settings
@@ -131,17 +151,30 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             backend: AgentKind::Claude,
-            command: String::new(),
-            args: Vec::new(),
-            env: Default::default(),
-            model: String::new(),
-            mode: String::new(),
             auto_allow: ["read", "search", "fetch", "think"].map(String::from).to_vec(),
             home: None,
             session_idle_minutes: None,
             memory: None,
         }
     }
+}
+
+/// `[codex]`, `[antigravity]` and `[acp]`: one ACP agent's settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AcpAgentConfig {
+    /// The agent's program. Empty: the usual one (`codex-acp`, `agy`).
+    pub command: String,
+    /// Arguments. With `command` set, the whole list (agy needs "acp");
+    /// otherwise added after the usual ones.
+    pub args: Vec<String>,
+    /// Extra environment variables for the agent.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Model id as the agent lists it. Empty: the agent's default.
+    pub model: String,
+    /// The agent's session mode (its approval preset), e.g. Codex's
+    /// "read-only" or Antigravity's "default". Empty: the usual one.
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -337,21 +370,63 @@ impl Config {
 
     /// The agent's name, for messages: "Claude wants to ...".
     pub fn agent_name(&self) -> &'static str {
-        match self.agent.backend {
-            AgentKind::Claude => "Claude",
-            AgentKind::Codex => "Codex",
-            AgentKind::Antigravity => "Antigravity",
-            AgentKind::Acp => "The assistant",
+        self.agent.backend.name()
+    }
+
+    /// The settings of an ACP agent (`Claude` has none: `[acp]`'s are given).
+    pub fn acp_agent(&self, kind: AgentKind) -> &AcpAgentConfig {
+        match kind {
+            AgentKind::Codex => &self.codex,
+            AgentKind::Antigravity => &self.antigravity,
+            AgentKind::Acp | AgentKind::Claude => &self.acp,
         }
+    }
+
+    /// The program that runs `kind`. Empty: none configured.
+    pub fn program(&self, kind: AgentKind) -> String {
+        let usual = match kind {
+            AgentKind::Claude => return self.claude.bin.clone(),
+            AgentKind::Codex => "codex-acp",
+            AgentKind::Antigravity => "agy",
+            AgentKind::Acp => "",
+        };
+        let own = &self.acp_agent(kind).command;
+        if own.is_empty() { usual.to_string() } else { own.clone() }
+    }
+
+    /// Whether `kind` can run here: its program is configured and found.
+    pub fn available(&self, kind: AgentKind) -> bool {
+        let prog = self.program(kind);
+        !prog.is_empty() && find_program(&prog).is_some()
     }
 
     /// The model to show before the agent says which it's using.
     pub fn model_hint(&self) -> String {
         match self.agent.backend {
             AgentKind::Claude => self.claude.model.clone(),
-            _ if !self.agent.model.is_empty() => self.agent.model.clone(),
-            _ => self.agent_name().to_string(),
+            k if !self.acp_agent(k).model.is_empty() => self.acp_agent(k).model.clone(),
+            k => k.name().to_string(),
         }
+    }
+
+    /// Switch to `kind` from now on: set `[agent] backend` in the config
+    /// file, keeping the rest of it (comments included) as it is.
+    pub fn save_backend(kind: AgentKind) -> Result<()> {
+        let path = Self::path().context("no config directory")?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let new = set_backend(&text, kind).with_context(|| format!("parsing {}", path.display()))?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        // Write a copy and rename it over, so a crash can't leave half a file.
+        let tmp = path.with_extension("toml.new");
+        std::fs::write(&tmp, new).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
+        Ok(())
     }
 
     /// The assistant's home (`[agent] home`).
@@ -364,6 +439,38 @@ impl Config {
                 .unwrap_or_else(|| PathBuf::from(".fsc-home")),
         }
     }
+}
+
+/// `text` (a config file) with `[agent] backend` set to `kind`.
+fn set_backend(text: &str, kind: AgentKind) -> Result<String> {
+    let mut doc: toml_edit::DocumentMut = text.parse()?;
+    let agent = doc.entry("agent").or_insert_with(toml_edit::table);
+    let agent = agent.as_table_like_mut().context("`agent` isn't a table")?;
+    match agent.get_mut("backend") {
+        // Keep the comment that follows the value.
+        Some(item) if item.is_value() => {
+            let decor = item.as_value().map(|v| v.decor().clone());
+            *item = toml_edit::value(kind.key());
+            if let (Some(d), Some(v)) = (decor, item.as_value_mut()) {
+                *v.decor_mut() = d;
+            }
+        }
+        _ => {
+            agent.insert("backend", toml_edit::value(kind.key()));
+        }
+    }
+    Ok(doc.to_string())
+}
+
+/// Look `prog` up like a shell would: a path as given, a name on `$PATH`.
+pub fn find_program(prog: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let runnable = |p: &std::path::Path| p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+    if prog.contains('/') {
+        let p = PathBuf::from(prog);
+        return runnable(&p).then_some(p);
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(prog)).find(|p| runnable(p))
 }
 
 /// "~" or "~/x" -> under the home directory, as a shell would. TOML has no
@@ -394,13 +501,38 @@ mod tests {
     fn agent_section() {
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(c.agent.backend, AgentKind::Claude);
-        let c: Config = toml::from_str("[agent]\nbackend = \"codex\"\nmodel = \"gpt-6-luna[low]\"\n").unwrap();
+        let c: Config = toml::from_str("[agent]\nbackend = \"codex\"\n[codex]\nmodel = \"gpt-6-luna[low]\"\n").unwrap();
         assert_eq!(c.agent.backend, AgentKind::Codex);
-        assert_eq!(c.agent.model, "gpt-6-luna[low]");
+        assert_eq!(c.codex.model, "gpt-6-luna[low]");
+        assert_eq!(c.program(AgentKind::Antigravity), "agy");
+        assert_eq!(c.program(AgentKind::Acp), "");
+        assert!(!c.available(AgentKind::Acp));
         assert!(c.agent.auto_allow.iter().any(|k| k == "read"));
         assert_eq!(c.model_hint(), "gpt-6-luna[low]");
         assert!(c.memory());
         assert_eq!(c.session_idle_minutes(), 20);
+    }
+
+    #[test]
+    fn saving_the_backend_keeps_the_file() {
+        let text = "# my settings\n[agent]\nbackend = \"claude\"   # which agent\nmemory = true\n\n[ui]\nwidth = 700\n";
+        let new = set_backend(text, AgentKind::Codex).unwrap();
+        assert_eq!(new, text.replace("\"claude\"", "\"codex\""));
+        // No [agent] table yet: one is added.
+        let new = set_backend("[ui]\nwidth = 700\n", AgentKind::Antigravity).unwrap();
+        let c: Config = toml::from_str(&new).unwrap();
+        assert_eq!((c.agent.backend, c.ui.width), (AgentKind::Antigravity, 700));
+        assert_eq!(set_backend("", AgentKind::Acp).unwrap().trim(), "[agent]\nbackend = \"acp\"");
+        assert!(set_backend("not = [toml", AgentKind::Acp).is_err());
+        assert_eq!(AgentKind::from_key(" Codex "), Some(AgentKind::Codex));
+        assert_eq!(AgentKind::from_key("gemini"), None);
+    }
+
+    #[test]
+    fn programs_are_found() {
+        assert!(find_program("sh").is_some());
+        assert!(find_program("/bin/sh").is_some());
+        assert!(find_program("surely-not-a-program-here").is_none());
     }
 
     #[test]

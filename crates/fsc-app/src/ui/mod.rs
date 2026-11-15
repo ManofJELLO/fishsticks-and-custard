@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use fsc_audio::{AudioEvent, AudioHandle};
 use fsc_core::Phase;
 use fsc_core::agent::{AgentEvent, AgentHandle, pretty_model, pretty_tool};
-use fsc_core::config::{Config, SpeakMode, Surface};
+use fsc_core::config::{AgentKind, Config, SpeakMode, Surface};
 use fsc_core::ipc::{Command, Reply};
 use fsc_core::permission::{self, Answer, PermissionAsk};
 
@@ -101,6 +101,9 @@ struct State {
     desktop_accent: Option<Rgb>,
     muted: bool,
     model: String,
+    /// The agent answering, and which are installed (`AgentKind::ALL` order).
+    agent: AgentKind,
+    agents: [bool; 4],
     voice: Voice,
     viz: Viz,
     last_frame: Option<i64>,
@@ -285,6 +288,7 @@ impl Ui {
         );
 
         let model = pretty_model(&cfg.model_hint());
+        let (agent, agents) = (cfg.agent.backend, AgentKind::ALL.map(|k| cfg.available(k)));
         let viz = Viz::new(&cfg.ui);
         let ui = Rc::new(Ui {
             cfg,
@@ -311,6 +315,8 @@ impl Ui {
                 desktop_accent: None,
                 muted: false,
                 model,
+                agent,
+                agents,
                 voice: Voice::default(),
                 viz,
                 last_frame: None,
@@ -556,6 +562,13 @@ impl Ui {
                 st.last_activity = None;
                 // Forgetting cancels any save in flight; it won't report back.
                 st.memory_saving = false;
+            }
+            Command::Agent { backend: None } => return Reply::state(self.st.borrow().agent.key()),
+            Command::Agent { backend: Some(name) } => {
+                let Some(kind) = AgentKind::from_key(&name) else {
+                    return Reply::err(format!("no agent called {name:?}: try claude, codex, antigravity or acp"));
+                };
+                return self.switch_agent(kind);
             }
             Command::Quit => self.quit(),
         }
@@ -871,6 +884,52 @@ impl Ui {
         st.last_activity = None;
     }
 
+    /// Hand the conversation to another agent: this session ends (saving
+    /// memory) and the next prompt goes to `kind`. Remembered in the config.
+    fn switch_agent(self: &Rc<Self>, kind: AgentKind) -> Reply {
+        // Reread the config so edits to the agent's own table count.
+        let mut cfg = Config::load().unwrap_or_else(|e| {
+            eprintln!("fsc: {e:#}; using the settings fscd started with");
+            self.cfg.clone()
+        });
+        let agents = AgentKind::ALL.map(|k| cfg.available(k));
+        self.st.borrow_mut().agents = agents;
+        if kind == self.st.borrow().agent {
+            self.push_tray();
+            return Reply::state(format!("already using {}", kind.name()));
+        }
+        if !cfg.available(kind) {
+            self.push_tray();
+            let prog = cfg.program(kind);
+            return Reply::err(if prog.is_empty() {
+                "set `command` in the [acp] section of config.toml first".to_string()
+            } else {
+                format!("{} isn't installed (no `{prog}` found)", kind.name())
+            });
+        }
+        cfg.agent.backend = kind;
+        let saved = Config::save_backend(kind);
+        if let Err(e) = &saved {
+            eprintln!("fsc: could not save the agent choice: {e:#}");
+        }
+        {
+            let mut st = self.st.borrow_mut();
+            self.claude.switch(&cfg, st.session_dirty);
+            st.memory_saving |= st.session_dirty && cfg.memory();
+            st.session_dirty = false;
+            st.last_activity = None;
+            st.agent = kind;
+            st.model = pretty_model(&cfg.model_hint());
+        }
+        self.add_divider(&format!("NOW {}", kind.name().to_uppercase()));
+        self.flash_meta(&format!("AGENT: {}", kind.name().to_uppercase()));
+        self.push_tray();
+        match saved {
+            Ok(()) => Reply::state(format!("switched to {}", kind.name())),
+            Err(e) => Reply::state(format!("switched to {} for now (not saved: {e:#})", kind.name())),
+        }
+    }
+
     /// Called every minute: rotate an idle session in the background so the
     /// next question doesn't wait for the memory save.
     pub fn tick_idle(&self) {
@@ -1138,7 +1197,7 @@ impl Ui {
         if !self.is_open() || self.headless() {
             self.show(false);
             let how = if self.headless() { " (fsc allow / fsc deny)" } else { "" };
-            notify(&format!("{} wants to {}.{how}", self.cfg.agent_name(), ask.action));
+            notify(&format!("{} wants to {}.{how}", self.st.borrow().agent.name(), ask.action));
         }
         let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
         card.add_css_class("ask");
@@ -1397,6 +1456,8 @@ impl Ui {
             muted: st.muted,
             accent: style::NOTHING_RED,
             shape: self.cfg.ui.tray_icon,
+            agent: st.agent,
+            agents: st.agents,
         };
         // Each update re-renders the icon at 6 sizes and signals the tray host.
         if st.tray_sent != Some(state) {

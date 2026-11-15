@@ -12,7 +12,7 @@ use tiny_skia::{
 };
 
 use fsc_core::Phase;
-use fsc_core::config::TrayIcon;
+use fsc_core::config::{AgentKind, TrayIcon};
 
 use crate::style::{Rgb, ThemeMode};
 
@@ -23,6 +23,10 @@ pub struct IconState {
     pub muted: bool,
     pub accent: Rgb,
     pub shape: TrayIcon,
+    /// For the tray menu: the agent answering, and which ones (in
+    /// `AgentKind::ALL` order) are installed.
+    pub agent: AgentKind,
+    pub agents: [bool; 4],
 }
 
 pub const SIZES: [u32; 6] = [16, 22, 24, 32, 48, 64];

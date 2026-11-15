@@ -5,13 +5,23 @@ backend = "claude"            # "claude", "codex", "antigravity", or "acp" (any 
 # home = "~/.local/share/fsc/home"   # persona.md, memory.md and the agent's settings live here
 session_idle_minutes = 20     # start a fresh session after this long idle (0 = never)
 memory = true                 # remember durable facts across sessions (fsc memory / fsc forget)
-# ACP agents (codex, antigravity, acp) only:
-# command = ""                # the agent's program; empty = codex-acp / agy
+# Switch from the tray's Agent menu or with `fsc agent <name>`; that rewrites `backend` here.
+# auto_allow = ["read", "search", "fetch", "think"]   # ACP agents: tool kinds that run without asking
+
+# Each ACP agent's own settings (the same keys in [codex], [antigravity] and [acp]):
+[codex]
+# command = ""                # the agent's program; empty = codex-acp (agy for antigravity)
 # args = []                   # with command set, the whole argument list ("acp" for agy)
 # env = { }                   # extra environment variables
 # model = ""                  # model id as the agent lists it; empty = its default
 # mode = ""                   # approval mode; empty = read-only for Codex, the agent's default otherwise
-# auto_allow = ["read", "search", "fetch", "think"]   # tool kinds that run without asking
+
+[antigravity]
+# model = ""
+
+[acp]                         # any other Agent Client Protocol agent
+# command = ""
+# args = []
 
 [claude]
 bin = "claude"

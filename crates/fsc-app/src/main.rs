@@ -99,6 +99,8 @@ fn main() -> Result<()> {
             // The recording dot is always red, whatever the theme.
             accent: style::NOTHING_RED,
             shape: cfg.ui.tray_icon,
+            agent: cfg.agent.backend,
+            agents: fsc_core::config::AgentKind::ALL.map(|k| cfg.available(k)),
         },
         tray_rx,
         ev_tx.clone(),
@@ -194,7 +196,15 @@ fn dump_icons(dir: &str) -> Result<()> {
     for shape in [TrayIcon::PoliceBox, TrayIcon::Fishbone] {
         for theme in [ThemeMode::Dark, ThemeMode::Light] {
             for (name, phase, muted) in [("idle", Phase::Idle, false), ("rec", Phase::Listening, false), ("muted", Phase::Idle, true)] {
-                let st = icon::IconState { phase, theme, muted, accent: style::NOTHING_RED, shape };
+                let st = icon::IconState {
+                    phase,
+                    theme,
+                    muted,
+                    accent: style::NOTHING_RED,
+                    shape,
+                    agent: Default::default(),
+                    agents: [true; 4],
+                };
                 for size in [22u32, 64] {
                     let path = format!("{dir}/{shape:?}-{theme:?}-{name}-{size}.png").to_lowercase();
                     icon::render(size, &st).save_png(&path)?;

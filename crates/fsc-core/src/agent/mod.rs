@@ -61,6 +61,9 @@ enum Req {
     /// memory from it first. `last`: the app is quitting, so don't start one.
     Rotate { save: bool, last: bool },
     Forget,
+    /// End this session (saving memory first if `save`) and carry on with
+    /// another agent.
+    Switch { cfg: Box<Config>, save: bool },
 }
 
 #[derive(Clone)]
@@ -75,16 +78,15 @@ impl AgentHandle {
         F: Fn(AgentEvent) + Send + Sync + 'static,
     {
         let (tx, rx) = mpsc::unbounded_channel();
-        let memory = cfg.memory();
-        match cfg.agent.backend {
-            AgentKind::Claude => {
-                tokio::spawn(actor(claude::ClaudeCli::new(cfg.claude.clone()), memory, home, rx, emit));
-            }
-            _ => {
-                tokio::spawn(actor(acp::Acp::new(&cfg.agent), memory, home, rx, emit));
-            }
-        }
+        tokio::spawn(run(cfg.clone(), home, rx, emit));
         Self { tx }
+    }
+
+    /// Carry on with the agent `cfg` names: the current session ends
+    /// (saving memory first if `save`, as `rotate`), and prompts asked
+    /// meanwhile go to the new one.
+    pub fn switch(&self, cfg: &Config, save: bool) {
+        let _ = self.tx.send(Req::Switch { cfg: Box::new(cfg.clone()), save });
     }
 
     pub fn ask(&self, text: impl Into<String>) {
@@ -234,6 +236,8 @@ struct Session<B: Backend, F> {
     closing: bool,
     /// Why the agent last failed to start.
     start_error: Option<String>,
+    /// Hand over to this agent once the session has ended.
+    switch_to: Option<Config>,
 }
 
 impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
@@ -312,6 +316,10 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
     }
 
     async fn ask_queued(&mut self) {
+        if self.switch_to.is_some() {
+            // They're for the next agent.
+            return;
+        }
         for text in std::mem::take(&mut self.queued) {
             self.ask(&text).await;
         }
@@ -362,6 +370,14 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
     }
 
     async fn on_request(&mut self, req: Req) {
+        let req = match req {
+            // Like quitting, but another agent takes over afterwards.
+            Req::Switch { cfg, save } => {
+                self.switch_to = Some(*cfg);
+                Req::Rotate { save, last: true }
+            }
+            req => req,
+        };
         match req {
             Req::Ask(text) => {
                 if self.turn.active && self.turn.internal {
@@ -443,6 +459,7 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
                 (self.emit)(AgentEvent::Forgotten);
                 self.ask_queued().await;
             }
+            Req::Switch { .. } => unreachable!("handled above"),
         }
     }
 
@@ -506,10 +523,43 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
     }
 }
 
-async fn actor<B, F>(backend: B, memory: bool, home: PathBuf, mut rx: mpsc::UnboundedReceiver<Req>, emit: F)
+/// Run agents, one after another as the user switches between them.
+async fn run<F>(mut cfg: Config, home: PathBuf, mut rx: mpsc::UnboundedReceiver<Req>, emit: F)
+where
+    F: Fn(AgentEvent) + Send + Sync + 'static,
+{
+    let mut carried = VecDeque::new();
+    loop {
+        let memory = cfg.memory();
+        let next = match cfg.agent.backend {
+            AgentKind::Claude => {
+                let backend = claude::ClaudeCli::new(cfg.claude.clone());
+                actor(backend, memory, home.clone(), &mut rx, &emit, carried).await
+            }
+            kind => {
+                let backend = acp::Acp::new(kind, cfg.acp_agent(kind), &cfg.agent.auto_allow);
+                actor(backend, memory, home.clone(), &mut rx, &emit, carried).await
+            }
+        };
+        let Some((next, queued)) = next else { return };
+        eprintln!("fsc: switching to {}", next.agent_name());
+        (cfg, carried) = (next, queued);
+    }
+}
+
+/// Run one agent until the app ends (`None`) or the user switches to
+/// another: then its config and the prompts waiting for it.
+async fn actor<B, F>(
+    backend: B,
+    memory: bool,
+    home: PathBuf,
+    rx: &mut mpsc::UnboundedReceiver<Req>,
+    emit: &F,
+    queued: VecDeque<String>,
+) -> Option<(Config, VecDeque<String>)>
 where
     B: Backend,
-    F: Fn(AgentEvent) + Send + Sync + 'static,
+    F: Fn(AgentEvent) + Send + Sync,
 {
     if let Err(e) = ensure_home(&home).and_then(|()| backend.prepare(&home)) {
         eprintln!("fsc: could not prepare {}: {e}", home.display());
@@ -522,16 +572,25 @@ where
         conn: None,
         turn: Turn::default(),
         dirty: false,
-        queued: VecDeque::new(),
+        queued,
         closing: false,
         start_error: None,
+        switch_to: None,
     };
     s.start().await;
+    s.ask_queued().await;
     // A hidden (drain + memory update) turn must finish by this time, or it's
     // abandoned so a queued prompt can't hang behind it.
     let mut internal_deadline: Option<tokio::time::Instant> = None;
 
     loop {
+        // Switching, and the old session is done with (memory saved).
+        if s.switch_to.is_some() && !(s.turn.active && s.turn.internal) {
+            if let Some(c) = s.conn.take() {
+                c.close().await;
+            }
+            return s.switch_to.take().map(|cfg| (cfg, s.queued));
+        }
         if s.turn.active && s.turn.internal {
             internal_deadline.get_or_insert_with(|| tokio::time::Instant::now() + INTERNAL_TURN_TIMEOUT);
         } else {
@@ -540,7 +599,7 @@ where
         tokio::select! {
             _ = sleep_until_opt(internal_deadline) => s.on_timeout().await,
             req = rx.recv() => match req {
-                None => break,
+                None => return None,
                 Some(req) => s.on_request(req).await,
             },
             msg = recv(&mut s.conn) => match msg {
@@ -845,6 +904,7 @@ mod tests {
         tx: mpsc::UnboundedSender<Req>,
         events: mpsc::UnboundedReceiver<AgentEvent>,
         home: PathBuf,
+        done: tokio::task::JoinHandle<Option<(Config, VecDeque<String>)>>,
     }
 
     impl Harness {
@@ -854,10 +914,15 @@ mod tests {
             let fake = fake::Fake::default();
             let (tx, rx) = mpsc::unbounded_channel();
             let (etx, events) = mpsc::unbounded_channel();
-            tokio::spawn(actor(fake.clone(), true, home.clone(), rx, move |e| {
-                let _ = etx.send(e);
-            }));
-            Self { fake, tx, events, home }
+            let (f, h) = (fake.clone(), home.clone());
+            let done = tokio::spawn(async move {
+                let mut rx = rx;
+                let emit = move |e| {
+                    let _ = etx.send(e);
+                };
+                actor(f, true, h, &mut rx, &emit, VecDeque::new()).await
+            });
+            Self { fake, tx, events, home, done }
         }
 
         fn send(&self, r: Req) {
@@ -958,6 +1023,43 @@ mod tests {
             h.fake.log(),
             ["start false", "prompt tell me a story", "answer p1 Deny", "interrupt", "prompt <memory update>", "close"]
         );
+    }
+
+    #[tokio::test]
+    async fn switching_saves_then_hands_over() {
+        let mut h = Harness::new("switch");
+        h.send(Req::Ask("I like tea".into()));
+        h.settle().await;
+        h.fake.say("end");
+        assert!(matches!(h.next().await, AgentEvent::TurnDone { ok: true, .. }));
+
+        let mut next = Config::default();
+        next.agent.backend = AgentKind::Codex;
+        h.send(Req::Switch { cfg: Box::new(next), save: true });
+        // Asked during the save: goes to the next agent.
+        h.send(Req::Ask("hello codex".into()));
+        h.settle().await;
+        h.fake.say("text:- likes tea");
+        h.fake.say("end");
+        assert!(matches!(h.next().await, AgentEvent::MemorySaved { ok: true, facts: 1, .. }));
+        let (cfg, queued) = tokio::time::timeout(std::time::Duration::from_secs(2), &mut h.done)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("handed over");
+        assert_eq!(cfg.agent.backend, AgentKind::Codex);
+        assert_eq!(queued, ["hello codex"]);
+        // The old agent was stopped, not given a new session.
+        assert_eq!(h.fake.log(), ["start false", "prompt I like tea", "prompt <memory update>", "close"]);
+    }
+
+    #[tokio::test]
+    async fn switching_an_idle_session_is_immediate() {
+        let mut h = Harness::new("switch-idle");
+        h.send(Req::Switch { cfg: Box::default(), save: false });
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), &mut h.done).await.unwrap().unwrap();
+        assert!(r.is_some_and(|(_, q)| q.is_empty()));
+        assert_eq!(h.fake.log(), ["start false", "close"]);
     }
 
     #[tokio::test]

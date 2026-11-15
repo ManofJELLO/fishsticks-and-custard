@@ -40,6 +40,9 @@ pub enum Command {
     Memory,
     /// Delete long-term memory and start a fresh session.
     Forget,
+    /// Switch to another agent ("claude", "codex", "antigravity", "acp")
+    /// from now on, or say which one answers (`None`).
+    Agent { backend: Option<String> },
     Quit,
 }
 

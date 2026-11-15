@@ -32,7 +32,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::process::Child;
 
 use super::{Backend, Conn, Event};
-use crate::config::{AgentConfig, AgentKind};
+use crate::config::{AcpAgentConfig, AgentKind};
 use crate::permission::{Answer, PermissionAsk, phrase, truncate};
 
 /// Longest wait for the agent to start or open a session. Antigravity
@@ -65,8 +65,9 @@ struct Settings {
 }
 
 impl Acp {
-    pub(crate) fn new(cfg: &AgentConfig) -> Self {
-        let (program, mut args, login, install, mode): (&str, Vec<String>, _, _, &str) = match cfg.backend {
+    /// `kind`'s usual set-up, changed by its own config table.
+    pub(crate) fn new(kind: AgentKind, cfg: &AcpAgentConfig, auto_allow: &[String]) -> Self {
+        let (program, mut args, login, install, mode): (&str, Vec<String>, _, _, &str) = match kind {
             AgentKind::Codex => (
                 "codex-acp",
                 Vec::new(),
@@ -95,7 +96,7 @@ impl Acp {
             settings: Settings {
                 model: cfg.model.clone(),
                 mode: if cfg.mode.is_empty() { mode.into() } else { cfg.mode.clone() },
-                auto_allow: cfg.auto_allow.clone(),
+                auto_allow: auto_allow.to_vec(),
             },
         }
     }
@@ -114,7 +115,7 @@ impl Backend for Acp {
 
     async fn start(&self, home: &Path, prompt: &str) -> Result<(AcpConn, Vec<Event>), String> {
         if self.program.is_empty() {
-            return Err("no agent command: set `command` in [agent]".into());
+            return Err("no agent command: set `command` in [acp]".into());
         }
         let cwd = workspace(home);
         std::fs::create_dir_all(&cwd).map_err(|e| format!("could not create {}: {e}", cwd.display()))?;
@@ -788,16 +789,15 @@ mod tests {
 
     #[test]
     fn presets() {
-        let mut cfg = AgentConfig { backend: AgentKind::Antigravity, ..Default::default() };
-        let a = Acp::new(&cfg);
+        let mut cfg = AcpAgentConfig::default();
+        let a = Acp::new(AgentKind::Antigravity, &cfg, &[]);
         assert_eq!((a.program.as_str(), a.args.clone()), ("agy", vec!["acp".to_string()]));
-        cfg.backend = AgentKind::Codex;
-        let a = Acp::new(&cfg);
+        let a = Acp::new(AgentKind::Codex, &cfg, &[]);
         assert_eq!((a.program.as_str(), a.settings.mode.as_str()), ("codex-acp", "read-only"));
         cfg.command = "/opt/my-agent".into();
         cfg.args = vec!["--acp".into()];
         cfg.mode = "auto".into();
-        let a = Acp::new(&cfg);
+        let a = Acp::new(AgentKind::Codex, &cfg, &[]);
         assert_eq!((a.program.as_str(), a.args.clone(), a.settings.mode.as_str()), ("/opt/my-agent", vec!["--acp".to_string()], "auto"));
     }
 }

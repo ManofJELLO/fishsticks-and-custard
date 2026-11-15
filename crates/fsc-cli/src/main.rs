@@ -54,6 +54,11 @@ enum Cmd {
     Memory,
     /// Delete everything the assistant remembers and start a fresh session
     Forget,
+    /// Show which agent answers, or switch to another (saved in config.toml)
+    Agent {
+        /// claude, codex, antigravity or acp
+        backend: Option<String>,
+    },
     /// Quit the daemon
     Quit,
     /// Download any missing speech models (whisper, silero VAD, piper voice)
@@ -91,6 +96,7 @@ fn main() -> ExitCode {
         Cmd::Status => Command::Status,
         Cmd::Memory => Command::Memory,
         Cmd::Forget => Command::Forget,
+        Cmd::Agent { backend } => Command::Agent { backend },
         Cmd::Quit => Command::Quit,
     };
 

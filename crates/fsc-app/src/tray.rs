@@ -1,9 +1,10 @@
 //! StatusNotifierItem tray icon (works with Waybar's `tray` module).
 
-use ksni::menu::{CheckmarkItem, StandardItem};
+use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{MenuItem, ToolTip, TrayMethods};
 use tokio::sync::mpsc;
 
+use fsc_core::config::AgentKind;
 use fsc_core::ipc::Command;
 
 use crate::AppEvent;
@@ -17,6 +18,49 @@ struct FscTray {
 impl FscTray {
     fn send(&self, cmd: Command) {
         let _ = self.tx.try_send(AppEvent::Command(cmd, None));
+    }
+}
+
+impl FscTray {
+    /// Agent ▸ Claude / Codex / Antigravity (/ Custom): the ones not
+    /// installed are greyed out, a custom one only shows when it's set up.
+    fn agent_menu(&self) -> MenuItem<Self> {
+        let shown: Vec<AgentKind> = AgentKind::ALL
+            .into_iter()
+            .zip(self.st.agents)
+            .filter(|&(k, ok)| k != AgentKind::Acp || ok || k == self.st.agent)
+            .map(|(k, _)| k)
+            .collect();
+        let selected = shown.iter().position(|&k| k == self.st.agent).unwrap_or(0);
+        let options = shown
+            .iter()
+            .map(|&k| {
+                let ok = self.st.agents[AgentKind::ALL.iter().position(|&a| a == k).unwrap_or(0)];
+                RadioItem {
+                    label: if ok { k.name().into() } else { format!("{} (not installed)", k.name()) },
+                    enabled: ok || k == self.st.agent,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        SubMenu {
+            label: format!("Agent: {}", self.st.agent.name()),
+            icon_name: "system-users-symbolic".into(),
+            submenu: vec![
+                RadioGroup {
+                    selected,
+                    select: Box::new(move |t: &mut Self, i: usize| {
+                        if let Some(&k) = shown.get(i) {
+                            t.send(Command::Agent { backend: Some(k.key().into()) });
+                        }
+                    }),
+                    options,
+                }
+                .into(),
+            ],
+            ..Default::default()
+        }
+        .into()
     }
 }
 
@@ -69,6 +113,7 @@ impl ksni::Tray for FscTray {
                 ..Default::default()
             }
             .into(),
+            self.agent_menu(),
             StandardItem {
                 label: "New conversation".into(),
                 activate: Box::new(|t: &mut Self| t.send(Command::New)),

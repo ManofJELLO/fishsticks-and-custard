@@ -57,21 +57,35 @@ CLI by default, or one of the others in [Choosing an agent](#choosing-an-agent).
 
 ## Choosing an agent
 
-Set `backend` in the `[agent]` section of `~/.config/fsc/config.toml`, then restart
-`fscd` (`fsc quit; fscd &`).
+Pick one from the tray icon's **Agent** menu, or run `fsc agent codex` (plain `fsc agent`
+says which one answers). The current conversation ends, saving what's worth remembering,
+and your next question goes to the new agent, which starts with the same memory. The
+choice is saved as `backend` in the `[agent]` section of `~/.config/fsc/config.toml`; agents
+that aren't installed are greyed out in the menu.
 
 | `backend` | Needs | Sign in with |
 |---|---|---|
 | `"claude"` (default) | Claude Code CLI (`claude`) | `claude`, once, interactively |
 | `"codex"` | Codex CLI and `codex-acp` (AUR `codex-acp`, or `npm i -g @agentclientprotocol/codex-acp`) | `codex login` |
 | `"antigravity"` | Antigravity CLI `agy` 1.5 or newer (AUR `antigravity-cli`) | `agy acp --login` |
-| `"acp"` | any [Agent Client Protocol](https://agentclientprotocol.com) agent: set `command` and `args` | the agent's own way |
+| `"acp"` | any [Agent Client Protocol](https://agentclientprotocol.com) agent: set `command` and `args` in `[acp]` | the agent's own way |
+
+Each agent has its own section for its settings, so switching back and forth keeps them:
 
 ```toml
 [agent]
 backend = "codex"
+
+[codex]
 # model = "gpt-6-luna[low]"     # as the agent lists it; empty = its default
-# mode = "read-only"            # the agent's approval mode; Codex defaults to read-only here
+# mode = "read-only"            # its approval mode; read-only (the default here) asks before edits and commands
+
+[antigravity]
+# model = "gemini-3.8-flash-low"
+
+[acp]
+# command = "my-agent"
+# args = ["--acp"]
 ```
 
 Claude runs through Claude Code's own stream-json mode, with its settings in `[claude]`.
@@ -147,6 +161,7 @@ show in rofi with `rofi -show drun -drun-show-actions`.
 | `fsc status` | `ready`, `thinking`, `listening`, … |
 | `fsc memory` | show what it remembers between sessions |
 | `fsc forget` / tray **Forget memories** | delete that memory and start a fresh session |
+| `fsc agent [name]` / tray **Agent** | say which agent answers, or switch (claude, codex, antigravity, acp) |
 
 ## Customise
 
