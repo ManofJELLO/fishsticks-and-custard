@@ -35,6 +35,9 @@ pub enum Command {
     New,
     /// Mute the wake word. `None` toggles.
     Mute { on: Option<bool> },
+    /// Listen for another wake phrase from now on (saved), or say which
+    /// one it listens for (`None`).
+    Wake { phrase: Option<String> },
     Status,
     /// Print what the assistant remembers between sessions.
     Memory,

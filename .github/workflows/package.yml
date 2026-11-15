@@ -39,7 +39,7 @@ jobs:
           pacman -Syu --noconfirm --needed git github-cli rust clang cmake vulkan-headers shaderc \
             gtk4 gtk4-layer-shell pipewire alsa-lib vulkan-icd-loader espeak-ng pcaudiolib libsonic
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 

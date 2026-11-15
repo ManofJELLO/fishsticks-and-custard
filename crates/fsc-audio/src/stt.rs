@@ -12,10 +12,16 @@ pub struct Stt {
     _ctx: WhisperContext,
     state: Mutex<WhisperState>,
     language: String,
+    /// Biases spelling toward the wake phrase.
+    prompt: Mutex<String>,
+}
+
+fn prompt_for(phrase: &str) -> String {
+    format!("Talking to my desktop assistant, {}, on Arch Linux and Hyprland.", crate::wake::spelling(phrase))
 }
 
 impl Stt {
-    pub fn load(path: &Path, language: &str, gpu: bool) -> Result<Self> {
+    pub fn load(path: &Path, language: &str, gpu: bool, wake_phrase: &str) -> Result<Self> {
         // Without a log backend feature this routes whisper.cpp/ggml logs to nowhere.
         whisper_rs::install_logging_hooks();
         let mut params = WhisperContextParameters::default();
@@ -24,7 +30,16 @@ impl Stt {
             .map_err(|e| anyhow!("{e}"))
             .with_context(|| format!("loading {}", path.display()))?;
         let state = ctx.create_state().map_err(|e| anyhow!("{e}"))?;
-        Ok(Self { _ctx: ctx, state: Mutex::new(state), language: language.to_string() })
+        Ok(Self {
+            _ctx: ctx,
+            state: Mutex::new(state),
+            language: language.to_string(),
+            prompt: Mutex::new(prompt_for(wake_phrase)),
+        })
+    }
+
+    pub fn set_wake_phrase(&self, phrase: &str) {
+        *self.prompt.lock().unwrap_or_else(|e| e.into_inner()) = prompt_for(phrase);
     }
 
     /// `pcm`: mono f32 at 16 kHz.
@@ -41,8 +56,9 @@ impl Stt {
         p.set_print_realtime(false);
         p.set_print_special(false);
         p.set_print_timestamps(false);
-        // Bias spelling toward the assistant's name (and the wake phrase).
-        p.set_initial_prompt("Talking to my desktop assistant, Fishsticks and Custard, on Arch Linux and Hyprland.");
+        // Bias spelling toward the wake phrase.
+        let prompt = self.prompt.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        p.set_initial_prompt(&prompt);
 
         // whisper wants at least ~1 s of audio; pad short clips with silence.
         let mut audio = pcm.to_vec();

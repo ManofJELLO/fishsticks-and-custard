@@ -1202,4 +1202,16 @@ mod real {
     async fn real_acp_antigravity() {
         round_trip(AgentKind::Antigravity).await;
     }
+
+    #[tokio::test]
+    #[ignore]
+    async fn real_acp_opencode() {
+        round_trip(AgentKind::OpenCode).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn real_acp_opencode_asks() {
+        asks_before_editing_home(AgentKind::OpenCode).await;
+    }
 }

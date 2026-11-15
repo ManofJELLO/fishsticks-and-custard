@@ -17,6 +17,16 @@ pub fn run() -> ExitCode {
     }
 }
 
+/// `label<TAB>url` for each model the default settings use.
+pub fn print_default_urls() -> ExitCode {
+    for m in models::required(&Default::default()) {
+        if let Some(url) = m.url {
+            println!("{}\t{url}", m.label);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 fn fetch_all() -> Result<()> {
     let cfg = Config::load()?;
     let missing = models::missing(&cfg.voice);

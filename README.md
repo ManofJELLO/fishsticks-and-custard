@@ -142,6 +142,21 @@ install -Dm644 packaging/desktop/dev.fsc.FishsticksAndCustard.svg -t ~/.local/sh
 
 ### Releasing
 
+First run `packaging/release/check.py`. It checks whether anything the app depends on has
+changed since the last release was tested:
+- **Agents** (claude, codex-acp, codex, agy, opencode): checks the installed version against
+  the one recorded in `packaging/release/tested.json` and against the newest upstream. If an
+  agent's version changed, its real end-to-end tests run again (`--live` reruns them all).
+- **Packages:** checks that every PKGBUILD package still exists.
+- **Crates:** shows available Rust crate updates.
+- **Models:** checks that the default speech models still download, and whether they
+  changed upstream.
+- **CI:** checks the GitHub Actions versions.
+- **Build:** runs `cargo test` and clippy.
+
+Fix anything marked FAIL and read the WARNs. Then rerun with `--record` to save what was
+tested, and commit `tested.json` with the release.
+
 Bump `version` in `Cargo.toml` and `pkgver` in `packaging/arch/PKGBUILD` (they must match),
 commit, then `git tag vX.Y.Z && git push --tags`. The `package` workflow builds, signs and
 publishes it.
@@ -173,6 +188,7 @@ show in rofi with `rofi -show drun -drun-show-actions`.
 | **ALLOW / ALWAYS / DENY** / `fsc allow [--always]` / `fsc deny` | answer a permission question; by voice, say *yes*, *always* or *no*; typing `y` or `n` works too |
 | *"Fishsticks and custard[, question]"* | wake it by voice; a question in the same breath is sent straight away |
 | `fsc mute [on\|off]` / tray | mute the wake word |
+| `fsc wake [phrase]` | say which wake phrase it listens for, or change it (saved as `voice.wake_phrase`) |
 | `fsc status` | `ready`, `thinking`, `listening`, … |
 | `fsc memory` | show what it remembers between sessions |
 | `fsc forget` / tray **Forget memories** | delete that memory and start a fresh session |
@@ -226,6 +242,15 @@ Silero VAD cuts speech into segments, each segment is transcribed locally by whi
 the GPU (~0.25 s), and a fuzzy match checks whether it *starts* with the phrase. Nothing
 is sent anywhere unless it does. Long segments are checked after 2.5 s and dropped early
 if they don't start with the phrase. Mute it from the tray or with `fsc mute`.
+
+**Choosing the phrase:** `fsc wake hey computer` changes it straight away and saves it
+as `voice.wake_phrase` in config.toml (editing the file works too, after a restart).
+Whisper is told to expect the phrase, so an unusual word is spelled consistently. It
+needs at least 5 letters and at most 5 words. Only a few fillers may come before it
+("okay, um, hey fishsticks and custard"), so "we had fish sticks and custard" doesn't
+wake it. Said in the middle of continuous speech (no pause before it) any words may
+precede it, so a short, everyday phrase still wakes more easily by accident, and
+anything said after a false wake goes to the agent. Longer, unusual phrases are safer.
 
 This means the GPU does a little work whenever someone speaks nearby. A trained
 openWakeWord model can be added later as a cheaper first stage.

@@ -1,27 +1,90 @@
 //! Wake phrase matching on whisper transcripts.
 //!
-//! Whisper spells an unusual phrase in many ways ("Fishsticks and Custard",
-//! "fish sticks & custard", "Fishtix and custard"), so we compare with
-//! spaces removed and allow a few character edits. The phrase must start
-//! within the first few words ("hey fishsticks and custard ..." is fine;
-//! a mention in the middle of a sentence is not a wake-up).
+//! Whisper spells an unusual phrase in many ways ("Fishsticks", "fish
+//! sticks", "Fishtix"), so we compare with spaces removed and allow a few
+//! character edits. The phrase must start within the first few words
+//! ("hey fishsticks ..." is fine; a mention in the middle of a sentence is
+//! not a wake-up). The phrase is `voice.wake_phrase`; the tests use the
+//! old default, "fishsticks and custard", as well as the new one.
 
-/// Words allowed before the phrase, e.g. "hey", "okay".
-pub const MAX_LEADING_WORDS: usize = 2;
+/// Fillers allowed before the phrase at the start of speech ("okay, um,
+/// hey fishsticks and custard").
+pub const MAX_LEADING_WORDS: usize = 3;
 
-/// If `text` starts with the wake phrase, returns whatever follows it
-/// (possibly empty). `None` if it doesn't.
-pub fn match_wake(text: &str, phrase: &str) -> Option<String> {
-    match_after(text, phrase, MAX_LEADING_WORDS)
+/// What may come before the phrase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Lead {
+    /// Only up to `MAX_LEADING_WORDS` fillers, so "we had fish sticks and
+    /// custard for tea" isn't a wake-up. For speech that started after a pause.
+    #[default]
+    Fillers,
+    /// Up to this many words of anything: for audio cut from the middle of
+    /// continuing speech, where the cut lands among other words.
+    Any(usize),
 }
 
-/// `match_wake` allowing up to `max_leading` words before the phrase.
-pub fn match_wake_after(text: &str, phrase: &str, max_leading: usize) -> Option<String> {
-    match_after(text, phrase, max_leading)
+/// Words people put before a name when they call it.
+const FILLERS: &[&str] = &[
+    "hey", "hi", "hello", "hiya", "oi", "yo", "ok", "okay", "oh", "um", "umm", "uh", "uhh", "er", "erm", "ah",
+    "eh", "hm", "hmm", "mm", "so", "right", "alright", "well", "now", "there", "please",
+];
+
+fn is_filler(word: &str) -> bool {
+    FILLERS.contains(&word)
+}
+
+/// Letters a wake phrase needs: shorter ones match ordinary speech.
+const MIN_LETTERS: usize = 5;
+/// Words a wake phrase may have (the matcher joins up to six).
+const MAX_WORDS: usize = 5;
+
+/// `phrase` tidied (trimmed, single spaces), or why it can't be a wake phrase.
+pub fn check_phrase(phrase: &str) -> Result<String, String> {
+    let tidy = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
+    let norm = normalize(&tidy);
+    let letters = norm.chars().filter(|c| c.is_alphanumeric()).count();
+    let words = norm.split_whitespace().count();
+    if letters < MIN_LETTERS {
+        return Err(format!("{tidy:?} is too short for a wake phrase (at least {MIN_LETTERS} letters)"));
+    }
+    if words > MAX_WORDS {
+        return Err(format!("{tidy:?} is too long for a wake phrase (at most {MAX_WORDS} words)"));
+    }
+    Ok(tidy)
+}
+
+/// The phrase as whisper should spell it ("fishsticks" -> "Fishsticks"),
+/// for its initial prompt.
+pub fn spelling(phrase: &str) -> String {
+    phrase
+        .split_whitespace()
+        .map(|w| {
+            let mut c = w.chars();
+            c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+/// Character edits allowed when matching a phrase this long (spaces
+/// removed). A short name gets one, or "travis" would wake "jarvis".
+fn max_edits(len: usize) -> usize {
+    if len < 8 { 1 } else { (len / 5).max(2) }
+}
+
+/// If `text` starts with the wake phrase (after a few fillers at most),
+/// returns whatever follows it (possibly empty). `None` if it doesn't.
+pub fn match_wake(text: &str, phrase: &str) -> Option<String> {
+    match_after(text, phrase, Lead::Fillers)
+}
+
+/// `match_wake` with `lead` deciding what may come before the phrase.
+pub fn match_wake_after(text: &str, phrase: &str, lead: Lead) -> Option<String> {
+    match_after(text, phrase, lead)
 }
 
 /// Whether `text` ends partway into the phrase ("hey, uh... fishsticks
-/// and"), so it may still be being said.
+/// and" for "fishsticks and custard"), so it may still be being said.
 pub fn could_start(text: &str, phrase: &str) -> bool {
     let target: Vec<char> = normalize(phrase).split_whitespace().flat_map(str::chars).collect();
     let words: Vec<String> = normalize(text).split_whitespace().map(String::from).collect();
@@ -50,15 +113,15 @@ pub fn could_start(text: &str, phrase: &str) -> bool {
 /// Whether the phrase appears anywhere in `text`. Used to recognise our
 /// own voice saying it, picked up by the mic.
 pub fn mentions(text: &str, phrase: &str) -> bool {
-    match_after(text, phrase, usize::MAX).is_some()
+    match_after(text, phrase, Lead::Any(usize::MAX)).is_some()
 }
 
-fn match_after(text: &str, phrase: &str, max_leading: usize) -> Option<String> {
+fn match_after(text: &str, phrase: &str, lead: Lead) -> Option<String> {
     let target: String = normalize(phrase).split_whitespace().collect();
     if target.is_empty() {
         return None;
     }
-    let max_edits = (target.chars().count() / 5).max(2);
+    let max_edits = max_edits(target.chars().count());
 
     // Normalized words, each remembering which original word it came from.
     let original: Vec<&str> = text.split_whitespace().collect();
@@ -68,7 +131,23 @@ fn match_after(text: &str, phrase: &str, max_leading: usize) -> Option<String> {
         .flat_map(|(i, w)| normalize(w).split_whitespace().map(move |n| (n.to_string(), i)).collect::<Vec<_>>())
         .collect();
 
+    let max_leading = match lead {
+        Lead::Fillers => MAX_LEADING_WORDS,
+        Lead::Any(n) => n,
+    };
     for start in 0..=max_leading.min(words.len()) {
+        if lead == Lead::Fillers && start > 0 && !is_filler(&words[start - 1].0) {
+            break;
+        }
+        // The phrase must start here: without this, a short word before it
+        // ("dad", "well") fits in the edit budget and slips through.
+        if let Some((first, _)) = words.get(start) {
+            let n = first.chars().count().min(target.chars().count());
+            let head: String = target.chars().take(n).collect();
+            if levenshtein(first, &head) > (n / 3).max(1) {
+                continue;
+            }
+        }
         let mut best: Option<(usize, usize)> = None; // (edits, end)
         let mut joined = String::new();
         for (end, (w, _)) in words.iter().enumerate().skip(start).take(6) {
@@ -124,7 +203,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{could_start, match_wake, match_wake_after, mentions};
+    use super::{Lead, check_phrase, could_start, match_wake, match_wake_after, mentions, spelling};
 
     const P: &str = "fishsticks and custard";
 
@@ -161,6 +240,17 @@ mod tests {
     }
 
     #[test]
+    fn fillers_may_come_first() {
+        assert_eq!(match_wake("Okay, um, hey fishsticks and custard, what's on?", P).as_deref(), Some("what's on?"));
+        assert_eq!(match_wake("Hmm. Fishsticks and custard?", P).as_deref(), Some(""));
+        assert_eq!(match_wake("Hello there, fishsticks and custard.", P).as_deref(), Some(""));
+        // Too many, even of fillers.
+        assert_eq!(match_wake("Um, uh, so, well, okay, fishsticks and custard", P), None);
+        // One real word among them is enough to rule it out.
+        assert_eq!(match_wake("Hey Dad fishsticks and custard", P), None);
+    }
+
+    #[test]
     fn partway_into_the_phrase() {
         assert!(could_start("Hey, uh, fishsticks and", P));
         assert!(could_start("Fish sticks", P));
@@ -175,7 +265,7 @@ mod tests {
     fn more_leading_words_when_allowed() {
         let s = "and then they went home. Fishsticks and custard, play some music";
         assert_eq!(match_wake(s, P), None);
-        assert_eq!(match_wake_after(s, P, 6).as_deref(), Some("play some music"));
+        assert_eq!(match_wake_after(s, P, Lead::Any(6)).as_deref(), Some("play some music"));
     }
 
     #[test]
@@ -183,5 +273,41 @@ mod tests {
         assert!(mentions("Sure. As Fishsticks and Custard, I can help with that.", P));
         assert!(mentions("Fish sticks & custard here.", P));
         assert!(!mentions("It's sunny and twelve degrees.", P));
+    }
+    const F: &str = "fishsticks";
+
+    #[test]
+    fn one_word_phrase() {
+        assert_eq!(match_wake("Fishsticks, what time is it?", F).as_deref(), Some("what time is it?"));
+        assert_eq!(match_wake("Fish sticks. Open Firefox.", F).as_deref(), Some("Open Firefox."));
+        assert_eq!(match_wake("Hey Fishstick", F).as_deref(), Some(""));
+        assert_eq!(match_wake("I had fish and chips for dinner.", F), None);
+        assert_eq!(match_wake("This sticks to the pan.", F), None);
+        // Only fillers may come first, so talk about fish sticks doesn't wake it.
+        assert_eq!(match_wake("We had fish sticks for tea.", F), None);
+        assert_eq!(match_wake("We had fish sticks and custard for tea.", P), None);
+        assert_eq!(match_wake("I want fishsticks", F), None);
+        assert!(could_start("Hey, um, fish", F));
+        assert!(!could_start("What's the weather like", F));
+    }
+
+    #[test]
+    fn short_names_allow_one_edit() {
+        let p = "jarvis";
+        assert_eq!(match_wake("Jarvis, lights on", p).as_deref(), Some("lights on"));
+        assert_eq!(match_wake("Jarvus, lights on", p).as_deref(), Some("lights on"));
+        assert_eq!(match_wake("Travis is here", p), None);
+    }
+
+    #[test]
+    fn phrases_are_checked() {
+        assert_eq!(check_phrase("  hey   computer ").as_deref(), Ok("hey computer"));
+        assert_eq!(check_phrase("Fishsticks").as_deref(), Ok("Fishsticks"));
+        assert!(check_phrase("").is_err());
+        assert!(check_phrase("bob").is_err());
+        assert!(check_phrase("!!! ...").is_err());
+        assert!(check_phrase("one two three four five six").is_err());
+        assert_eq!(spelling("fishsticks and custard"), "Fishsticks And Custard");
+        assert_eq!(spelling("fishsticks"), "Fishsticks");
     }
 }

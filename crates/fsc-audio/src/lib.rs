@@ -38,6 +38,7 @@ use tts::Tts;
 use vad::{CHUNK, Vad};
 
 pub use spectrum::BANDS;
+pub use wake::check_phrase as check_wake_phrase;
 
 #[derive(Debug, Clone)]
 pub enum AudioEvent {
@@ -84,6 +85,8 @@ enum Cmd {
     ReleaseMic,
     /// Enable/disable wake-phrase watching (the tray's mute).
     WakeEnabled(bool),
+    /// Listen for another phrase (already checked with `check_wake_phrase`).
+    WakePhrase(String),
 }
 
 #[derive(Clone)]
@@ -118,6 +121,9 @@ impl AudioHandle {
     }
     pub fn set_wake_enabled(&self, on: bool) {
         let _ = self.tx.send(Cmd::WakeEnabled(on));
+    }
+    pub fn set_wake_phrase(&self, phrase: impl Into<String>) {
+        let _ = self.tx.send(Cmd::WakePhrase(phrase.into()));
     }
 }
 
@@ -207,7 +213,7 @@ struct WakeDetector {
     check: Check,
     /// Words allowed before the phrase in this segment: more when it carries
     /// on from a rejected one, which ends with whatever was being said.
-    lead: usize,
+    lead: wake::Lead,
     /// Counts segments, so a late early-check result for an abandoned one is ignored.
     generation: u64,
     /// Transcriptions in flight, oldest first.
@@ -229,7 +235,7 @@ struct Job {
     generation: u64,
     /// The finished segment, rather than an early look at one in progress.
     done: bool,
-    lead: usize,
+    lead: wake::Lead,
     rx: mpsc::Receiver<String>,
 }
 
@@ -246,7 +252,7 @@ impl WakeDetector {
                     self.preroll.drain(..excess);
                     if self.onset.step(p) {
                         let seg = self.preroll.drain(..).collect();
-                        self.start(seg, EARLY_CHECK, wake::MAX_LEADING_WORDS);
+                        self.start(seg, EARLY_CHECK, wake::Lead::Fillers);
                     }
                 }
                 Some(seg) => {
@@ -276,7 +282,7 @@ impl WakeDetector {
         }
     }
 
-    fn start(&mut self, seg: Vec<f32>, check_at: usize, lead: usize) {
+    fn start(&mut self, seg: Vec<f32>, check_at: usize, lead: wake::Lead) {
         self.seg = Some(seg);
         self.silence = 0;
         self.check = Check::Due(check_at);
@@ -324,7 +330,7 @@ impl WakeDetector {
                 // came before (other speech carried over), so it may sit
                 // further in by then.
                 self.check = Check::Done;
-                self.lead = usize::MAX;
+                self.lead = wake::Lead::Any(usize::MAX);
             } else if wake::could_start(&heard, phrase) {
                 // Maybe mid-phrase ("hey, uh... fishsticks and"): look again later.
                 self.check = Check::Due(seg.len() + RECHECK);
@@ -333,7 +339,7 @@ impl WakeDetector {
                 // just the end of it, so the phrase said over continuing
                 // background speech is still caught.
                 let keep = seg.split_off(seg.len().saturating_sub(OVERLAP));
-                self.start(keep, OVERLAP + RECHECK, OVERLAP_LEADING_WORDS);
+                self.start(keep, OVERLAP + RECHECK, wake::Lead::Any(OVERLAP_LEADING_WORDS));
             }
         }
         None
@@ -462,6 +468,9 @@ impl<F: Fn(AudioEvent)> Engine<F> {
     }
 
     fn load(&mut self) {
+        if let Err(e) = wake::check_phrase(&self.cfg.wake_phrase) {
+            eprintln!("fsc: voice.wake_phrase: {e}; it may not wake, or wake too often");
+        }
         let missing = !models::missing(&self.cfg).is_empty();
         let env = match ort::init().with_name("fsc").build() {
             Ok(e) => Some(e),
@@ -486,7 +495,7 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             }
         }
         let t0 = Instant::now();
-        match Stt::load(&models::whisper_path(&self.cfg), &self.cfg.language, self.cfg.gpu) {
+        match Stt::load(&models::whisper_path(&self.cfg), &self.cfg.language, self.cfg.gpu, &self.cfg.wake_phrase) {
             Ok(s) => {
                 // Warm up: the first run compiles GPU shaders.
                 let _ = s.transcribe(&[0.0; MIC_RATE as usize]);
@@ -602,6 +611,13 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                 if !on {
                     self.watching = None;
                 }
+            }
+            Cmd::WakePhrase(phrase) => {
+                eprintln!("fsc: wake phrase is now {phrase:?}");
+                if let Some(stt) = &self.stt {
+                    stt.set_wake_phrase(&phrase);
+                }
+                self.cfg.wake_phrase = phrase;
             }
             Cmd::ReleaseMic => {
                 if !self.conversation
@@ -1016,7 +1032,7 @@ pub fn self_test(cfg: &VoiceConfig) -> anyhow::Result<()> {
     println!("piper    loaded in {:.2}s", t.elapsed().as_secs_f32());
 
     let t = Instant::now();
-    let stt = Stt::load(&models::whisper_path(cfg), &cfg.language, cfg.gpu)?;
+    let stt = Stt::load(&models::whisper_path(cfg), &cfg.language, cfg.gpu, &cfg.wake_phrase)?;
     println!("whisper  loaded in {:.2}s (gpu: {})", t.elapsed().as_secs_f32(), cfg.gpu);
 
     let sentence = "Fishsticks and custard. What is the weather like in London today?";
@@ -1093,7 +1109,7 @@ mod tests {
         let env = ort::init().with_name("fsc-test").build().unwrap();
         let mut vad = Vad::load(&env, &models::vad_path()).unwrap();
         let mut tts = Tts::load(&env, &models::piper_path(&cfg), &models::piper_config_path(&cfg), 1.0).unwrap();
-        let stt = Arc::new(Stt::load(&models::whisper_path(&cfg), &cfg.language, cfg.gpu).unwrap());
+        let stt = Arc::new(Stt::load(&models::whisper_path(&cfg), &cfg.language, cfg.gpu, &cfg.wake_phrase).unwrap());
         let say = |tts: &mut Tts, text: &str| {
             let pcm = tts.synth(text).unwrap();
             let mut rs = io::Resampler::new(tts.sample_rate(), MIC_RATE);

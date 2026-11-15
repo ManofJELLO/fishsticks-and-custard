@@ -48,6 +48,11 @@ enum Cmd {
         #[arg(value_enum, default_value_t = MuteMode::Toggle)]
         mode: MuteMode,
     },
+    /// Show the wake phrase, or change it (saved in config.toml)
+    Wake {
+        /// The new phrase, e.g. `fsc wake hey computer`
+        phrase: Vec<String>,
+    },
     /// Print the current state
     Status,
     /// Show what the assistant remembers between sessions
@@ -72,7 +77,11 @@ enum Cmd {
     /// Quit the daemon
     Quit,
     /// Download any missing speech models (whisper, silero VAD, piper voice)
-    FetchModels,
+    FetchModels {
+        /// Print the default models' URLs instead (for the release check)
+        #[arg(long, hide = true)]
+        urls: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -84,7 +93,8 @@ enum MuteMode {
 
 fn main() -> ExitCode {
     let cmd = match Cli::parse().cmd {
-        Cmd::FetchModels => return fetch::run(),
+        Cmd::FetchModels { urls: true } => return fetch::print_default_urls(),
+        Cmd::FetchModels { urls: false } => return fetch::run(),
         Cmd::Toggle => Command::Toggle,
         Cmd::Show => Command::Show,
         Cmd::Hide => Command::Hide,
@@ -103,6 +113,7 @@ fn main() -> ExitCode {
                 MuteMode::Toggle => None,
             },
         },
+        Cmd::Wake { phrase } => Command::Wake { phrase: (!phrase.is_empty()).then(|| phrase.join(" ")) },
         Cmd::Status => Command::Status,
         Cmd::Memory => Command::Memory,
         Cmd::Forget => Command::Forget,

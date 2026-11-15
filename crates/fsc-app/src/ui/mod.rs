@@ -101,6 +101,8 @@ struct State {
     /// The desktop's accent colour, when it sets one.
     desktop_accent: Option<Rgb>,
     muted: bool,
+    /// `voice.wake_phrase`, as changed by `fsc wake`.
+    wake_phrase: String,
     model: String,
     /// The agent answering, and which are installed (`AgentKind::ALL` order).
     agent: AgentKind,
@@ -296,6 +298,7 @@ impl Ui {
         let model = pretty_model(&cfg.model_hint());
         let (agent, agents) = (cfg.agent.backend, AgentKind::ALL.map(|k| cfg.available(k)));
         let memory_on = cfg.memory();
+        let wake_phrase = cfg.voice.wake_phrase.clone();
         let viz = Viz::new(&cfg.ui);
         let ui = Rc::new(Ui {
             cfg,
@@ -321,6 +324,7 @@ impl Ui {
                 palette,
                 desktop_accent: None,
                 muted: false,
+                wake_phrase,
                 model,
                 agent,
                 agents,
@@ -546,6 +550,8 @@ impl Ui {
                 self.flash_meta(if muted { "WAKE WORD MUTED" } else { "WAKE WORD ON" });
                 self.push_tray();
             }
+            Command::Wake { phrase: None } => return Reply::state(self.st.borrow().wake_phrase.clone()),
+            Command::Wake { phrase: Some(phrase) } => return self.set_wake_phrase(&phrase),
             Command::Status => {
                 let st = self.st.borrow();
                 let mut s = st.phase().label().to_lowercase();
@@ -918,6 +924,21 @@ impl Ui {
 
     /// Hand the conversation to another agent: this session ends (saving
     /// memory) and the next prompt goes to `kind`. Remembered in the config.
+    /// Listen for `phrase` from now on, and save it as `voice.wake_phrase`.
+    fn set_wake_phrase(self: &Rc<Self>, phrase: &str) -> Reply {
+        let phrase = match fsc_audio::check_wake_phrase(phrase) {
+            Ok(p) => p,
+            Err(e) => return Reply::err(e),
+        };
+        self.audio.set_wake_phrase(phrase.clone());
+        self.st.borrow_mut().wake_phrase = phrase.clone();
+        self.flash_meta(&format!("WAKE PHRASE: {}", phrase.to_uppercase()));
+        match Config::save_value("voice", "wake_phrase", &phrase) {
+            Ok(()) => Reply::state(format!("listening for {phrase:?}")),
+            Err(e) => Reply::state(format!("listening for {phrase:?} until fscd restarts (not saved: {e:#})")),
+        }
+    }
+
     fn switch_agent(self: &Rc<Self>, kind: AgentKind) -> Reply {
         // Reread the config so edits to the agent's own table count.
         let mut cfg = Config::load().unwrap_or_else(|e| {
@@ -1010,7 +1031,7 @@ impl Ui {
         glib::timeout_add_local_once(Duration::from_secs(30), move || app.quit());
     }
 
-    /// "Fishsticks and custard[, <command>]" was heard.
+    /// The wake phrase was heard ("fishsticks[, <command>]").
     fn on_wake(self: &Rc<Self>, command: Option<String>) {
         self.show(false);
         let start_conversation = self.cfg.voice.conversation && !self.st.borrow().conversation;
