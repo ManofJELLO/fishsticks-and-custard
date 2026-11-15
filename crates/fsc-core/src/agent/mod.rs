@@ -9,7 +9,10 @@
 //! A [`Backend`] starts the agent and speaks its protocol, turning its output
 //! into [`Event`]s:
 //! - [`claude`]: Claude Code over its native stream-json protocol.
+//! - [`acp`]: any agent that speaks the Agent Client Protocol (Codex through
+//!   codex-acp, Antigravity's `agy acp`, ...).
 
+mod acp;
 mod claude;
 mod claude_ask;
 
@@ -18,7 +21,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
-use crate::config::ClaudeConfig;
+use crate::config::{AgentKind, Config};
 use crate::memory;
 use crate::permission::{Answer, PermissionAsk};
 
@@ -67,13 +70,20 @@ pub struct AgentHandle {
 
 impl AgentHandle {
     /// Start the session actor. Must be called inside a tokio runtime.
-    pub fn spawn<F>(cfg: ClaudeConfig, home: PathBuf, emit: F) -> Self
+    pub fn spawn<F>(cfg: &Config, home: PathBuf, emit: F) -> Self
     where
         F: Fn(AgentEvent) + Send + Sync + 'static,
     {
         let (tx, rx) = mpsc::unbounded_channel();
-        let memory = cfg.memory;
-        tokio::spawn(actor(claude::ClaudeCli::new(cfg), memory, home, rx, emit));
+        let memory = cfg.claude.memory;
+        match cfg.agent.backend {
+            AgentKind::Claude => {
+                tokio::spawn(actor(claude::ClaudeCli::new(cfg.claude.clone()), memory, home, rx, emit));
+            }
+            _ => {
+                tokio::spawn(actor(acp::Acp::new(&cfg.agent), memory, home, rx, emit));
+            }
+        }
         Self { tx }
     }
 
@@ -133,8 +143,10 @@ pub(crate) trait Backend: Send + Sync + 'static {
     /// Seed or migrate the agent's own files in the assistant's home.
     fn prepare(&self, home: &Path) -> std::io::Result<()>;
     /// Start the agent on a fresh session. `prompt` is the persona plus
-    /// remembered facts, for its system prompt or context file.
-    fn start(&self, home: &Path, prompt: &str) -> impl Future<Output = Option<Self::Conn>> + Send;
+    /// remembered facts, for its system prompt. Also returns events to apply
+    /// straight away (such as `Ready`), or why it couldn't start.
+    fn start(&self, home: &Path, prompt: &str)
+    -> impl Future<Output = Result<(Self::Conn, Vec<Event>), String>> + Send;
 }
 
 /// A running agent. Writes are queued and sent by `flush`, so reading
@@ -144,7 +156,7 @@ pub(crate) trait Conn: Send {
     /// cancel-safe.
     fn recv(&mut self) -> impl Future<Output = std::io::Result<Option<String>>> + Send;
     /// Make sense of a message from `recv`. May queue replies to the agent.
-    fn handle(&mut self, msg: &str) -> Option<Event>;
+    fn handle(&mut self, msg: &str) -> Vec<Event>;
     /// Send queued writes.
     fn flush(&mut self) -> impl Future<Output = ()> + Send;
     /// Send a user prompt, starting a turn.
@@ -156,6 +168,9 @@ pub(crate) trait Conn: Send {
     fn answer(&mut self, id: &str, answer: Answer) -> bool;
     /// Queue a refusal for every open permission question.
     fn deny_all(&mut self);
+    /// Start a fresh session in the running agent, as `Backend::start` does
+    /// for a new one. `Err` if it can't: the agent is then restarted.
+    fn new_session(&mut self, home: &Path, prompt: &str) -> impl Future<Output = Result<Vec<Event>, String>> + Send;
     /// Stop the agent and say why it ended (exit status, last stderr lines).
     fn close(self) -> impl Future<Output = String> + Send;
 }
@@ -217,25 +232,53 @@ struct Session<B: Backend, F> {
     queued: VecDeque<String>,
     /// The app is quitting: sessions that end aren't replaced.
     closing: bool,
+    /// Why the agent last failed to start.
+    start_error: Option<String>,
 }
 
 impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
     async fn start(&mut self) {
         let prompt = session_prompt(&self.home, self.memory);
-        self.conn = self.backend.start(&self.home, &prompt).await;
+        match self.backend.start(&self.home, &prompt).await {
+            Ok((conn, events)) => {
+                self.conn = Some(conn);
+                self.start_error = None;
+                self.apply(events);
+            }
+            Err(e) => {
+                eprintln!("fsc: could not start {}: {e}", self.backend.program());
+                self.start_error = Some(e);
+            }
+        }
     }
 
-    /// Stop the current agent (if any) and start a new session, unless the
-    /// app is closing (a new session would only be killed again on exit; one
+    /// Events that need nothing more than showing (from starting a session).
+    fn apply(&mut self, events: Vec<Event>) {
+        for e in events {
+            on_event(e, &mut self.turn, &self.emit);
+        }
+    }
+
+    /// End the current session and start a new one: in the same agent if
+    /// it can, else by restarting it. When the app is closing the agent is
+    /// just stopped (a new session would only be killed again on exit; one
     /// is still started on demand if a prompt does arrive).
     async fn restart(&mut self) {
+        self.dirty = false;
+        if !self.closing && let Some(c) = self.conn.as_mut() {
+            let prompt = session_prompt(&self.home, self.memory);
+            match c.new_session(&self.home, &prompt).await {
+                Ok(events) => return self.apply(events),
+                Err(e) if !e.is_empty() => eprintln!("fsc: new session failed, restarting the agent: {e}"),
+                Err(_) => {}
+            }
+        }
         if let Some(c) = self.conn.take() {
             c.close().await;
         }
         if !self.closing {
             self.start().await;
         }
-        self.dirty = false;
     }
 
     /// Say no to every open permission question (the turn is being stopped).
@@ -252,7 +295,10 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
             self.start().await;
         }
         let Some(c) = self.conn.as_mut() else {
-            let error = format!("could not start `{}`", self.backend.program());
+            let mut error = format!("could not start `{}`", self.backend.program());
+            if let Some(e) = &self.start_error {
+                error = format!("{error}: {e}");
+            }
             (self.emit)(AgentEvent::TurnDone { ok: false, interrupted: false, error: Some(error) });
             return;
         };
@@ -403,30 +449,33 @@ impl<B: Backend, F: Fn(AgentEvent)> Session<B, F> {
     /// A message from the agent.
     async fn on_message(&mut self, msg: &str) {
         let Some(c) = self.conn.as_mut() else { return };
-        let event = c.handle(msg);
+        let events = c.handle(msg);
         c.flush().await;
-        let Some(event) = event else { return };
-        let saving = match on_event(event, &mut self.turn, &self.emit) {
-            After::Nothing => return,
-            After::Refuse(id) => {
-                if let Some(c) = self.conn.as_mut() {
-                    c.answer(&id, Answer::Deny);
-                    c.flush().await;
+        for event in events {
+            let saving = match on_event(event, &mut self.turn, &self.emit) {
+                After::Nothing => continue,
+                After::Refuse(id) => {
+                    if let Some(c) = self.conn.as_mut() {
+                        c.answer(&id, Answer::Deny);
+                        c.flush().await;
+                    }
+                    continue;
                 }
-                return;
+                After::Drained => self.begin_save().await,
+                After::Memory { ok, reply } => {
+                    // The memory update finished: store it, then start the new session.
+                    let event = finish_save(&self.home, ok, reply);
+                    eprintln!("fsc: {event:?}");
+                    (self.emit)(event);
+                    false
+                }
+            };
+            if !saving {
+                self.restart().await;
+                self.ask_queued().await;
             }
-            After::Drained => self.begin_save().await,
-            After::Memory { ok, reply } => {
-                // The memory update finished: store it, then start the new session.
-                let event = finish_save(&self.home, ok, reply);
-                eprintln!("fsc: {event:?}");
-                (self.emit)(event);
-                false
-            }
-        };
-        if !saving {
-            self.restart().await;
-            self.ask_queued().await;
+            // The rest of this message belonged to the turn that just ended.
+            return;
         }
     }
 
@@ -475,6 +524,7 @@ where
         dirty: false,
         queued: VecDeque::new(),
         closing: false,
+        start_error: None,
     };
     s.start().await;
     // A hidden (drain + memory update) turn must finish by this time, or it's
@@ -602,8 +652,15 @@ pub fn pretty_model(model: &str) -> String {
     let name = parts.iter().find(|p| p.chars().next().is_some_and(|c| c.is_ascii_alphabetic()));
     let Some(name) = name else { return model.to_uppercase() };
     // Version numbers are short numeric parts; long ones are dates.
-    let ver: Vec<&str> =
-        parts.iter().copied().filter(|p| !p.is_empty() && p.len() <= 2 && p.chars().all(|c| c.is_ascii_digit())).collect();
+    let ver: Vec<&str> = parts
+        .iter()
+        .copied()
+        .filter(|p| {
+            p.len() <= 4
+                && p.starts_with(|c: char| c.is_ascii_digit())
+                && p.chars().all(|c| c.is_ascii_digit() || c == '.')
+        })
+        .collect();
     let name = name.to_uppercase();
     if ver.is_empty() { name } else { format!("{name} {}", ver.join(".")) }
 }
@@ -619,6 +676,8 @@ mod tests {
         assert_eq!(pretty_model("claude-haiku-5-5-20261001"), "HAIKU 5.5");
         assert_eq!(pretty_model("claude-3-5-sonnet-20241022"), "SONNET 3.5");
         assert_eq!(pretty_model("opus"), "OPUS");
+        assert_eq!(pretty_model("gemini-3.8-flash-high"), "GEMINI 3.8");
+        assert_eq!(pretty_model("gpt-6-luna[medium]"), "GPT 6");
     }
 
     #[test]
@@ -713,11 +772,11 @@ mod tests {
             fn prepare(&self, _: &Path) -> std::io::Result<()> {
                 Ok(())
             }
-            async fn start(&self, _: &Path, prompt: &str) -> Option<FakeConn> {
+            async fn start(&self, _: &Path, prompt: &str) -> Result<(FakeConn, Vec<Event>), String> {
                 let (tx, rx) = mpsc::unbounded_channel();
                 *self.out.lock().unwrap() = Some(tx);
                 self.note(format!("start {}", prompt.contains("- likes tea")));
-                Some(FakeConn { fake: self.clone(), rx, pending: Vec::new(), outbox: Vec::new() })
+                Ok((FakeConn { fake: self.clone(), rx, pending: Vec::new(), outbox: Vec::new() }, Vec::new()))
             }
         }
 
@@ -725,9 +784,9 @@ mod tests {
             async fn recv(&mut self) -> std::io::Result<Option<String>> {
                 Ok(self.rx.recv().await)
             }
-            fn handle(&mut self, msg: &str) -> Option<Event> {
+            fn handle(&mut self, msg: &str) -> Vec<Event> {
                 let (kind, arg) = msg.split_once(':').unwrap_or((msg, ""));
-                Some(match kind {
+                vec![match kind {
                     "text" => Event::Text(arg.into()),
                     "start" => Event::TextStart,
                     "ask" => {
@@ -743,8 +802,8 @@ mod tests {
                     }
                     "end" => Event::TurnEnd { ok: true, error: None },
                     "fail" => Event::TurnEnd { ok: false, error: Some(arg.into()) },
-                    _ => return None,
-                })
+                    _ => return Vec::new(),
+                }]
             }
             async fn flush(&mut self) {
                 for m in std::mem::take(&mut self.outbox) {
@@ -770,6 +829,9 @@ mod tests {
                 for id in std::mem::take(&mut self.pending) {
                     self.outbox.push(format!("answer {id} Deny"));
                 }
+            }
+            async fn new_session(&mut self, _: &Path, _: &str) -> Result<Vec<Event>, String> {
+                Err(String::new())
             }
             async fn close(self) -> String {
                 self.fake.note("close".into());

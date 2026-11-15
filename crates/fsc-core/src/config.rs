@@ -7,6 +7,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub agent: AgentConfig,
     pub claude: ClaudeConfig,
     pub ui: UiConfig,
     pub voice: VoiceConfig,
@@ -76,6 +77,56 @@ impl Default for VoiceConfig {
             hang_up_after_secs: 60,
             wake_word: true,
             wake_phrase: "fishsticks and custard".into(),
+        }
+    }
+}
+
+/// Which agent answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentKind {
+    /// Claude Code, settings in `[claude]`.
+    #[default]
+    Claude,
+    /// OpenAI Codex through `codex-acp` (sign in with `codex login`).
+    Codex,
+    /// Google Antigravity CLI through `agy acp` (sign in with `agy acp --login`).
+    Antigravity,
+    /// Any other Agent Client Protocol agent: set `command`.
+    Acp,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    pub backend: AgentKind,
+    /// The agent's program. Empty: the backend's usual one (`codex-acp`, `agy`).
+    pub command: String,
+    /// Arguments: the backend's usual ones (`acp` for agy) are kept unless
+    /// `command` is set.
+    pub args: Vec<String>,
+    /// Extra environment variables for the agent.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Model id as the agent lists it. Empty: the agent's default.
+    pub model: String,
+    /// The agent's session mode (its approval preset), e.g. Codex's
+    /// "read-only" or Antigravity's "default". Empty: the backend's usual one.
+    pub mode: String,
+    /// Tool kinds that run without asking. The rest (edit, delete, move,
+    /// execute, other) are asked about, when the agent asks at all.
+    pub auto_allow: Vec<String>,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            backend: AgentKind::Claude,
+            command: String::new(),
+            args: Vec::new(),
+            env: Default::default(),
+            model: String::new(),
+            mode: String::new(),
+            auto_allow: ["read", "search", "fetch", "think"].map(String::from).to_vec(),
         }
     }
 }
@@ -298,6 +349,16 @@ mod tests {
         let c: Config = toml::from_str("[ui]\nsurface = \"layer\"\nanchor = \"bottom-right\"\n").unwrap();
         assert_eq!((c.ui.surface, c.ui.anchor), (Surface::Layer, Anchor::BottomRight));
         assert_eq!(c.ui.anchor.edges(), (false, true, false, true));
+    }
+
+    #[test]
+    fn agent_section() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.agent.backend, AgentKind::Claude);
+        let c: Config = toml::from_str("[agent]\nbackend = \"codex\"\nmodel = \"gpt-6-luna[low]\"\n").unwrap();
+        assert_eq!(c.agent.backend, AgentKind::Codex);
+        assert_eq!(c.agent.model, "gpt-6-luna[low]");
+        assert!(c.agent.auto_allow.iter().any(|k| k == "read"));
     }
 
     #[test]

@@ -56,8 +56,9 @@ impl Backend for ClaudeCli {
         seed_settings(home)
     }
 
-    async fn start(&self, home: &Path, prompt: &str) -> Option<ClaudeConn> {
-        start(&self.cfg, home, prompt)
+    async fn start(&self, home: &Path, prompt: &str) -> Result<(ClaudeConn, Vec<Event>), String> {
+        // The CLI says which model it's using once the first prompt is in.
+        start(&self.cfg, home, prompt).map(|c| (c, Vec::new()))
     }
 }
 
@@ -129,10 +130,10 @@ impl Conn for ClaudeConn {
         self.lines.next_line().await
     }
 
-    fn handle(&mut self, line: &str) -> Option<Event> {
+    fn handle(&mut self, line: &str) -> Vec<Event> {
         let (event, reply) = parse_line(line, &mut self.pending);
         self.outbox.extend(reply);
-        event
+        event.into_iter().collect()
     }
 
     async fn flush(&mut self) {
@@ -171,6 +172,11 @@ impl Conn for ClaudeConn {
         }
     }
 
+    /// The CLI holds one conversation; a new one means a new process.
+    async fn new_session(&mut self, _: &Path, _: &str) -> Result<Vec<Event>, String> {
+        Err(String::new())
+    }
+
     async fn close(mut self) -> String {
         // A read error (e.g. invalid UTF-8) can happen with the CLI still
         // running; make sure it's gone before waiting on it.
@@ -187,7 +193,7 @@ impl Conn for ClaudeConn {
     }
 }
 
-fn start(cfg: &ClaudeConfig, home: &Path, prompt: &str) -> Option<ClaudeConn> {
+fn start(cfg: &ClaudeConfig, home: &Path, prompt: &str) -> Result<ClaudeConn, String> {
     let mut cmd = tokio::process::Command::new(&cfg.bin);
     cmd.args([
         "-p",
@@ -229,15 +235,10 @@ fn start(cfg: &ClaudeConfig, home: &Path, prompt: &str) -> Option<ClaudeConn> {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("fsc: failed to start {}: {e}", cfg.bin);
-            return None;
-        }
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        return Err("no pipes to the CLI".into());
     };
-    let stdin = child.stdin.take()?;
-    let stdout = child.stdout.take()?;
     let stderr_buf = Arc::new(Mutex::new(VecDeque::new()));
     if let Some(err) = child.stderr.take() {
         let buf = stderr_buf.clone();
@@ -253,7 +254,7 @@ fn start(cfg: &ClaudeConfig, home: &Path, prompt: &str) -> Option<ClaudeConn> {
             }
         });
     }
-    Some(ClaudeConn {
+    Ok(ClaudeConn {
         child,
         stdin,
         lines: BufReader::new(stdout).lines(),
@@ -457,8 +458,11 @@ mod real {
         let home = std::env::temp_dir().join(format!("fsc-real-claude-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let cfg = ClaudeConfig { model: "haiku".into(), memory: false, ..Default::default() };
-        let agent = AgentHandle::spawn(cfg, home.clone(), move |e| {
+        let cfg = crate::config::Config {
+            claude: ClaudeConfig { model: "haiku".into(), memory: false, ..Default::default() },
+            ..Default::default()
+        };
+        let agent = AgentHandle::spawn(&cfg, home.clone(), move |e| {
             let _ = tx.send(e);
         });
         agent.ask("Reply with just the word pong.");

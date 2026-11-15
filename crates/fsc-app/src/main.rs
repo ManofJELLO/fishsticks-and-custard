@@ -106,7 +106,7 @@ fn main() -> Result<()> {
 
     let claude = {
         let tx = ev_tx.clone();
-        AgentHandle::spawn(cfg.claude.clone(), cfg.claude_home(), move |e| {
+        AgentHandle::spawn(&cfg, cfg.claude_home(), move |e| {
             let _ = tx.try_send(AppEvent::Agent(e));
         })
     };
