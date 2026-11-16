@@ -1,42 +1,55 @@
 # Fishsticks & Custard
 
-A voice desktop assistant for Arch + Hyprland, written in Rust. You summon it with the
-wake phrase *"fishsticks and custard"*, a hotkey, or the tray icon.
-It runs on the AI subscription you already have: Claude (through Claude Code), ChatGPT
-(through Codex) or Google (through Antigravity CLI), or on OpenCode's free models.
-See [Choosing an agent](#choosing-an-agent).
+A voice assistant for your Hyprland desktop. Say *"fishsticks and custard"*, press a key or
+click the police box in your tray, then ask it something. It answers in a small popup and,
+if you spoke, reads the reply aloud.
 
-## Status
+<p align="center"><img src="docs/images/popup-reply.png" alt="The popup showing a typed question and its reply" width="680"></p>
 
-| Step | What | State |
-|---|---|---|
-| 1 | Tray icon, popup (translucent panel, dot-matrix status and visualiser), text input, `fsc` CLI, Claude session | **done** |
-| 2 | Push-to-talk: cpal (PipeWire) → Silero VAD → whisper-rs (Vulkan) → Claude → Piper, spoken sentence by sentence; real FFT in the visualiser | **done** |
-| 3 | Wake phrase "fishsticks and custard" (VAD-gated whisper, say a command in the same breath) | **done** |
-| 4 | Safe system control: permission prompts routed to the popup | **done** |
-| 5 | Polish: police-box tray icon, LED-segment visualiser, window/layer/headless modes, spoken-reply cleanup | **done** |
-| 6 | Any agent: Codex, Antigravity and OpenCode through the Agent Client Protocol, beside Claude Code; agent, model and mode menus | **done** |
-| 7 | 18 languages (following the desktop's), a choice of voices, and microphone, speech and settings menus in the tray | **done** |
+- **Talk or type.** Use the wake phrase, hold a key to talk, or type into the popup.
+- **Uses the AI subscription you already have.** It works with Claude (through Claude
+  Code), ChatGPT (through Codex), Google (through Antigravity), or OpenCode's free models.
+  Nothing extra to pay for.
+- **Asks before it acts.** Before running a command, writing a file or fetching a page, it
+  shows you exactly what it wants to do and waits for you to answer.
+- **Your voice stays on your computer.** Speech recognition and the spoken voice run
+  locally. Only the text of what you ask goes to the agent.
+- **Remembers what matters.** It keeps a short list of facts about you between
+  conversations. It's a plain file you can read, edit or delete.
+- **Speaks 18 languages**, with a choice of voices for each.
 
-## Layout
+## Contents
 
-```
-crates/fsc-core   IPC protocol, config, model registry, agent sessions: Claude stream-json, ACP (no GTK)
-crates/fsc-audio  mic/speaker (cpal), Silero VAD + Piper (ONNX Runtime), whisper.cpp STT, spectrum
-crates/fsc-app    `fscd`: GTK4 popup (window or layer-shell), ksni tray, portal theme/accent watcher, socket server
-crates/fsc-cli    `fsc`: control CLI for Hyprland binds and scripts
-voice-home/       defaults seeded into ~/.local/share/fsc/home (persona + tool allow-list)
-packaging/        Hyprland snippet, example config, Arch PKGBUILD + signing key
-.github/workflows CI: build, sign and publish the pacman repository
-```
+- [What you need](#what-you-need)
+- [Install](#install)
+- [Getting started](#getting-started)
+- [When it asks first](#when-it-asks-first)
+- [The tray icon](#the-tray-icon)
+- [Keys and commands](#keys-and-commands)
+- [Choosing an agent](#choosing-an-agent)
+- [Languages and voices](#languages-and-voices)
+- [The wake phrase](#the-wake-phrase)
+- [Conversations and memory](#conversations-and-memory)
+- [Bluetooth headsets](#bluetooth-headsets)
+- [Privacy](#privacy)
+- [Settings](#settings)
+- [Troubleshooting](#troubleshooting)
+- [Updating and uninstalling](#updating-and-uninstalling)
 
-## Install (pacman repository)
+## What you need
 
-Signed packages are built by GitHub Actions for every release and published to this
-repo's [`repo` release](https://github.com/ManofJELLO/fishsticks-and-custard/releases/tag/repo).
-Updates then arrive with a normal `pacman -Syu`.
+- **Arch Linux with Hyprland.** Other Wayland compositors may work, but it's made for
+  Hyprland. It doesn't run on X11.
+- **A system tray** for the icon, such as Waybar's `tray` module.
+- **An account with one of the agents** (see [Choosing an agent](#choosing-an-agent)).
+  Claude Code is the default. OpenCode needs no account at all.
+- **For voice:** a microphone, and speakers or headphones. Typing works without either.
+- **About 700 MB of disk** for the speech models. A graphics card with Vulkan drivers
+  makes speech recognition fast. It also runs on the CPU, more slowly.
 
-1. Trust the packaging key:
+## Install
+
+1. **Trust the package signing key:**
 
    ```sh
    curl -sL https://raw.githubusercontent.com/ManofJELLO/fishsticks-and-custard/main/packaging/arch/fishsticks-and-custard.asc \
@@ -44,296 +57,298 @@ Updates then arrive with a normal `pacman -Syu`.
    sudo pacman-key --lsign-key 3286286EB33C3D8E9B47D6EF0A83688698B6FA30
    ```
 
-2. Add the repository to `/etc/pacman.conf`:
+2. **Add the repository** to the end of `/etc/pacman.conf`:
 
    ```ini
    [fishsticks-and-custard]
    Server = https://github.com/ManofJELLO/fishsticks-and-custard/releases/download/repo
    ```
 
-3. Install: `sudo pacman -Sy fishsticks-and-custard`, then follow the printed setup steps
-   (agent login, `fsc fetch-models`, Hyprland lines).
+3. **Install it:**
 
-You also need an agent, signed in with your account: the [Claude Code](https://claude.com/claude-code)
-CLI by default, or one of the others in [Choosing an agent](#choosing-an-agent).
+   ```sh
+   sudo pacman -Syu fishsticks-and-custard
+   ```
+
+4. **Install an agent and sign in.** For Claude, install the
+   [Claude Code](https://claude.com/claude-code) CLI and run `claude` once to sign in. For
+   the others, see [Choosing an agent](#choosing-an-agent).
+
+5. **Download the speech models** (about 640 MB, including a voice for your desktop's
+   language), then check them:
+
+   ```sh
+   fsc fetch-models
+   fscd --self-test
+   ```
+
+   The self-test speaks a sentence out loud and transcribes it back, so turn your
+   volume up.
+
+6. **Add the Hyprland lines.** Copy the contents of
+   `/usr/share/fishsticks-and-custard/hyprland/fsc.lua` into `~/.config/hypr/hyprland.lua`.
+   They set up the following:
+   - the popup floats near the top of the screen on every workspace;
+   - **Super+A** opens it for typing;
+   - holding **Super+Shift+A** lets you talk.
+
+   To start the assistant when you log in, add `hl.exec_cmd("fscd")` inside your
+   existing `hl.on("hyprland.start", ...)` block.
+
+7. **Start it.** Run `fscd`, or open **Fishsticks & Custard** from your app launcher. The
+   police box appears in your tray.
+
+## Getting started
+
+**Type a question:** press **Super+A** (or click the tray icon), type, and press
+**Enter**. Press **Esc** to hide the popup again.
+
+**Ask out loud:** hold **Super+Shift+A**, speak, and let go. Or tap it once and just
+talk: it stops listening when you stop talking.
+
+**Use the wake phrase:** say *"Fishsticks and custard"*, then your question. You can say
+both in one breath: *"Fishsticks and custard, how long do I boil an egg?"*
+
+**Keep talking:** after a spoken reply it listens again, like a phone call, so you can
+follow up without the wake phrase. While the status says **LISTENING** in red,
+everything it hears goes to the agent. Press **Esc** to hang up. It also hangs up
+after a minute of silence.
+
+**Interrupt it:** say the wake phrase while it's thinking or talking (*"Fishsticks and
+custard, actually…"*), or press the talk key. **Ctrl+C** in the popup stops a reply.
+
+**Start over:** **Ctrl+N** starts a new conversation.
+
+## When it asks first
+
+<p align="center"><img src="docs/images/popup-allow.png" alt="A permission card asking to run a command, with Allow and Deny buttons" width="680"></p>
+
+Before the agent does something on your computer (runs a command, writes a file, opens a
+web page), the reply pauses and the status turns to **ALLOW?** A card shows what it
+wants to do and the exact command, address or file. You can answer in four ways:
+
+- **ALLOW** lets it do this once.
+- **ALWAYS** lets it do this kind of thing from now on without asking. It only appears
+  when the agent offers it.
+- **DENY** refuses. Closing the popup also counts as no.
+- **By voice:** if you asked out loud, it also asks out loud (*"May I search the web
+  for…? Yes, always, or no?"*). Answer *yes*, *always* or *no*.
+
+Reading, searching and thinking don't need your permission.
+
+## The tray icon
+
+<p align="center"><img src="docs/images/tray-icons.png" alt="Tray icons: police box when ready, with a red dot while recording, dimmed when the wake word is muted, and the fishbone alternative" width="600"></p>
+
+Click the icon to show or hide the popup. A red dot means the microphone is recording.
+If you prefer, a fishbone icon is available as well (see [Settings](#settings)).
+Right-click the icon for its menu:
+
+| Menu item | What it does |
+|---|---|
+| **Type…** / **Talk** | Opens the popup for typing, or starts listening. |
+| **Mute wake word** | Stops it listening for the wake phrase. The talk key still works. |
+| **Microphone** | Chooses which microphone to use. |
+| **Speak replies** | Chooses when replies are read aloud: when you talk (the default), always, or never. |
+| **Language** / **Voice** | Chooses the language it speaks and listens in, and the voice it uses. |
+| **Agent** | Chooses which agent answers. Agents that aren't installed are greyed out. |
+| **Model** / **Mode** | Chooses the agent's model, and how much it asks before acting. |
+| **New conversation** | Starts a new conversation. |
+| **Forget memories** | Deletes what it remembers about you. |
+| **Settings…** | Opens your settings (see [Settings](#settings)). |
+| **Quit** | Closes the assistant. |
+
+Changes made from the menu take effect straight away and are saved.
+
+## Keys and commands
+
+| Key | What it does |
+|---|---|
+| **Super+A** | Opens the popup for typing. |
+| **Super+Shift+A** | Hold to talk, or tap to talk until you stop. |
+| **Enter** | Sends your message. |
+| **Esc** | Hides the popup, and hangs up a voice conversation. A reply still in progress finishes as text, and you get a notification. |
+| **Ctrl+C** | Stops the reply (when no text is selected). |
+| **Ctrl+N** | Starts a new conversation. |
+
+The `fsc` command does the same from a terminal or a script. Run `fsc --help` for the
+full list.
+
+| Command | What it does |
+|---|---|
+| `fsc ask "…"` | Asks a question without opening the text field. |
+| `fsc type` / `fsc listen` | Opens the popup for typing, or starts listening. |
+| `fsc stop` / `fsc new` | Stops the reply, or starts a new conversation. |
+| `fsc allow [--always]` / `fsc deny` | Answers a permission question. |
+| `fsc status` | Prints what it's doing: `ready`, `listening`, `thinking`, and so on. |
+| `fsc mute [on\|off]` | Mutes or unmutes the wake phrase. |
+| `fsc wake [phrase]` | Shows the wake phrase, or changes it. |
+| `fsc agent [name]` | Shows which agent answers, or switches to `claude`, `codex`, `antigravity` or `opencode`. |
+| `fsc model [id]` / `fsc mode [id]` | Lists the agent's models or modes, or switches to one. |
+| `fsc mic [name]` | Lists microphones, or switches to one (`default` for the system's). |
+| `fsc speak [voice\|always\|never]` | Sets when replies are read aloud. |
+| `fsc language [code]` / `fsc voice [name]` | Lists the languages or voices, or switches. |
+| `fsc memory` / `fsc forget` | Shows what it remembers, or deletes it. |
+| `fsc settings` | Opens your settings. |
+| `fsc quit` | Closes the assistant. |
 
 ## Choosing an agent
 
-Pick one from the tray icon's **Agent** menu, or run `fsc agent codex` (plain `fsc agent`
-says which one answers). The current conversation ends, saving what's worth remembering,
-and your next question goes to the new agent, which starts with the same memory. The
-choice is saved as `backend` in the `[agent]` section of `~/.config/fsc/config.toml`; agents
-that aren't installed are greyed out in the menu.
+The agent is the AI that answers. You can switch from the tray's **Agent** menu or with
+`fsc agent codex`. The current conversation ends, and the new agent starts with the same
+memory of you.
 
-The tray menu's **Model** and **Mode** submenus list what the current agent offers
-(`fsc model` and `fsc mode` print the same lists, and `fsc model <id>` switches). A change
-applies to the conversation you're in, and is saved in that agent's section of the config
-so later sessions keep it. The mode is the agent's own idea of how much to ask first: for
-Claude, Ask (default), Accept edits, Auto or Plan; Codex's read-only asks before edits,
-commands and network use. The popup shows the model and mode in its top line. Both
-submenus stay in the tray menu, greyed out, while an agent is starting and hasn't said
-what it offers yet, so the menu never changes length under the pointer.
+| Agent | Account | Install | Sign in |
+|---|---|---|---|
+| **Claude** (default) | Claude Pro or Max | [Claude Code](https://claude.com/claude-code) | run `claude` once |
+| **Codex** | ChatGPT | the Codex CLI and `codex-acp` (AUR `codex-acp`, or `npm i -g @agentclientprotocol/codex-acp`) | `codex login` |
+| **Antigravity** | Google | `agy` 1.5 or newer (AUR `antigravity-cli`) | `agy acp --login` |
+| **OpenCode** | none for its free models | `sudo pacman -S opencode` | `opencode auth login`, only for your own providers |
 
-| `backend` | Needs | Sign in with |
-|---|---|---|
-| `"claude"` (default) | Claude Code CLI (`claude`) | `claude`, once, interactively |
-| `"codex"` | Codex CLI and `codex-acp` (AUR `codex-acp`, or `npm i -g @agentclientprotocol/codex-acp`) | `codex login` |
-| `"antigravity"` | Antigravity CLI `agy` 1.5 or newer (AUR `antigravity-cli`) | `agy acp --login` |
-| `"opencode"` | OpenCode (`pacman -S opencode`) | nothing for its free models; `opencode auth login` for your own providers |
-| `"acp"` | any [Agent Client Protocol](https://agentclientprotocol.com) agent: set `command` and `args` in `[acp]` | the agent's own way |
+If an agent isn't signed in, the popup tells you which command to run.
 
-Each agent has its own section for its settings, so switching back and forth keeps them:
+The tray's **Model** menu lists the agent's models. The **Mode** menu sets how much it
+asks before acting. Claude's modes are Ask (the default), Accept edits, Auto and Plan.
+Codex starts in read-only, which asks before any edit, command or network use. The
+popup shows the current model and mode at the top.
 
-```toml
-[agent]
-backend = "codex"
+Codex, Antigravity and OpenCode work in a folder of their own,
+`~/.local/share/fsc/home/workspace`. They can write there freely, but they ask before
+touching anything else of yours.
 
-[codex]
-# model = "gpt-6-luna[low]"     # as the agent lists it; empty = its default
-# mode = "read-only"            # its approval mode; read-only (the default here) asks before edits and commands
-
-[antigravity]
-# model = "gemini-3.8-flash-low"
-
-[opencode]
-# model = "opencode/big-pickle"
-
-[acp]
-# command = "my-agent"
-# args = ["--acp"]
-```
-
-Claude runs through Claude Code's own stream-json mode, with its settings in `[claude]`.
-The others speak ACP: each session gets the persona as a system prompt, conversations
-rotate to fresh sessions in the same agent process, and permission questions arrive
-on the same card (see [Permission questions](#permission-questions)). ACP agents work in
-`~/.local/share/fsc/home/workspace`, an empty folder of their own. Agents let themselves
-write there freely (Antigravity also writes in `/tmp` without asking), but changes to the
-assistant's own files and to anything of yours are asked about. Reading, searching, web
-fetches and thinking run without asking; set `auto_allow` to change which tool kinds do.
-OpenCode lets itself do anything by default, so FSC gives it a project config of its own,
-`~/.local/share/fsc/home/workspace/.opencode/opencode.json`, that asks about every action
-(your own OpenCode settings are left alone; edit that file to change what's asked).
-If an agent isn't signed in, the popup says which command to run.
-
-## Build from source
-
-Build dependencies (Arch):
-
-```sh
-sudo pacman -S --needed clang vulkan-headers espeak-ng
-```
-
-`clang` generates C bindings, `vulkan-headers` builds whisper.cpp's GPU backend, and
-`espeak-ng` provides the phoneme data Piper needs. The first build compiles
-whisper.cpp and its Vulkan shaders. If your machine is sensitive to sustained
-all-core load, limit it: `CMAKE_BUILD_PARALLEL_LEVEL=4 cargo build -j 4`.
-
-```sh
-cargo install --locked --root ~/.local --path crates/fsc-app
-cargo install --locked --root ~/.local --path crates/fsc-cli
-```
-
-Or build the same package the repository ships: `cd packaging/arch && makepkg -si`.
-
-For a launcher entry (rofi `drun`, etc.) when installing with cargo:
-
-```sh
-install -Dm644 packaging/desktop/dev.fsc.FishsticksAndCustard.desktop -t ~/.local/share/applications/
-install -Dm644 packaging/desktop/dev.fsc.FishsticksAndCustard.svg -t ~/.local/share/icons/hicolor/scalable/apps/
-```
-
-### Releasing
-
-First run `packaging/release/check.py`. It checks whether anything the app depends on has
-changed since the last release was tested:
-- **Agents** (claude, codex-acp, codex, agy, opencode): checks the installed version against
-  the one recorded in `packaging/release/tested.json` and against the newest upstream. If an
-  agent's version changed, its real end-to-end tests run again (`--live` reruns them all).
-- **Packages:** checks that every PKGBUILD package still exists.
-- **Crates:** shows available Rust crate updates.
-- **Models:** checks that the default speech models still download, and whether they
-  changed upstream.
-- **CI:** checks the GitHub Actions versions.
-- **Build:** runs `cargo test` and clippy.
-
-Fix anything marked FAIL and read the WARNs. Then rerun with `--record` to save what was
-tested, and commit `tested.json` with the release.
-
-Bump `version` in `Cargo.toml` and `pkgver` in `packaging/arch/PKGBUILD` (they must match),
-commit, then `git tag vX.Y.Z && git push --tags`. The `package` workflow builds, signs and
-publishes it.
-
-Download the speech models (~640 MB into `~/.local/share/fsc/models`), then check them:
-
-```sh
-fsc fetch-models
-fscd --self-test     # Piper speaks a sentence, whisper transcribes it back, with timings
-```
-
-Then paste `packaging/hyprland/fsc.lua` into `~/.config/hypr/hyprland.lua`.
-
-The package installs a launcher entry, **Fishsticks & Custard**. Opening it starts `fscd`, or
-toggles the popup if it's already running. Its actions (Type, Talk, New conversation, Quit)
-show in rofi with `rofi -show drun -drun-show-actions`.
-
-## Use
-
-| | |
-|---|---|
-| `SUPER+A` / tray click / `fsc type` | open the popup with the text field focused |
-| `Enter` | send |
-| `Esc` | hide; in a voice conversation this also hangs up (a reply keeps streaming as text, with a notification) |
-| `Ctrl+C` (nothing selected) / `fsc stop` | interrupt the reply |
-| `Ctrl+N` / `fsc new` | new conversation |
-| `SUPER+SHIFT+A` hold / `fsc listen` + `fsc release` | push-to-talk; a quick tap listens until you stop talking |
-| `fsc ask "…"` | send without opening the field |
-| **ALLOW / ALWAYS / DENY** / `fsc allow [--always]` / `fsc deny` | answer a permission question; by voice, say *yes*, *always* or *no*; typing `y` or `n` works too |
-| *"Fishsticks and custard[, question]"* | wake it by voice; a question in the same breath is sent straight away |
-| `fsc mute [on\|off]` / tray | mute the wake word |
-| `fsc wake [phrase]` | say which wake phrase it listens for, or change it (saved as `voice.wake_phrase`) |
-| `fsc status` | `ready`, `thinking`, `listening`, … |
-| `fsc memory` | show what it remembers between sessions |
-| `fsc forget` / tray **Forget memories** | delete that memory and start a fresh session |
-| `fsc agent [name]` / tray **Agent** | say which agent answers, or switch (claude, codex, antigravity, opencode, acp) |
-| `fsc model [id]` / `fsc mode [id]` / tray **Model**, **Mode** | list the agent's models or modes, or switch |
-| `fsc mic [name]` / tray **Microphone** | list the microphones, or listen with another (`default` for the system's; saved as `voice.input_device`). A named mic that's unplugged is waited for, and the tray says so; no other mic is opened in its place |
-| `fsc speak [voice\|always\|never]` / tray **Speak replies** | when replies are read aloud: replies to spoken prompts (*When I talk*), always or never (saved as `voice.speak`) |
-| `fsc settings` / tray **Settings…** | open HyprCustard if it's installed, otherwise `config.toml` in your editor |
-| `fsc language [code]` / tray **Language** | list the languages, or speak and listen in another (saved as `voice.language`) |
-| `fsc voice [name]` / tray **Voice** | list the language's voices, or speak with another (downloaded if need be; saved as `voice.piper_voice`) |
-
-## Customise
-
-- **Persona and reply style:** `~/.local/share/fsc/home/persona.md`
-- **What Claude may run** (Claude only; ACP agents keep their own rules):
-  `~/.local/share/fsc/home/.claude/settings.local.json`. Anything
-  on `allow` just runs, anything on `deny` never does, and anything else is asked about (see
-  below). **ALWAYS** answers are added here. Run `fsc new` after editing it or the persona.
-  (Local settings are used because Claude Code ignores a folder's shared `settings.json`
-  allow-list until you've trusted the folder interactively.) File edits (`Edit`, `Write`)
-  are asked about. Versions before 0.6.4 denied them; updating removes those three deny rules
-  once, so add them back to `deny` if you'd rather it never edits files.
-- **Everything else:** `~/.config/fsc/config.toml` (see `packaging/config.example.toml`), or
-  HyprCustard's Fishsticks & Custard page. The tray's **Settings…** opens whichever you
-  have; with no config file yet it starts one listing every setting, commented out. Edits
-  to the file apply when fscd restarts; the tray menus and `fsc` commands apply at once.
-- Preview the tray icons: `fscd --dump-icons /some/dir`.
-
-## Permission questions
-
-When the agent wants a tool that isn't allowed or denied (a command, a web page, a file
-write), the reply pauses: the status turns red (**ALLOW?**) and a card shows what it wants
-to do and the exact command, URL or path, with **ALLOW**, **ALWAYS** and **DENY**. After a
-spoken question it also asks out loud ("May I search the web for…? Yes, always, or no?")
-and listens for the answer. Closing the popup counts as no. **ALWAYS** saves the rule
-Claude Code suggests, so the same kind of request just runs next time. With ACP agents it
-picks the agent's own "always allow" option, when it offers one.
-
-## Sessions and memory
-
-One session lasts while you're actively talking to it. After
-`agent.session_idle_minutes` (default 20) without an exchange, or on `fsc new` / Ctrl+N,
-or when `fscd` quits, the session ends and a new one starts, so context doesn't grow
-forever. Older exchanges stay visible in the popup above a **NEW SESSION** divider.
-
-Before a session ends, the agent is asked (hidden) to update a short list of durable facts
-about you: preferences, location, people, setup, ongoing plans, things you asked it to
-remember. It leaves out one-off questions and sensitive details. The list is saved to
-`~/.local/share/fsc/home/memory.md`, a plain file you can read or edit, and is loaded
-into every new session. `fsc memory` shows it, `fsc forget` deletes it, and
-`agent.memory = false` turns the feature off. (Both were in `[claude]` before 0.7,
-and are still read from there.) Saving costs one small extra turn per
-session.
+Any other agent that supports the [Agent Client Protocol](https://agentclientprotocol.com)
+can be used too: set `backend = "acp"` and its `command` in the settings file.
 
 ## Languages and voices
 
-It speaks and listens in 18 languages: English, German, French, Spanish, Italian,
-Portuguese, Dutch, Polish, Swedish, Danish, Norwegian, Finnish, Czech, Russian,
-Ukrainian, Turkish, Hungarian and Romanian. Out of the box it follows your desktop's
-language (`LANG`), or English when that isn't one of them. Pick another from the tray's
-**Language** menu or with `fsc language de`. The change covers:
+It speaks and listens in English, German, French, Spanish, Italian, Portuguese, Dutch,
+Polish, Swedish, Danish, Norwegian, Finnish, Czech, Russian, Ukrainian, Turkish, Hungarian
+and Romanian. At first it uses your desktop's language, or English if that isn't on the
+list.
 
-- **what it hears:** whisper listens for that language;
-- **what it says:** a voice for that language. The voice is downloaded (60 to 120 MB) the
-  first time, and it says hello when it's ready;
-- **the agent:** it is told which language to reply in;
-- **permission questions:** they're asked in that language, and *yes*, *always* and *no*
-  are understood in it, as well as in English.
+Pick another language from the tray's **Language** menu, or with `fsc language de`. It
+then listens for that language, speaks it, and tells the agent to reply in it.
+Permission questions are asked in it too, and *yes*, *always* and *no* are understood in
+that language as well as in English. The first time you pick a language, its voice
+downloads (60 to 120 MB), and it says hello when it's ready.
 
-The tray's **Voice** menu lists every voice Piper has for the language, with each one's
-download size until it's downloaded; `fsc voice` prints the same list. Any other Piper voice
-can be set by name in `voice.piper_voice`.
+The **Voice** menu lists every voice available for the language, with its download size.
 
-The wake phrase stays as it is; `fsc wake` sets one in your language.
-whisper also knows languages that aren't on the list: set `voice.language` (e.g. `"ja"`)
-and `voice.piper_voice` by hand, and its own questions stay in English.
+The wake phrase doesn't change with the language. To use one in your own language, see
+below.
 
-## Wake phrase
+## The wake phrase
 
-When nothing else is using the mic, `fscd` keeps it open and watches for the phrase:
-Silero VAD cuts speech into segments, each segment is transcribed locally by whisper on
-the GPU (~0.25 s), and a fuzzy match checks whether it *starts* with the phrase. Nothing
-is sent anywhere unless it does. Long segments are checked after 2.5 s and dropped early
-if they don't start with the phrase. Mute it from the tray or with `fsc mute`.
+While the assistant is running and the wake word isn't muted, it listens for the wake
+phrase. This happens entirely on your computer, and nothing is sent anywhere until it
+hears the phrase. Mute it from the tray or with `fsc mute`.
 
-**Choosing the phrase:** `fsc wake hey computer` changes it straight away and saves it
-as `voice.wake_phrase` in config.toml (editing the file works too, after a restart).
-Whisper is told to expect the phrase, so an unusual word is spelled consistently. It
-needs at least 5 letters and at most 5 words. Only a few fillers may come before it
-("okay, um, hey fishsticks and custard"), so "we had fish sticks and custard" doesn't
-wake it. Said in the middle of continuous speech (no pause before it) any words may
-precede it, so a short, everyday phrase still wakes more easily by accident, and
-anything said after a false wake goes to the agent. Longer, unusual phrases are safer.
+To change the phrase, run `fsc wake hey computer`. It takes effect straight away. The
+phrase needs at least 5 letters and at most 5 words. Longer, unusual phrases are less
+likely to wake it by accident. Short everyday ones can trigger in normal conversation,
+and whatever is said after a false wake goes to the agent.
 
-This means the GPU does a little work whenever someone speaks nearby. A trained
-openWakeWord model can be added later as a cheaper first stage.
+It only wakes when the phrase starts what you're saying. *"Okay, fishsticks and custard"*
+works, but *"we had fish sticks and custard"* doesn't.
 
-Pick the mic with `voice.input_device` (a substring of its name, e.g. `"C920"`). A wired
-or USB mic is best for an always-on wake word; see below for Bluetooth headsets.
+The wake phrase works best with a wired or USB microphone that's always connected. Choose
+one from the tray's **Microphone** menu. If that microphone is unplugged, it waits for it
+to come back rather than switching to another. The tray tooltip says when it's missing.
+
+## Conversations and memory
+
+A conversation lasts while you keep talking to it. After 20 minutes without a message, or
+when you start a new one (**Ctrl+N**), it begins fresh. Earlier messages stay visible in
+the popup above a **NEW SESSION** line.
+
+Before a conversation ends, the agent updates a short list of lasting facts about you:
+your preferences, the people and things you mention, plans you're working on, anything you
+asked it to remember. It leaves out one-off questions and sensitive details. The list is
+kept in `~/.local/share/fsc/home/memory.md`, a plain text file you can read and edit.
+
+- `fsc memory` shows the list.
+- `fsc forget` or **Forget memories** in the tray deletes it.
+- To turn memory off, set `memory = false` in the `[agent]` section of the settings.
 
 ## Bluetooth headsets
 
-Earbuds in high-quality playback mode (A2DP) have no microphone. When `fscd` opens the
-mic, WirePlumber switches them to headset mode (HFP), which takes about 1–5 s. The popup
-says **WAITING FOR MIC…** until audio actually arrives. The mic then stays open until the
-spoken reply finishes (`voice.hold_mic_while_speaking`), because closing it flips the
-headset back and removes the device the reply would play on. Replies therefore play at
-headset quality. An always-on wake word (step 3) works better with a separate mic: name
-it in the tray's **Microphone** menu. Then, if it's unplugged, the wake word waits for it
-to come back instead of opening the headset's mic, which would drop the headset into
-call quality whenever the separate mic goes away.
+Bluetooth earbuds and headsets have to switch into headset mode before their microphone
+works, which takes a few seconds. While that happens, the popup shows **WAITING FOR
+MIC…**. During a voice conversation, replies play at headset (call) quality.
 
-**Conversation mode** (`voice.conversation`, on by default): after a spoken reply it
-listens again automatically, like a phone call, keeping the mic and a warm output
-stream open (with inaudible dither so earbuds don't sleep and clip the next reply).
-Closing the popup (Esc) hangs up and releases the headset. A minute with nobody
-speaking (`voice.hang_up_after_secs`) hangs up too, and the popup closes itself. While a conversation is open, everything
-it hears is sent to Claude; the red LISTENING status shows the line is live.
+To keep music and replies at full quality, use a separate microphone (a webcam or USB
+mic) for listening: choose it in the tray's **Microphone** menu.
 
-**Talking over a reply:** say the wake phrase while Claude is thinking or speaking
-("fishsticks and custard, actually…") to stop it and ask something else. Pressing the
-talk shortcut does the same.
+## Privacy
 
-## Design notes
+- **Your voice:** speech recognition and the spoken voice both run on your computer.
+  No audio is sent anywhere.
+- **The wake phrase:** it listens locally and sends nothing until it hears the phrase.
+- **What is sent:** the text of your questions goes to the agent you chose, and through
+  it to that company, just as if you typed it into that agent yourself.
+- **Your memory file:** kept on your computer. You can read, edit or delete it.
+- **Actions:** anything that changes your computer or reaches the web is asked about
+  first, unless you've answered **ALWAYS** for it.
 
-- **Surface:** `ui.surface = "window"` (default) is a normal window, so Hyprland's
-  window rules give it border, shadow, rounding, blur, opacity and animation (see
-  `packaging/hyprland/fsc.lua`). `"layer"` is a layer-shell popup pinned to an edge or
-  corner (`ui.anchor`, `ui.margin`, `ui.margin_x`, `ui.monitor`), with its own
-  `ui.opacity` and optional `ui.gradient`. `"headless"` shows nothing: talk to it, the
-  tray icon shows the state, permission questions and typed replies arrive as
-  notifications.
-- **Theme:** panel and text colours come from your GTK theme, the accent from the
-  desktop (or the theme's selection colour; `ui.accent` pins one). Light/dark for the
-  tray icon follows `org.freedesktop.appearance color-scheme`, live.
-- **Wayland only:** GDK runs on Wayland only (layer mode needs layer-shell).
-- **Type:** 0xProto Nerd Font for body text. The status label uses a built-in 5×7
-  dot-matrix font drawn as circles.
-- **Visualiser:** chunky LED-segment bars rising from the bottom, like an old car-stereo
-  spectrum analyser (`ui.visualiser = "spectrum"`, `ui.bands`, `ui.block_percent`), or a
-  scrolling loudness history (`"loudness"`). Red while listening, white for replies.
-- **Tray icon:** a blue police box with white windows (`ui.tray_icon = "police-box"`) or a fishbone at 45°
-  (`"fishbone"`). A red dot in the corner means the mic is recording.
-- **Colour:** the accent marks state only: listening, permission questions. Errors use
-  the theme's error colour.
+## Settings
+
+The tray's **Settings…** opens [HyprCustard](https://github.com/ManofJELLO/hyprcustard) if
+you have it installed, or your settings file, `~/.config/fsc/config.toml`, in your text
+editor. If the file doesn't exist yet, it's created with every setting listed and
+commented out. Changes to the file take effect when you restart the assistant
+(`fsc quit`, then `fscd`).
+
+Some settings you might want to change:
+
+| Setting | What it does |
+|---|---|
+| `[ui] surface` | `"window"` (default) is a normal floating window. `"layer"` pins the popup to a screen edge or corner (`anchor`, `margin`). `"headless"` shows no popup: you talk to it, and questions and typed replies arrive as notifications. |
+| `[ui] tray_icon` | `"police-box"` (default) or `"fishbone"`. |
+| `[ui] visualiser` | `"spectrum"` (default) shows bars, `"loudness"` shows a level over time. |
+| `[ui] accent` | The highlight colour. By default it follows your desktop. |
+| `[ui] width`, `max_height` | The popup's size. |
+| `[voice] end_silence_ms` | How long a pause ends what you're saying. Raise it if it cuts you off mid-thought. |
+| `[voice] conversation` | Set it to `false` to stop listening again after each spoken reply. |
+| `[voice] hang_up_after_secs` | Seconds of silence before a voice conversation hangs up. |
+| `[voice] speech_rate` | How fast it talks. |
+| `[agent] session_idle_minutes` | Minutes without a message before a new conversation starts. |
+
+The full list, with explanations, is in
+`/usr/share/fishsticks-and-custard/config.example.toml`.
+
+The popup follows your GTK theme's colours and your desktop's light or dark mode.
+
+**Personality:** how the assistant talks is described in
+`~/.local/share/fsc/home/persona.md`. Edit it and press **Ctrl+N** to start a
+conversation with the change.
+
+**What Claude may do without asking:** your **ALWAYS** answers are saved in
+`~/.local/share/fsc/home/.claude/settings.local.json`. Remove an entry from its `allow`
+list to be asked again, or add one to `deny` to refuse it every time.
+
+## Troubleshooting
+
+- **No reply, or an error about signing in:** run the agent's sign-in command (see
+  [Choosing an agent](#choosing-an-agent)). The popup names the command.
+- **It doesn't hear you:** check the tray's **Microphone** menu, and that **Mute wake
+  word** isn't ticked. Run `fscd --self-test` to check the speech models.
+- **It cuts you off mid-sentence:** raise `end_silence_ms` in the `[voice]` settings.
+- **It wakes up by accident:** choose a longer or more unusual phrase with `fsc wake`.
+- **Nothing happens when you press Super+A:** check that the Hyprland lines are in your
+  config, and that the assistant is running (`fsc status`).
+- **To see what it's doing:** quit it (`fsc quit`) and start it in a terminal with
+  `fscd`. Its messages appear there.
+
+## Updating and uninstalling
+
+Updates arrive with your normal `sudo pacman -Syu`. Afterwards, restart the assistant
+with `fsc quit`, then `fscd`. If the update notes ask for new speech models, run
+`fsc fetch-models`.
+
+To uninstall, run `sudo pacman -Rns fishsticks-and-custard`. Your settings and data stay
+in `~/.config/fsc` and `~/.local/share/fsc`. Delete those folders to remove them too.
+
+---
+
+To build from source, run `cd packaging/arch && makepkg -si`. For working on the code, see
+[docs/DEVELOPING.md](docs/DEVELOPING.md).

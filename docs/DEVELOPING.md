@@ -1,0 +1,74 @@
+# Developing Fishsticks & Custard
+
+Notes for working on the code. Using the assistant is covered in the [README](../README.md).
+
+## Layout
+
+```
+crates/fsc-core   IPC protocol, config, model registry, agent sessions: Claude stream-json, ACP (no GTK)
+crates/fsc-audio  mic/speaker (cpal), Silero VAD + Piper (ONNX Runtime), whisper.cpp STT, spectrum
+crates/fsc-app    `fscd`: GTK4 popup (window or layer-shell), ksni tray, portal theme/accent watcher, socket server
+crates/fsc-cli    `fsc`: control CLI for Hyprland binds and scripts
+voice-home/       defaults seeded into ~/.local/share/fsc/home (persona + tool allow-list)
+packaging/        Hyprland snippet, example config, Arch PKGBUILD + signing key, release check
+.github/workflows CI: build, sign and publish the pacman repository
+```
+
+## How it fits together
+
+- **Claude** runs through Claude Code's stream-json mode (`claude -p`), with
+  `--permission-prompt-tool stdio` so permission questions come to the popup. Its
+  allow-list lives in the assistant home's `.claude/settings.local.json`, because
+  Claude Code ignores a folder's shared `settings.json` allow-list until the folder has
+  been trusted interactively.
+- **Codex, Antigravity, OpenCode and other ACP agents** speak the Agent Client Protocol.
+  Each session gets the persona as a system prompt. Conversations rotate to fresh
+  sessions in the same agent process.
+- **Wake phrase:** Silero VAD cuts speech into segments. Each segment is transcribed by
+  whisper on the GPU (~0.25 s), and a fuzzy match checks whether it starts with the
+  phrase. Long segments are checked after 2.5 s and dropped early if they don't start
+  with it. A trained openWakeWord model could be added later as a cheaper first stage.
+
+## Build
+
+```sh
+sudo pacman -S --needed clang vulkan-headers espeak-ng
+cargo build --release
+```
+
+The first build compiles whisper.cpp and its Vulkan shaders. On a machine that
+dislikes sustained all-core load, limit it: `CMAKE_BUILD_PARALLEL_LEVEL=4 cargo build -j 4`.
+
+Previews without running the app:
+- `fscd --dump-icons DIR` writes every tray icon variant as a PNG.
+- `FSC_VIZ_PNG=DIR cargo test -p fsc-app viz_preview -- --ignored` renders the visualiser.
+
+## Releasing
+
+First run `packaging/release/check.py`. It checks whether anything the app depends on has
+changed since the last release was tested:
+- **Agents** (claude, codex-acp, codex, agy, opencode): checks the installed version against
+  the one recorded in `packaging/release/tested.json` and against the newest upstream. If an
+  agent's version changed, its real end-to-end tests run again (`--live` reruns them all).
+- **Packages:** checks that every PKGBUILD package still exists.
+- **Crates:** shows available Rust crate updates.
+- **Models:** checks that the default speech models still download, and whether they
+  changed upstream.
+- **CI:** checks the GitHub Actions versions.
+- **Build:** runs `cargo test` and clippy.
+
+Fix anything marked FAIL and read the WARNs. Then rerun with `--record` to save what was
+tested, and commit `tested.json` with the release.
+
+Bump `version` in `Cargo.toml` and `pkgver` in `packaging/arch/PKGBUILD` (they must match),
+commit, then `git tag vX.Y.Z && git push --tags`. The `package` workflow builds, signs and
+publishes it to the `repo` release.
+
+## Screenshots
+
+The README images in `docs/images` come from a separate test instance of `fscd`, so
+they never show a real conversation. It runs under `dbus-run-session` with its own
+`XDG_CONFIG_HOME` (wake word off, `speak = "never"`) and `XDG_DATA_HOME`, a short
+`XDG_RUNTIME_DIR`, and an empty `PIPEWIRE_RUNTIME_DIR`. `fsc show` puts the popup on
+screen without taking focus. Each image is a `grim -g` capture of the window's geometry,
+with the corners rounded in ImageMagick.
