@@ -5,7 +5,7 @@
 #   cd packaging/arch && makepkg -si
 
 pkgname=fishsticks-and-custard
-pkgver=0.7.2
+pkgver=0.8.0
 pkgrel=1
 pkgdesc="Voice desktop assistant for Hyprland on Claude, Codex, Antigravity or OpenCode (wake word, push-to-talk, tray)"
 arch=(x86_64)

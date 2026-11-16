@@ -22,6 +22,11 @@ pub struct MenuState {
     /// `voice.input_device`: "" is the system's default mic.
     pub mic: String,
     pub speak: SpeakMode,
+    /// The language's code (`fsc_core::lang`).
+    pub language: &'static str,
+    /// The Piper voice in use, and one being downloaded (percent).
+    pub voice: String,
+    pub fetching: Option<(String, u32)>,
 }
 
 impl MenuState {
@@ -32,6 +37,9 @@ impl MenuState {
             choices: Choices::default(),
             mic: cfg.voice.input_device.clone(),
             speak: cfg.voice.speak,
+            language: cfg.voice.spoken().code,
+            voice: cfg.voice.voice(),
+            fetching: None,
         }
     }
 }
@@ -181,12 +189,82 @@ impl FscTray {
         .into()
     }
 
+    /// Language ▸ each language, in its own name.
+    fn language_menu(&self) -> MenuItem<Self> {
+        let langs = &fsc_core::lang::LANGUAGES;
+        let selected = langs.iter().position(|l| l.code == self.menu.language).unwrap_or(0);
+        SubMenu {
+            label: format!("Language: {}", langs[selected].native),
+            icon_name: "preferences-desktop-locale-symbolic".into(),
+            submenu: vec![
+                RadioGroup {
+                    selected,
+                    select: Box::new(|t: &mut Self, i: usize| {
+                        if let Some(l) = fsc_core::lang::LANGUAGES.get(i) {
+                            t.send(Command::Language { code: Some(l.code.into()) });
+                        }
+                    }),
+                    options: langs
+                        .iter()
+                        .map(|l| RadioItem {
+                            label: if l.native == l.name { l.native.into() } else { format!("{} · {}", l.native, l.name) },
+                            ..Default::default()
+                        })
+                        .collect(),
+                }
+                .into(),
+            ],
+            ..Default::default()
+        }
+        .into()
+    }
+
+    /// Voice ▸ the language's voices; ones still to download say how big.
+    fn voice_menu(&self) -> MenuItem<Self> {
+        let m = &self.menu;
+        let mut keys: Vec<String> = fsc_core::voices::for_language(m.language).map(|v| v.key.to_string()).collect();
+        if !keys.contains(&m.voice) {
+            keys.push(m.voice.clone()); // set by hand in config.toml
+        }
+        let fetching = |key: &str| m.fetching.as_ref().filter(|(v, _)| v == key).map(|(_, pct)| *pct);
+        let label = |key: &str| -> String {
+            let info = fsc_core::voices::find(key);
+            let name = info.map(|v| v.label.to_string()).unwrap_or_else(|| key.to_string());
+            match (fetching(key), info) {
+                (Some(pct), _) => format!("{name} · downloading {pct}%"),
+                (None, Some(v)) if !fsc_core::models::has_voice(key) => format!("{name} · {} MB", v.mb),
+                _ => name,
+            }
+        };
+        let selected = keys.iter().position(|k| *k == m.voice).unwrap_or(0);
+        let title = label(&m.voice);
+        let options = keys.iter().map(|k| RadioItem { label: menu_label(&label(k)), ..Default::default() }).collect();
+        SubMenu {
+            label: format!("Voice: {}", menu_label(&title)),
+            icon_name: "audio-speakers-symbolic".into(),
+            submenu: vec![
+                RadioGroup {
+                    selected,
+                    select: Box::new(move |t: &mut Self, i: usize| {
+                        if let Some(k) = keys.get(i) {
+                            t.send(Command::Voice { name: Some(k.clone()) });
+                        }
+                    }),
+                    options,
+                }
+                .into(),
+            ],
+            ..Default::default()
+        }
+        .into()
+    }
+
     /// Speak replies ▸ When I talk / Always / Never.
     fn speak_menu(&self) -> MenuItem<Self> {
         let selected = SpeakMode::ALL.iter().position(|&m| m == self.menu.speak).unwrap_or(0);
         SubMenu {
             label: format!("Speak replies: {}", self.menu.speak.name()),
-            icon_name: "audio-speakers-symbolic".into(),
+            icon_name: "audio-volume-high-symbolic".into(),
             submenu: vec![
                 RadioGroup {
                     selected,
@@ -265,6 +343,8 @@ impl ksni::Tray for FscTray {
             .into(),
             self.mic_menu(),
             self.speak_menu(),
+            self.language_menu(),
+            self.voice_menu(),
             MenuItem::Separator,
             self.agent_menu(),
             self.choice_menu("Model", self.menu.choices.model.as_ref(), |v| Command::Model { value: Some(v) }),

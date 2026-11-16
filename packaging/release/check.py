@@ -247,6 +247,26 @@ def check_models(tested, now):
             report("OK", "models", label)
 
 
+def check_voices():
+    """Every voice the Voice menu offers (crates/fsc-core/src/voices.rs) is
+    still in Piper's catalogue, with one speaker."""
+    section("Piper voices (Voice menu)")
+    keys = re.findall(r'key: "([^"]+)"', (ROOT / "crates/fsc-core/src/voices.rs").read_text())
+    try:
+        catalogue = json.loads(get("https://huggingface.co/rhasspy/piper-voices/resolve/main/voices.json", timeout=60))
+    except Exception as e:
+        report("WARN", "voices", f"couldn't fetch voices.json: {e}")
+        return
+    gone = [k for k in keys if k not in catalogue]
+    multi = [k for k in keys if k in catalogue and catalogue[k].get("num_speakers", 1) != 1]
+    for k in gone:
+        report("FAIL", "voices", f"{k} is no longer in voices.json; drop it from voices.rs (and lang.rs if it's a default)")
+    for k in multi:
+        report("WARN", "voices", f"{k} now has several speakers")
+    if not gone and not multi:
+        report("OK", "voices", f"all {len(keys)} voices listed")
+
+
 def check_actions():
     section("GitHub Actions")
     uses = set()
@@ -286,6 +306,7 @@ def main():
     check_packages()
     check_crates()
     check_models(tested, now)
+    check_voices()
     check_actions()
 
     fails = [r for r in results if r[0] == "FAIL"]

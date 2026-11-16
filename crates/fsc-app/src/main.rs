@@ -32,6 +32,9 @@ pub enum AppEvent {
     Theme(ThemeMode),
     /// The desktop's accent colour changed (`None`: it has none).
     Accent(Option<Rgb>),
+    /// A voice download moved on: `Ok(Some(percent))` while it runs,
+    /// `Ok(None)` when it's done, `Err` if it failed.
+    VoiceFetch { voice: String, progress: Result<Option<u32>, String> },
 }
 
 const APP_ID: &str = "dev.fsc.FishsticksAndCustard";
@@ -125,6 +128,7 @@ fn main() -> Result<()> {
 
     {
         let ui_cell = ui_cell.clone();
+        let ev_tx = ev_tx.clone();
         app.connect_activate(move |app| {
             // Activated once at startup; a second fscd toggles us over the
             // control socket instead (see above).
@@ -144,6 +148,7 @@ fn main() -> Result<()> {
                 claude.clone(),
                 audio.clone(),
                 tray_tx.clone(),
+                ev_tx.clone(),
             );
             *ui_cell.borrow_mut() = Some(ui.clone());
 

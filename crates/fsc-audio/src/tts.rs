@@ -5,7 +5,7 @@
 //! The id sequence follows Piper: BOS, PAD, then each phoneme followed by
 //! PAD, then EOS.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use ort::session::Session;
 use ort::value::Tensor;
 use serde::Deserialize;
@@ -107,17 +107,19 @@ impl Tts {
     }
 
     fn infer(&mut self, ids: Vec<i64>) -> Result<Vec<f32>> {
-        if self.voice.num_speakers > 1 {
-            bail!("multi-speaker piper voices are not supported yet");
-        }
         let n = ids.len();
         let inf = &self.voice.inference;
         let scales = vec![inf.noise_scale, inf.length_scale / self.rate, inf.noise_w];
-        let outputs = self.session.run(ort::inputs![
-            "input" => Tensor::from_array(([1usize, n], ids))?,
-            "input_lengths" => Tensor::from_array(([1usize], vec![n as i64]))?,
-            "scales" => Tensor::from_array(([3usize], scales))?,
-        ])?;
+        let input = Tensor::from_array(([1usize, n], ids))?;
+        let lengths = Tensor::from_array(([1usize], vec![n as i64]))?;
+        let scales = Tensor::from_array(([3usize], scales))?;
+        // A voice with several speakers speaks as its first.
+        let outputs = if self.voice.num_speakers > 1 {
+            let sid = Tensor::from_array(([1usize], vec![0i64]))?;
+            self.session.run(ort::inputs!["input" => input, "input_lengths" => lengths, "scales" => scales, "sid" => sid])?
+        } else {
+            self.session.run(ort::inputs!["input" => input, "input_lengths" => lengths, "scales" => scales])?
+        };
         let (_, pcm) = outputs[0].try_extract_tensor::<f32>()?;
         Ok(pcm.iter().map(|s| s.clamp(-1.0, 1.0)).collect())
     }

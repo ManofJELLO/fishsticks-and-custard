@@ -23,14 +23,15 @@ pub enum Lead {
     Any(usize),
 }
 
-/// Words people put before a name when they call it.
-const FILLERS: &[&str] = &[
-    "hey", "hi", "hello", "hiya", "oi", "yo", "ok", "okay", "oh", "um", "umm", "uh", "uhh", "er", "erm", "ah",
-    "eh", "hm", "hmm", "mm", "so", "right", "alright", "well", "now", "there", "please",
-];
-
-fn is_filler(word: &str) -> bool {
-    FILLERS.contains(&word)
+/// Words people put before a name when they call it: English's (the usual
+/// phrase is English, and "hey" is everywhere) and the spoken language's.
+/// Not every language's: Polish "no" or Czech "to" before the phrase would
+/// wake it in an English sentence.
+fn is_filler(word: &str, language: &str) -> bool {
+    ["en", language]
+        .iter()
+        .filter_map(|c| fsc_core::lang::find(c))
+        .any(|l| l.wake_fillers.contains(&word))
 }
 
 /// Letters a wake phrase needs: shorter ones match ordinary speech.
@@ -75,19 +76,20 @@ fn max_edits(len: usize) -> usize {
 /// If `text` starts with the wake phrase (after a few fillers at most),
 /// returns whatever follows it (possibly empty). `None` if it doesn't.
 pub fn match_wake(text: &str, phrase: &str) -> Option<String> {
-    match_after(text, phrase, Lead::Fillers)
+    match_after(text, phrase, Lead::Fillers, "en")
 }
 
 /// `match_wake` with `lead` deciding what may come before the phrase.
-pub fn match_wake_after(text: &str, phrase: &str, lead: Lead) -> Option<String> {
-    match_after(text, phrase, lead)
+/// `language`: whose fillers may come before the phrase, besides English's.
+pub fn match_wake_after(text: &str, phrase: &str, lead: Lead, language: &str) -> Option<String> {
+    match_after(text, phrase, lead, language)
 }
 
 /// Whether `text` ends partway into the phrase ("hey, uh... fishsticks
 /// and" for "fishsticks and custard"), so it may still be being said.
 pub fn could_start(text: &str, phrase: &str) -> bool {
-    let target: Vec<char> = normalize(phrase).split_whitespace().flat_map(str::chars).collect();
-    let words: Vec<String> = normalize(text).split_whitespace().map(String::from).collect();
+    let target: Vec<char> = sound(&normalize(phrase).split_whitespace().collect::<String>()).chars().collect();
+    let words: Vec<String> = normalize(text).split_whitespace().map(sound).collect();
     let mut tail = String::new();
     for w in words.iter().rev().take(4) {
         tail.insert_str(0, w);
@@ -113,11 +115,11 @@ pub fn could_start(text: &str, phrase: &str) -> bool {
 /// Whether the phrase appears anywhere in `text`. Used to recognise our
 /// own voice saying it, picked up by the mic.
 pub fn mentions(text: &str, phrase: &str) -> bool {
-    match_after(text, phrase, Lead::Any(usize::MAX)).is_some()
+    match_after(text, phrase, Lead::Any(usize::MAX), "en").is_some()
 }
 
-fn match_after(text: &str, phrase: &str, lead: Lead) -> Option<String> {
-    let target: String = normalize(phrase).split_whitespace().collect();
+fn match_after(text: &str, phrase: &str, lead: Lead, language: &str) -> Option<String> {
+    let target: String = sound(&normalize(phrase).split_whitespace().collect::<String>());
     if target.is_empty() {
         return None;
     }
@@ -136,22 +138,31 @@ fn match_after(text: &str, phrase: &str, lead: Lead) -> Option<String> {
         Lead::Any(n) => n,
     };
     for start in 0..=max_leading.min(words.len()) {
-        if lead == Lead::Fillers && start > 0 && !is_filler(&words[start - 1].0) {
+        if lead == Lead::Fillers && start > 0 && !is_filler(&words[start - 1].0, language) {
             break;
         }
         // The phrase must start here: without this, a short word before it
         // ("dad", "well") fits in the edit budget and slips through.
         if let Some((first, _)) = words.get(start) {
-            let n = first.chars().count().min(target.chars().count());
-            let head: String = target.chars().take(n).collect();
-            if levenshtein(first, &head) > (n / 3).max(1) {
+            let first = sound(first);
+            let tchars: Vec<char> = target.chars().collect();
+            let n = first.chars().count().min(tchars.len());
+            // Against phrase beginnings of about the same length, so a
+            // dropped or extra letter ("fistiks") still lines up. Not for
+            // short words, which would then pass ("of" against "f").
+            let slack = if n >= 5 { 2 } else { 0 };
+            let close = (n.saturating_sub(slack)..=(n + slack).min(tchars.len())).any(|m| {
+                let head: String = tchars[..m].iter().collect();
+                levenshtein(&first, &head) <= (n / 3).max(1)
+            });
+            if !close {
                 continue;
             }
         }
         let mut best: Option<(usize, usize)> = None; // (edits, end)
         let mut joined = String::new();
         for (end, (w, _)) in words.iter().enumerate().skip(start).take(6) {
-            joined.push_str(w);
+            joined.push_str(&sound(w));
             let d = levenshtein(&joined, &target);
             if d <= max_edits && best.is_none_or(|(bd, _)| d < bd) {
                 best = Some((d, end + 1));
@@ -184,6 +195,12 @@ fn normalize(s: &str) -> String {
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect()
+}
+
+/// Spellings that sound alike made alike, so whisper's guesses at a made-up
+/// word ("Fistix", "Fischsticks") are judged by how they sound.
+fn sound(s: &str) -> String {
+    s.replace("sch", "sh").replace("ck", "k").replace("ph", "f").replace('x', "ks").replace('ß', "ss")
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -265,7 +282,7 @@ mod tests {
     fn more_leading_words_when_allowed() {
         let s = "and then they went home. Fishsticks and custard, play some music";
         assert_eq!(match_wake(s, P), None);
-        assert_eq!(match_wake_after(s, P, Lead::Any(6)).as_deref(), Some("play some music"));
+        assert_eq!(match_wake_after(s, P, Lead::Any(6), "en").as_deref(), Some("play some music"));
     }
 
     #[test]
@@ -309,5 +326,25 @@ mod tests {
         assert!(check_phrase("one two three four five six").is_err());
         assert_eq!(spelling("fishsticks and custard"), "Fishsticks And Custard");
         assert_eq!(spelling("fishsticks"), "Fishsticks");
+    }
+
+    #[test]
+    fn spellings_that_sound_alike() {
+        let p = "fishsticks and custard";
+        for heard in ["Fistix and Custard. Wie spät ist es?", "Fischstix and Custard.", "Fishtix and Custard, hi"] {
+            assert!(match_wake(heard, p).is_some(), "{heard:?}");
+        }
+        assert_eq!(match_wake("Fistix and Custard. Wie spät ist es?", p).as_deref(), Some("Wie spät ist es?"));
+        assert!(match_wake("we had fish sticks and custard for tea", p).is_none());
+        assert!(could_start("Hey, Fistix and", p));
+        assert!(match_wake("Of fishsticks and custard, what's on?", p).is_none());
+    }
+
+    #[test]
+    fn fillers_follow_the_language() {
+        let p = "fishsticks and custard";
+        // Polish "no" isn't an English filler...
+        assert!(match_wake("No fishsticks and custard tonight", p).is_none());
+        assert!(match_wake_after("No, fishsticks and custard, która godzina?", p, Lead::Fillers, "pl").is_some());
     }
 }

@@ -63,6 +63,9 @@ pub enum AudioEvent {
     NobodySpoke,
     SpeakingStarted,
     SpeakingDone,
+    /// After `set_language`: whether `voice` loaded (`false`: it isn't
+    /// downloaded, or is broken; replies aren't spoken meanwhile).
+    Voice { voice: String, ok: bool },
     /// The wake phrase was heard. `command` is anything said right after it
     /// in the same breath ("fishsticks and custard, what time is it?").
     Wake { command: Option<String> },
@@ -90,6 +93,9 @@ enum Cmd {
     WakePhrase(String),
     /// Use another microphone (`voice.input_device`) from now on.
     InputDevice(String),
+    /// Hear `whisper` (a language code or "auto") and speak with Piper
+    /// voice `voice` from now on.
+    Language { whisper: String, voice: String },
 }
 
 #[derive(Clone)]
@@ -131,6 +137,12 @@ impl AudioHandle {
     /// Use another microphone: a substring of its name, "" for the system's.
     pub fn set_input_device(&self, name: impl Into<String>) {
         let _ = self.tx.send(Cmd::InputDevice(name.into()));
+    }
+    /// Recognise `whisper` and speak with `voice` (reloaded if it changed,
+    /// or if it failed to load before: say once it's downloaded). Answered
+    /// with `AudioEvent::Voice`.
+    pub fn set_language(&self, whisper: impl Into<String>, voice: impl Into<String>) {
+        let _ = self.tx.send(Cmd::Language { whisper: whisper.into(), voice: voice.into() });
     }
 }
 
@@ -225,6 +237,8 @@ struct WakeDetector {
     generation: u64,
     /// Transcriptions in flight, oldest first.
     jobs: VecDeque<Job>,
+    /// An early check heard the phrase at the start of this segment.
+    heard: bool,
 }
 
 #[derive(Default, PartialEq)]
@@ -243,11 +257,15 @@ struct Job {
     /// The finished segment, rather than an early look at one in progress.
     done: bool,
     lead: wake::Lead,
-    rx: mpsc::Receiver<String>,
+    /// An early check of this segment had already heard the phrase.
+    heard: bool,
+    /// What was heard in the wake phrase's language, and, for a finished
+    /// segment with a command after the phrase in another language, in that.
+    rx: mpsc::Receiver<(String, Option<String>)>,
 }
 
 impl WakeDetector {
-    fn feed(&mut self, fresh: &[f32], vad: &mut Vad, stt: &Arc<Stt>, end_silence: usize, max_len: usize) {
+    fn feed(&mut self, fresh: &[f32], vad: &mut Vad, stt: &Arc<Stt>, end_silence: usize, max_len: usize, phrase: &str) {
         self.pending.extend_from_slice(fresh);
         while self.pending.len() >= CHUNK {
             let chunk: Vec<f32> = self.pending.drain(..CHUNK).collect();
@@ -273,7 +291,7 @@ impl WakeDetector {
                         let seg = self.seg.take().unwrap_or_default();
                         self.onset.reset();
                         self.check = Check::Done;
-                        self.transcribe(stt, seg, true);
+                        self.transcribe(stt, seg, true, phrase);
                     } else if let Check::Due(at) = self.check
                         && seg.len() >= at
                         && self.jobs.is_empty()
@@ -282,7 +300,7 @@ impl WakeDetector {
                         // (CPU) whisper, early checks wait rather than pile up.
                         let seg = seg.clone();
                         self.check = Check::Waiting;
-                        self.transcribe(stt, seg, false);
+                        self.transcribe(stt, seg, false, phrase);
                     }
                 }
             }
@@ -294,37 +312,67 @@ impl WakeDetector {
         self.silence = 0;
         self.check = Check::Due(check_at);
         self.lead = lead;
+        self.heard = false;
         self.generation += 1;
     }
 
-    fn transcribe(&mut self, stt: &Arc<Stt>, audio: Vec<f32>, done: bool) {
+    fn transcribe(&mut self, stt: &Arc<Stt>, audio: Vec<f32>, done: bool, phrase: &str) {
         let (tx, rx) = mpsc::channel();
         let stt = stt.clone();
+        let (lead, heard_early, phrase) = (self.lead, self.heard, phrase.to_string());
         let spawned = std::thread::Builder::new()
             .name("fsc-wake-stt".into())
             .spawn(move || {
-                let _ = tx.send(stt.transcribe(&audio).unwrap_or_default());
+                let text = stt.transcribe_wake(&audio).unwrap_or_default();
+                // Woken with a command in another language than the phrase:
+                // hear the command in its own (here, off the audio thread).
+                let command = done
+                    && stt.wake_differs()
+                    && (heard_early
+                        || wake::match_wake_after(&text, &phrase, lead, &stt.language())
+                            .is_some_and(|r| !r.trim().is_empty()));
+                let main = command.then(|| stt.transcribe(&audio).unwrap_or_default());
+                let _ = tx.send((text, main));
             });
         match spawned {
-            Ok(_) => self.jobs.push_back(Job { generation: self.generation, done, lead: self.lead, rx }),
+            Ok(_) => self.jobs.push_back(Job { generation: self.generation, done, lead: self.lead, heard: self.heard, rx }),
             Err(e) => eprintln!("fsc: could not start wake transcription: {e}"),
         }
     }
 
     /// Collect finished transcriptions. Returns (what was heard, what followed
     /// the phrase) once a finished segment starts with the wake phrase.
-    fn poll(&mut self, phrase: &str) -> Option<(String, String)> {
+    fn poll(&mut self, phrase: &str, language: &str) -> Option<(String, String)> {
         while let Some(job) = self.jobs.front() {
-            let heard = match job.rx.try_recv() {
-                Ok(text) => text,
+            let (heard, main) = match job.rx.try_recv() {
+                Ok(r) => r,
                 Err(mpsc::TryRecvError::Empty) => return None,
-                Err(mpsc::TryRecvError::Disconnected) => String::new(),
+                Err(mpsc::TryRecvError::Disconnected) => (String::new(), None),
             };
             let Some(job) = self.jobs.pop_front() else { break };
-            let hit = wake::match_wake_after(&heard, phrase, job.lead);
+            let hit = wake::match_wake_after(&heard, phrase, job.lead, language);
+            if std::env::var_os("FSC_TRACE_WAKE").is_some() {
+                eprintln!("TRACE done={} gen={}/{} lead={:?} {heard:?} -> {hit:?}", job.done, job.generation, self.generation, job.lead);
+            }
             if job.done {
+                // The command as said, when it was heard again in its own
+                // language: after the phrase if whisper kept that, else all.
+                let command = |rest: String| match &main {
+                    Some(m) => wake::match_wake_after(m, phrase, wake::Lead::Any(usize::MAX), language)
+                        .unwrap_or_else(|| m.clone()),
+                    None => rest,
+                };
                 if let Some(rest) = hit {
-                    return Some((heard, rest));
+                    return Some((heard, command(rest)));
+                }
+                if job.heard && let Some(m) = main {
+                    // The early look heard the phrase but the whole segment's
+                    // transcript lost it: whisper can leave out a phrase in
+                    // another language than it's set to. Only then (`main`
+                    // is heard only when the languages differ); otherwise the
+                    // finished transcript has the last word, as a late
+                    // correction of a loose early match.
+                    return Some((heard, m));
                 }
                 continue;
             }
@@ -338,6 +386,7 @@ impl WakeDetector {
                 // further in by then.
                 self.check = Check::Done;
                 self.lead = wake::Lead::Any(usize::MAX);
+                self.heard = true;
             } else if wake::could_start(&heard, phrase) {
                 // Maybe mid-phrase ("hey, uh... fishsticks and"): look again later.
                 self.check = Check::Due(seg.len() + RECHECK);
@@ -364,8 +413,8 @@ fn detect_wake(
 ) -> Option<(String, String)> {
     let end_silence = cfg.end_silence_ms as usize * MIC_RATE as usize / 1000;
     let max_len = cfg.max_utterance_secs as usize * MIC_RATE as usize;
-    det.feed(fresh, vad, stt, end_silence, max_len);
-    det.poll(&cfg.wake_phrase)
+    det.feed(fresh, vad, stt, end_silence, max_len, &cfg.wake_phrase);
+    det.poll(&cfg.wake_phrase, &stt.language())
 }
 
 /// Audio kept from before speech starts.
@@ -407,6 +456,10 @@ struct Engine<F> {
     vad: Option<Vad>,
     stt: Option<Arc<Stt>>,
     tts: Option<Tts>,
+    /// The Piper voice `tts` is (or was meant to be).
+    voice: String,
+    /// Kept to load another voice later.
+    env: Option<ort::environment::Environment>,
     listening: Option<Listening>,
     held: Option<Held>,
     watching: Option<Watching>,
@@ -461,6 +514,8 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             vad: None,
             stt: None,
             tts: None,
+            voice: String::new(),
+            env: None,
             listening: None,
             held: None,
             watching: None,
@@ -491,18 +546,12 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                 Ok(v) => self.vad = Some(v),
                 Err(e) => eprintln!("fsc: VAD unavailable: {e:#}"),
             }
-            match Tts::load(
-                env,
-                &models::piper_path(&self.cfg),
-                &models::piper_config_path(&self.cfg),
-                self.cfg.speech_rate,
-            ) {
-                Ok(t) => self.tts = Some(t),
-                Err(e) => eprintln!("fsc: TTS unavailable: {e:#}"),
-            }
         }
+        self.env = env;
+        self.voice = self.cfg.voice();
+        self.load_voice();
         let t0 = Instant::now();
-        match Stt::load(&models::whisper_path(&self.cfg), &self.cfg.language, self.cfg.gpu, &self.cfg.wake_phrase) {
+        match Stt::load(&models::whisper_path(&self.cfg), &self.cfg.spoken().whisper, self.cfg.gpu, &self.cfg.wake_phrase) {
             Ok(s) => {
                 // Warm up: the first run compiles GPU shaders.
                 let _ = s.transcribe(&[0.0; MIC_RATE as usize]);
@@ -516,6 +565,24 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             tts: self.tts.is_some(),
             missing_models: missing,
         });
+    }
+
+    /// Load `self.voice` (none if it isn't downloaded).
+    fn load_voice(&mut self) {
+        self.tts = None;
+        let Some(env) = &self.env else { return };
+        if !models::has_voice(&self.voice) {
+            eprintln!("fsc: voice {} isn't downloaded", self.voice);
+            return;
+        }
+        let t0 = Instant::now();
+        match Tts::load(env, &models::piper_path(&self.voice), &models::piper_config_path(&self.voice), self.cfg.speech_rate) {
+            Ok(t) => {
+                eprintln!("fsc: voice {} ready in {:.1}s", self.voice, t0.elapsed().as_secs_f32());
+                self.tts = Some(t);
+            }
+            Err(e) => eprintln!("fsc: TTS unavailable: {e:#}"),
+        }
     }
 
     fn run(mut self, rx: mpsc::Receiver<Cmd>) {
@@ -625,6 +692,18 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                     stt.set_wake_phrase(&phrase);
                 }
                 self.cfg.wake_phrase = phrase;
+            }
+            Cmd::Language { whisper, voice } => {
+                eprintln!("fsc: language {whisper}, voice {voice}");
+                if let Some(stt) = &self.stt {
+                    stt.set_language(&whisper);
+                }
+                if voice != self.voice || self.tts.is_none() {
+                    self.stop_speaking();
+                    self.voice = voice;
+                    self.load_voice();
+                }
+                (self.emit)(AudioEvent::Voice { voice: self.voice.clone(), ok: self.tts.is_some() });
             }
             Cmd::InputDevice(name) => {
                 eprintln!("fsc: microphone is now {:?}", if name.is_empty() { "the system default" } else { &name });
@@ -1048,11 +1127,12 @@ pub fn self_test(cfg: &VoiceConfig) -> anyhow::Result<()> {
     println!("vad      loaded in {:.2}s", t.elapsed().as_secs_f32());
 
     let t = Instant::now();
-    let mut tts = Tts::load(&env, &models::piper_path(cfg), &models::piper_config_path(cfg), cfg.speech_rate)?;
+    let voice = cfg.voice();
+    let mut tts = Tts::load(&env, &models::piper_path(&voice), &models::piper_config_path(&voice), cfg.speech_rate)?;
     println!("piper    loaded in {:.2}s", t.elapsed().as_secs_f32());
 
     let t = Instant::now();
-    let stt = Stt::load(&models::whisper_path(cfg), &cfg.language, cfg.gpu, &cfg.wake_phrase)?;
+    let stt = Stt::load(&models::whisper_path(cfg), &cfg.spoken().whisper, cfg.gpu, &cfg.wake_phrase)?;
     println!("whisper  loaded in {:.2}s (gpu: {})", t.elapsed().as_secs_f32(), cfg.gpu);
 
     let sentence = "Fishsticks and custard. What is the weather like in London today?";
@@ -1120,16 +1200,111 @@ pub fn self_test(cfg: &VoiceConfig) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// ONNX Runtime is set up once per process, so the tests share it.
+    fn test_env() -> &'static ort::environment::Environment {
+        static ENV: std::sync::OnceLock<ort::environment::Environment> = std::sync::OnceLock::new();
+        ENV.get_or_init(|| ort::init().with_name("fsc-test").build().unwrap())
+    }
+
+    /// Each language's voice says a few things; whisper, set to that
+    /// language, must hear them back, and the answers must read right. Then
+    /// the English wake phrase with a German question. Downloads the voices.
+    /// `cargo test -p fsc-audio --release -- --ignored --nocapture languages_`
+    #[test]
+    #[ignore]
+    fn languages_round_trip() {
+        use fsc_core::lang;
+        use fsc_core::permission::{Answer, parse_answer};
+        let env = test_env();
+        let base = VoiceConfig::default();
+        let stt = Arc::new(Stt::load(&models::whisper_path(&base), "en", base.gpu, &base.wake_phrase).unwrap());
+        let fetch = |voice: &str| {
+            for m in models::voice_files(voice) {
+                if !m.path.exists() {
+                    models::download(&m, |_, _| {}).unwrap_or_else(|e| panic!("{voice}: {e:#}"));
+                }
+            }
+        };
+        let say = |tts: &mut Tts, text: &str| {
+            let pcm = tts.synth(text).unwrap();
+            let mut rs = io::Resampler::new(tts.sample_rate(), MIC_RATE);
+            let mut out = Vec::new();
+            rs.push(&pcm, &mut out);
+            out
+        };
+        let only: Option<String> = std::env::var("FSC_TEST_LANGS").ok();
+        let mut failures: Vec<String> = Vec::new();
+        for l in &lang::LANGUAGES {
+            if only.as_ref().is_some_and(|o| !o.split(',').any(|c| c == l.code)) {
+                continue;
+            }
+            let voice = l.voice(if l.code == "pt" { "PT" } else { "" });
+            fetch(voice);
+            let mut tts = Tts::load(env, &models::piper_path(voice), &models::piper_config_path(voice), 1.0).unwrap();
+            stt.set_language(l.code);
+            let heard = |tts: &mut Tts, text: &str| stt.transcribe(&say(tts, text)).unwrap();
+            let sample = heard(&mut tts, l.phrases.sample);
+            let yes = heard(&mut tts, &format!("{}.", l.answers.consent[0]));
+            let always = heard(&mut tts, &format!("{}, {}.", l.answers.consent[0], l.answers.always.last().unwrap()));
+            let no = heard(&mut tts, &format!("{}.", l.answers.deny[0]));
+            let q = heard(&mut tts, &l.question(lang::AskKind::Command, ""));
+            eprintln!("{} {voice}\n  sample {sample:?}\n  yes {yes:?} always {always:?} no {no:?}\n  question {q:?}", l.code);
+            // One synthetic word is a harsh test (Piper varies each take, and
+            // whisper invents things for very short clips), so a miss is
+            // reported, not failed: the question is asked again in real use.
+            for (what, text, want) in [("yes", &yes, Answer::Once), ("always", &always, Answer::Always), ("no", &no, Answer::Deny)] {
+                let got = parse_answer(text, l);
+                if got != Some(want) {
+                    eprintln!("  WEAK {what}: heard {text:?} -> {got:?}");
+                }
+            }
+        }
+        // The English wake phrase, then German, heard as German.
+        if only.as_ref().is_none_or(|o| o.contains("wake")) {
+            let de = lang::find("de").unwrap();
+            fetch(de.voice(""));
+            let mut alan = Tts::load(env, &models::piper_path("en_GB-alan-medium"), &models::piper_config_path("en_GB-alan-medium"), 1.0).unwrap();
+            let mut thorsten = Tts::load(env, &models::piper_path(de.voice("")), &models::piper_config_path(de.voice("")), 1.0).unwrap();
+            stt.set_language("de");
+            let mut cfg = base.clone();
+            cfg.language = "de".into();
+            let mut audio = say(&mut alan, "Fishsticks and custard,");
+            audio.extend(say(&mut thorsten, "wie spät ist es?"));
+            audio.extend(vec![0.0f32; MIC_RATE as usize * 2]);
+            let mut vad = Vad::load(env, &models::vad_path()).unwrap();
+            let mut det = WakeDetector::default();
+            let mut hit = None;
+            for c in audio.chunks(MIC_RATE as usize / 50) {
+                std::thread::sleep(Duration::from_millis(20));
+                if let Some(h) = detect_wake(&mut det, c, &mut vad, &stt, &cfg) {
+                    hit = Some(h);
+                    break;
+                }
+            }
+            let t = Instant::now();
+            while hit.is_none() && t.elapsed() < Duration::from_secs(20) && !det.jobs.is_empty() {
+                std::thread::sleep(Duration::from_millis(20));
+                hit = det.poll(&cfg.wake_phrase, "de");
+            }
+            eprintln!("wake (de): {hit:?}");
+            if hit.is_none() {
+                failures.push("the English wake phrase wasn't heard with language de".into());
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
     /// Speech from Piper through the wake detector, as the mic would deliver
     /// it. Needs the models: `cargo test -p fsc-audio --release -- --ignored wake_`.
     #[test]
     #[ignore]
     fn wake_detector_end_to_end() {
         let cfg = VoiceConfig::default();
-        let env = ort::init().with_name("fsc-test").build().unwrap();
-        let mut vad = Vad::load(&env, &models::vad_path()).unwrap();
-        let mut tts = Tts::load(&env, &models::piper_path(&cfg), &models::piper_config_path(&cfg), 1.0).unwrap();
-        let stt = Arc::new(Stt::load(&models::whisper_path(&cfg), &cfg.language, cfg.gpu, &cfg.wake_phrase).unwrap());
+        let env = test_env();
+        let mut vad = Vad::load(env, &models::vad_path()).unwrap();
+        let voice = cfg.voice();
+        let mut tts = Tts::load(env, &models::piper_path(&voice), &models::piper_config_path(&voice), 1.0).unwrap();
+        let stt = Arc::new(Stt::load(&models::whisper_path(&cfg), &cfg.spoken().whisper, cfg.gpu, &cfg.wake_phrase).unwrap());
         let say = |tts: &mut Tts, text: &str| {
             let pcm = tts.synth(text).unwrap();
             let mut rs = io::Resampler::new(tts.sample_rate(), MIC_RATE);
@@ -1152,7 +1327,7 @@ mod tests {
             // Let the last transcriptions finish.
             while t.elapsed() < Duration::from_secs(20) && !det.jobs.is_empty() {
                 std::thread::sleep(Duration::from_millis(20));
-                if let Some(hit) = det.poll(&cfg.wake_phrase) {
+                if let Some(hit) = det.poll(&cfg.wake_phrase, "en") {
                     return Some(hit);
                 }
             }

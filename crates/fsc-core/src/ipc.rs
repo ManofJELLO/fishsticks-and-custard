@@ -59,6 +59,12 @@ pub enum Command {
     /// Open the settings: HyprCustard when it's installed, otherwise the
     /// config file in the desktop's editor.
     Settings,
+    /// Speak and listen in another language (a `lang` code; "" or "default"
+    /// follows the desktop's), or list them (`None`). Saved.
+    Language { code: Option<String> },
+    /// Speak with another Piper voice ("" or "default": the language's
+    /// usual one), or list the language's voices (`None`). Saved.
+    Voice { name: Option<String> },
     Quit,
 }
 

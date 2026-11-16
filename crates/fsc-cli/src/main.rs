@@ -87,6 +87,16 @@ enum Cmd {
     },
     /// Open the settings (HyprCustard if installed, else config.toml)
     Settings,
+    /// List the languages, or speak and listen in another (saved in config.toml)
+    Language {
+        /// A code from the list (de, fr, ...); `default` follows your desktop's
+        code: Option<String>,
+    },
+    /// List the language's voices, or speak with another (downloaded if need be; saved)
+    Voice {
+        /// A name from the list (de_DE-thorsten-medium); `default` for the language's usual one
+        name: Option<String>,
+    },
     /// Quit the daemon
     Quit,
     /// Download any missing speech models (whisper, silero VAD, piper voice)
@@ -151,6 +161,8 @@ fn main() -> ExitCode {
             .into()),
         },
         Cmd::Settings => Command::Settings,
+        Cmd::Language { code } => Command::Language { code },
+        Cmd::Voice { name } => Command::Voice { name },
         Cmd::Quit => Command::Quit,
     };
 

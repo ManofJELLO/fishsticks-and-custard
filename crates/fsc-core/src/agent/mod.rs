@@ -134,6 +134,7 @@ impl AgentHandle {
     where
         F: Fn(AgentEvent) + Send + Sync + 'static,
     {
+        *LANGUAGE.lock().unwrap_or_else(|e| e.into_inner()) = cfg.voice.spoken().instruction();
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(run(cfg.clone(), home, rx, emit));
         Self { tx }
@@ -180,7 +181,17 @@ impl AgentHandle {
     pub fn set(&self, which: Setting, value: impl Into<String>) {
         let _ = self.tx.send(Req::Set { which, value: value.into() });
     }
+
+    /// What every session from now on is told about the user's language
+    /// (`lang::Language::instruction`); `None` for nothing.
+    pub fn set_language(&self, instruction: Option<String>) {
+        *LANGUAGE.lock().unwrap_or_else(|e| e.into_inner()) = instruction;
+    }
 }
+
+/// See `AgentHandle::set_language`. Kept here, not per session, so it
+/// carries over agent switches.
+static LANGUAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// What a backend makes of the agent's output.
 #[derive(Debug)]
@@ -272,9 +283,14 @@ pub fn ensure_home(home: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// persona.md plus remembered facts, fresh for each session.
+/// persona.md plus remembered facts (and the user's language, when it isn't
+/// English), fresh for each session.
 fn session_prompt(home: &Path, memory: bool) -> String {
     let persona = std::fs::read_to_string(home.join("persona.md")).unwrap_or_else(|_| PERSONA.to_string());
+    let persona = match LANGUAGE.lock().unwrap_or_else(|e| e.into_inner()).as_deref() {
+        Some(note) => format!("{}\n\n## Language\n\n{note}\n", persona.trim_end()),
+        None => persona,
+    };
     let facts = if memory { memory::load(home) } else { Vec::new() };
     memory::session_prompt(&persona, &facts)
 }
@@ -939,6 +955,7 @@ mod tests {
             action: "run a command".into(),
             detail: None,
             spoken: "May I run a command?".into(),
+            kind: crate::permission::AskKind::Command,
             can_always: false,
         };
         // ...even ones that would be allowed outright in a visible turn.
@@ -1036,6 +1053,7 @@ mod tests {
                             action: "run a command".into(),
                             detail: None,
                             spoken: "May I run a command?".into(),
+                            kind: crate::permission::AskKind::Command,
                             can_always: false,
                         };
                         Event::Permission { ask, auto: kind == "auto" }

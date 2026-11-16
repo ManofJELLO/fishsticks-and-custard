@@ -3,6 +3,9 @@
 //! its agent's requests into a [`PermissionAsk`] and an [`Answer`] back into
 //! its reply.
 
+pub use crate::lang::AskKind;
+use crate::lang::{AnswerWords, Language};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer {
     Once,
@@ -20,8 +23,10 @@ pub struct PermissionAsk {
     pub action: String,
     /// The exact command, URL, path or query, if there is one.
     pub detail: Option<String>,
-    /// The question to read aloud.
+    /// The question to read aloud, in English. Other languages ask by `kind`.
     pub spoken: String,
+    /// What it is, to ask in other languages.
+    pub kind: AskKind,
     /// "Always" would save a rule.
     pub can_always: bool,
 }
@@ -33,10 +38,35 @@ pub struct PermissionAsk {
 /// nothing but agreement. Questions, hedges ("I'm not sure") and requests
 /// ("please tell me what it does first") give `None`, so the question is
 /// asked again.
-pub fn parse_answer(text: &str) -> Option<Answer> {
-    if text.contains('?') {
-        return None;
-    }
+///
+/// `lang`'s words count as well as English's.
+pub fn parse_answer(text: &str, lang: &Language) -> Option<Answer> {
+    let english = &crate::lang::english().answers;
+    let lists: Vec<&AnswerWords> = if lang.is_english() { vec![english] } else { vec![&lang.answers, english] };
+    // An English word that's an everyday word in `lang` means what it means
+    // there: Polish "no dobra" is "yeah, OK", Dutch "is goed" is "fine".
+    let ordinary = |w: &str| !lang.is_english() && (lang.answers.consent.contains(&w) || lang.answers.filler.contains(&w));
+    let any = |f: fn(&AnswerWords) -> &'static [&'static str]| -> Vec<&'static str> {
+        lists
+            .iter()
+            .flat_map(|l| {
+                let own = std::ptr::eq(*l, &lang.answers);
+                f(l).iter().copied().filter(move |w| own || !ordinary(w))
+            })
+            .collect()
+    };
+    let (always_words, deny, hedges, question_starts, consent, filler, agree) = (
+        any(|l| l.always),
+        any(|l| l.deny),
+        any(|l| l.hedges),
+        any(|l| l.question_starts),
+        any(|l| l.consent),
+        any(|l| l.filler),
+        any(|l| l.agree),
+    );
+    // A question isn't a yes, but it can be a no ("Nie?", as whisper
+    // sometimes hears a flat "nie").
+    let asked = text.contains(['?', '¿', '？']);
     let t: String = text
         .to_lowercase()
         .replace(['’', '‘'], "'")
@@ -51,73 +81,47 @@ pub fn parse_answer(text: &str) -> Option<Answer> {
     if words.is_empty() || words.len() > 8 {
         return None;
     }
-    if QUESTION_STARTS.contains(&words[0]) {
+    if question_starts.contains(&words[0]) {
         return None;
     }
     let mut s = format!(" {} ", words.join(" "));
     let has = |s: &str, list: &[&str]| list.iter().any(|w| s.contains(&format!(" {w} ")));
 
-    if has(&s, HEDGES) {
+    if has(&s, &hedges) {
         return None;
     }
     // Agreeing phrases that contain a negative word.
     let mut agreed = false;
-    for p in ["no problem", "no worries", "why not"] {
+    for p in &agree {
         if let Some(i) = s.find(&format!(" {p} ")) {
             s.replace_range(i..i + p.len() + 1, "");
             agreed = true;
         }
     }
     let mut always = false;
-    for p in ALWAYS {
+    for p in &always_words {
         while let Some(i) = s.find(&format!(" {p} ")) {
             s.replace_range(i..i + p.len() + 1, "");
             always = true;
         }
     }
-    if has(&s, DENY) {
+    if has(&s, &deny) {
         return Some(Answer::Deny);
     }
-    let rest: Vec<&str> = s.split_whitespace().collect();
-    if !rest.iter().all(|w| CONSENT.contains(w) || FILLER.contains(w)) {
+    if asked {
         return None;
     }
-    agreed |= rest.iter().any(|w| CONSENT.contains(w));
+    let rest: Vec<&str> = s.split_whitespace().collect();
+    if !rest.iter().all(|w| consent.contains(w) || filler.contains(w)) {
+        return None;
+    }
+    agreed |= rest.iter().any(|w| consent.contains(w));
     match (always, agreed) {
         (true, _) => Some(Answer::Always),
         (false, true) => Some(Answer::Once),
         (false, false) => None,
     }
 }
-
-/// Say "always allow" (removed before the rest is read).
-const ALWAYS: &[&str] = &["don't ask again", "don't ask me again", "every time", "from now on", "always"];
-/// Any of these anywhere means no.
-const DENY: &[&str] = &[
-    "no", "n", "nope", "nah", "not", "don't", "do not", "deny", "denied", "stop", "cancel", "never", "negative",
-];
-/// Unsure: ask again rather than guess.
-const HEDGES: &[&str] = &[
-    "not sure", "unsure", "maybe", "perhaps", "i think", "i guess", "dunno", "don't know", "idk", "hmm", "hm",
-    "possibly", "probably", "depends", "wait", "hold on",
-];
-/// A reply starting with one of these is a question, even without a "?".
-const QUESTION_STARTS: &[&str] = &[
-    "what", "what's", "why", "how", "who", "where", "when", "which", "is", "isn't", "are", "can", "could",
-    "would", "should", "does", "will", "shall",
-];
-/// Words that say yes.
-const CONSENT: &[&str] = &[
-    "yes", "y", "yeah", "yea", "yep", "yup", "yah", "ya", "sure", "ok", "okay", "k", "allow", "allowed", "fine",
-    "alright", "absolutely", "course", "proceed", "affirmative", "approve", "approved", "go", "ahead",
-    "certainly", "definitely", "please", "granted", "permission",
-];
-/// Words that may go with a yes without changing it.
-const FILLER: &[&str] = &[
-    "and", "then", "just", "it", "that", "that's", "this", "is", "you", "can", "may", "for", "of", "all", "right",
-    "do", "oh", "um", "uh", "er", "well", "thanks", "thank", "once", "time", "now", "good", "great", "sounds",
-    "totally", "i", "i'm", "a", "the", "one", "have",
-];
 
 /// "Write \"hi\" into note.txt." -> "write \"hi\" into note.txt", so it
 /// reads after "May I". Leaves a leading proper noun or acronym alone.
@@ -188,7 +192,74 @@ mod tests {
             ("Always allow it.", Some(Answer::Always)),
             ("Yes, and dont ask me again.", Some(Answer::Always)),
         ] {
-            assert_eq!(parse_answer(said), want, "{said:?}");
+            assert_eq!(parse_answer(said, crate::lang::english()), want, "{said:?}");
+        }
+    }
+
+    #[test]
+    fn answers_in_other_languages() {
+        let check = |code: &str, cases: &[(&str, Option<Answer>)]| {
+            let lang = crate::lang::find(code).unwrap();
+            for (said, want) in cases {
+                assert_eq!(parse_answer(said, lang), *want, "{code}: {said:?}");
+            }
+        };
+        use Answer::*;
+        check("de", &[
+            ("Ja.", Some(Once)),
+            ("Ja, mach das bitte.", Some(Once)),
+            ("Klar, kein Problem.", Some(Once)),
+            ("Ja, immer.", Some(Always)),
+            ("Ja, und frag nicht mehr.", Some(Always)),
+            ("Nein.", Some(Deny)),
+            ("Nein, immer fragen.", Some(Deny)),
+            ("Lieber nicht.", Some(Deny)),
+            ("Ich weiß nicht.", None),
+            ("Vielleicht.", None),
+            ("Was macht das?", None),
+            ("Was macht das", None),
+            ("Immer fragen.", None),
+            // English still works.
+            ("Okay.", Some(Once)),
+            ("No.", Some(Deny)),
+        ]);
+        check("fr", &[
+            ("Oui.", Some(Once)),
+            ("D'accord, vas-y.", Some(Once)),
+            ("Oui, toujours.", Some(Always)),
+            ("Non merci.", Some(Deny)),
+            ("Pas de problème.", Some(Once)),
+            ("Je ne sais pas.", None),
+            ("Pourquoi ?", None),
+        ]);
+        check("es", &[
+            ("Sí.", Some(Once)),
+            ("Sí, adelante, por favor.", Some(Once)),
+            ("Vale, siempre.", Some(Always)),
+            ("No, gracias.", Some(Deny)),
+            ("No hay problema.", Some(Once)),
+            ("No sé.", None),
+            ("¿Qué hace?", None),
+        ]);
+        check("ru", &[
+            ("Да.", Some(Once)),
+            ("Да, конечно.", Some(Once)),
+            ("Да, всегда.", Some(Always)),
+            ("Нет.", Some(Deny)),
+            ("Без проблем.", Some(Once)),
+            ("Не знаю.", None),
+        ]);
+        check("pl", &[("Tak.", Some(Once)), ("Nie.", Some(Deny)), ("Nie?", Some(Deny)), ("Tak?", None), ("Tak, zawsze.", Some(Always)), ("Nie wiem.", None)]);
+        check("en", &[("No?", Some(Deny)), ("Yes?", None), ("Okay?", None)]);
+        check("pl", &[("No dobra.", Some(Once)), ("No.", None), ("No nie.", Some(Deny))]);
+        check("cs", &[("No jasně.", Some(Once)), ("Ne.", Some(Deny))]);
+        check("nl", &[("Is goed.", Some(Once)), ("Nee.", Some(Deny))]);
+        check("tr", &[("Evet.", Some(Once)), ("Hayır.", Some(Deny)), ("Sorun yok.", Some(Once)), ("Evet, her zaman.", Some(Always))]);
+        check("hu", &[("Igen.", Some(Once)), ("Nem.", Some(Deny)), ("Nem vagyok biztos.", None), ("Igen, mindig.", Some(Always))]);
+        // Every language: its yes means yes, its no means no.
+        for l in &crate::lang::LANGUAGES {
+            assert_eq!(parse_answer(l.answers.consent[0], l), Some(Once), "{}", l.code);
+            assert_eq!(parse_answer(l.answers.deny[0], l), Some(Deny), "{}", l.code);
         }
     }
 

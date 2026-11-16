@@ -33,7 +33,7 @@ use tokio::process::Child;
 
 use super::{Applied, Backend, Choice, Choices, Conn, Event, Select, Setting};
 use crate::config::{AcpAgentConfig, AgentKind};
-use crate::permission::{Answer, PermissionAsk, phrase, truncate};
+use crate::permission::{Answer, AskKind, PermissionAsk, phrase, truncate};
 
 /// Longest wait for the agent to start or open a session. Antigravity
 /// signs in to its servers first.
@@ -759,21 +759,22 @@ fn describe_tool(id: &str, call: &Value, can_always: bool) -> PermissionAsk {
     let path = call["locations"][0]["path"].as_str().map(str::to_string);
     let url = input["url"].as_str().map(str::to_string);
     let query = input["query"].as_str().map(str::to_string);
-    let (tool, action, detail) = match tool_kind(call) {
-        "execute" => ("Command", "run a command".to_string(), command.or(title.map(String::from))),
-        "edit" => ("Edit", "change a file".into(), path.or(title.map(String::from))),
-        "delete" => ("Delete", "delete a file".into(), path.or(title.map(String::from))),
-        "move" => ("Move", "move a file".into(), title.map(String::from)),
-        "read" => ("Read", "read a file".into(), path.or(title.map(String::from))),
-        "search" if query.is_some() => ("Web search", "search the web".into(), query),
-        "search" => ("Search", "search".into(), title.map(String::from)),
-        "fetch" => ("Web", "open a web page".into(), url.or(title.map(String::from))),
-        "think" => ("Think", "think it through".into(), None),
-        _ => ("Tool", title.map(phrase).unwrap_or_else(|| "use a tool".into()), None),
+    let (kind, tool, action, detail) = match tool_kind(call) {
+        "execute" => (AskKind::Command, "Command", "run a command".to_string(), command.or(title.map(String::from))),
+        "edit" => (AskKind::Edit, "Edit", "change a file".into(), path.or(title.map(String::from))),
+        "delete" => (AskKind::Delete, "Delete", "delete a file".into(), path.or(title.map(String::from))),
+        "move" => (AskKind::Move, "Move", "move a file".into(), title.map(String::from)),
+        "read" => (AskKind::Read, "Read", "read a file".into(), path.or(title.map(String::from))),
+        "search" if query.is_some() => (AskKind::WebSearch, "Web search", "search the web".into(), query),
+        "search" => (AskKind::SearchFiles, "Search", "search".into(), title.map(String::from)),
+        "fetch" => (AskKind::OpenPage, "Web", "open a web page".into(), url.or(title.map(String::from))),
+        "think" => (AskKind::Think, "Think", "think it through".into(), None),
+        _ => (AskKind::Tool, "Tool", title.map(phrase).unwrap_or_else(|| "use a tool".into()), None),
     };
     PermissionAsk {
         id: id.to_string(),
         tool: tool.into(),
+        kind,
         spoken: format!("May I {action}?"),
         action,
         detail: detail.map(|d| truncate(&d, MAX_DETAIL)),

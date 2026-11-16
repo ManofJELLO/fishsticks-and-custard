@@ -7,10 +7,8 @@
 const MIN_CHUNK: usize = 24;
 /// Inline code longer than this isn't read out.
 const MAX_INLINE_CODE: usize = 40;
-/// Said in place of a fenced code block.
-const CODE_BLOCK: &str = "The code is on screen.";
-/// Said in place of long inline code.
-const LONG_CODE: &str = "the command on screen";
+
+use fsc_core::lang::{self, Language};
 
 #[derive(Default)]
 pub struct SentenceBuffer {
@@ -20,6 +18,8 @@ pub struct SentenceBuffer {
     /// How far `boundary` has looked without finding one, so each push
     /// only scans the new text.
     scan: Scan,
+    /// What's said instead of code; English when `None`.
+    lang: Option<&'static Language>,
 }
 
 /// Progress of the sentence-boundary scan through `buf`.
@@ -36,6 +36,14 @@ struct Scan {
 }
 
 impl SentenceBuffer {
+    pub fn set_language(&mut self, lang: &'static Language) {
+        self.lang = Some(lang);
+    }
+
+    fn language(&self) -> &'static Language {
+        self.lang.unwrap_or_else(lang::english)
+    }
+
     pub fn clear(&mut self) {
         self.buf.clear();
         self.in_code = false;
@@ -60,19 +68,19 @@ impl SentenceBuffer {
                 let line = self.take(nl + 1);
                 let fence = line.trim_start().starts_with("```");
                 if fence && !self.in_code {
-                    out.push(CODE_BLOCK.to_string());
+                    out.push(self.language().phrases.code_on_screen.to_string());
                 }
                 if fence {
                     self.in_code = !self.in_code;
                 }
-                if !fence && !self.in_code && let Some(s) = speakable(&line) {
+                if !fence && !self.in_code && let Some(s) = speakable(&line, self.language()) {
                     out.push(s);
                 }
                 continue;
             }
             let Some(end) = self.boundary() else { break };
             let s = self.take(end);
-            if let Some(s) = speakable(&s) {
+            if let Some(s) = speakable(&s, self.language()) {
                 out.push(s);
             }
         }
@@ -84,7 +92,7 @@ impl SentenceBuffer {
         let s = std::mem::take(&mut self.buf);
         let in_code = std::mem::take(&mut self.in_code);
         self.scan = Scan::default();
-        if in_code || s.trim_start().starts_with("```") { None } else { speakable(&s) }
+        if in_code || s.trim_start().starts_with("```") { None } else { speakable(&s, self.language()) }
     }
 
     /// Byte index just past a sentence end: `.`/`!`/`?` followed by
@@ -126,10 +134,10 @@ impl SentenceBuffer {
 /// Make a chunk of reply sayable: link text instead of links, site names
 /// instead of URLs, no list bullets or markdown symbols. `None` if nothing
 /// worth saying is left.
-fn speakable(s: &str) -> Option<String> {
+fn speakable(s: &str, lang: &Language) -> Option<String> {
     let s = strip_list_marker(s.trim());
     let s = links_to_text(s);
-    let s = inline_code(&s);
+    let s = inline_code(&s, lang.phrases.command_on_screen);
     let s: Vec<String> = s.split_whitespace().map(url_to_site).collect();
     let s = s.join(" ");
     let cleaned: String = s.chars().filter(|c| !matches!(c, '*' | '`' | '#' | '|' | '~')).collect();
@@ -172,7 +180,7 @@ fn links_to_text(s: &str) -> String {
 
 /// Keep short inline code (a command or file name reads fine); replace
 /// long code with a pointer to the screen.
-fn inline_code(s: &str) -> String {
+fn inline_code(s: &str, long_code: &str) -> String {
     let parts: Vec<&str> = s.split('`').collect();
     if parts.len() < 3 {
         return s.to_string();
@@ -182,7 +190,7 @@ fn inline_code(s: &str) -> String {
         // Odd parts are inside backticks (an unmatched last one isn't).
         let code = i % 2 == 1 && i + 1 < parts.len();
         if code && part.chars().count() > MAX_INLINE_CODE {
-            out.push_str(LONG_CODE);
+            out.push_str(long_code);
         } else {
             out.push_str(part);
         }
@@ -215,6 +223,9 @@ fn url_to_site(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CODE_BLOCK: &str = "The code is on screen.";
+    const LONG_CODE: &str = "the command on screen";
 
     fn all(text: &str) -> Vec<String> {
         let mut b = SentenceBuffer::default();

@@ -57,10 +57,10 @@ block_percent = 10            # each bar lights in blocks of this many percent
 notify_when_hidden = true
 
 [voice]
-whisper_model = "large-v3-turbo-q5_0"   # file ggml-<name>.bin; e.g. "small.en-q5_1" is smaller
-language = "en"                          # or "auto"
+whisper_model = "large-v3-turbo-q5_0"   # file ggml-<name>.bin; "*.en" models are English-only
+language = ""                            # "de", "fr", ... (`fsc language`); empty = your desktop's (tray: Language)
 gpu = true                               # whisper on Vulkan
-piper_voice = "en_GB-alan-medium"        # any voice from huggingface.co/rhasspy/piper-voices
+piper_voice = ""                         # empty = the language's usual one; any from huggingface.co/rhasspy/piper-voices (tray: Voice)
 speech_rate = 1.0
 speak = "voice"                          # speak replies to spoken prompts: "voice", "always", "never" (tray: Speak replies)
 input_device = ""                        # the mic's name or part of it; empty = system default (tray: Microphone, `fsc mic`)

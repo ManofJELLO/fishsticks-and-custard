@@ -59,11 +59,12 @@ impl SpeakMode {
 pub struct VoiceConfig {
     /// whisper.cpp model name: the file is `ggml-<name>.bin`.
     pub whisper_model: String,
-    /// Spoken language for recognition ("en", "auto", ...).
+    /// The language spoken and heard ("de"): see `lang`. Empty follows the
+    /// desktop's locale.
     pub language: String,
     /// Run whisper on the GPU (Vulkan).
     pub gpu: bool,
-    /// Piper voice, e.g. "en_GB-alan-medium".
+    /// Piper voice, e.g. "en_GB-alan-medium". Empty: the language's usual one.
     pub piper_voice: String,
     /// >1 speaks faster, <1 slower.
     pub speech_rate: f32,
@@ -94,9 +95,9 @@ impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
             whisper_model: "large-v3-turbo-q5_0".into(),
-            language: "en".into(),
+            language: String::new(),
             gpu: true,
-            piper_voice: "en_GB-alan-medium".into(),
+            piper_voice: String::new(),
             speech_rate: 1.0,
             speak: SpeakMode::Voice,
             input_device: String::new(),
@@ -110,6 +111,35 @@ impl Default for VoiceConfig {
             wake_phrase: "fishsticks and custard".into(),
         }
     }
+}
+
+impl VoiceConfig {
+    /// What `language` comes to (the locale's when it's empty).
+    pub fn spoken(&self) -> crate::lang::Spoken {
+        crate::lang::resolve(&self.language)
+    }
+
+    /// The Piper voice to speak with: `piper_voice`, unless that's for
+    /// another of the listed languages (left over from before a language
+    /// change), else the language's usual one.
+    pub fn voice(&self) -> String {
+        voice_for(&self.spoken(), &self.piper_voice)
+    }
+}
+
+/// The voice `spoken` uses with `piper_voice` set as given.
+pub fn voice_for(spoken: &crate::lang::Spoken, piper_voice: &str) -> String {
+    let chosen = piper_voice.trim();
+    let listed = spoken.whisper == spoken.code;
+    if !chosen.is_empty() && (!listed || voice_language(chosen) == spoken.code) {
+        return chosen.to_string();
+    }
+    spoken.language().voice(&spoken.region).to_string()
+}
+
+/// "pt_BR-faber-medium" -> "pt".
+pub fn voice_language(voice: &str) -> &str {
+    voice.split(['_', '-']).next().unwrap_or("")
 }
 
 /// An agent's usual program and set-up.

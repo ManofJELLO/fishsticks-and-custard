@@ -15,7 +15,7 @@
 use serde_json::{Value, json};
 
 use super::claude::pretty_tool;
-use crate::permission::{Answer, PermissionAsk, phrase, truncate};
+use crate::permission::{Answer, AskKind, PermissionAsk, phrase, truncate};
 
 /// A question the CLI is waiting on, with what's needed to answer it.
 #[derive(Debug, Clone)]
@@ -34,18 +34,18 @@ pub fn parse(request_id: &str, req: &Value) -> (PermissionAsk, Pending) {
     let field = |k: &str| input[k].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let said = |k: &str| req[k].as_str().map(str::trim).filter(|s| !s.is_empty()).map(phrase);
 
-    let (action, detail, spoken_detail) = match name {
+    let (kind, action, detail, spoken_detail) = match name {
         "Bash" => {
             let action = field("description").map(|d| phrase(&d)).unwrap_or_else(|| "run a command".into());
-            (action, field("command"), None)
+            (AskKind::Command, action, field("command"), None)
         }
-        "WebSearch" => ("search the web".into(), field("query"), field("query")),
-        "WebFetch" => ("open a web page".into(), field("url"), None),
-        "Write" => ("write a file".into(), field("file_path"), None),
-        "Edit" | "MultiEdit" => ("edit a file".into(), field("file_path"), None),
-        "NotebookEdit" => ("edit a notebook".into(), field("notebook_path"), None),
-        "Read" => ("read a file".into(), field("file_path"), None),
-        "Glob" | "Grep" => ("search your files".into(), field("pattern"), None),
+        "WebSearch" => (AskKind::WebSearch, "search the web".into(), field("query"), field("query")),
+        "WebFetch" => (AskKind::OpenPage, "open a web page".into(), field("url"), None),
+        "Write" => (AskKind::Write, "write a file".into(), field("file_path"), None),
+        "Edit" | "MultiEdit" => (AskKind::Edit, "edit a file".into(), field("file_path"), None),
+        "NotebookEdit" => (AskKind::Edit, "edit a notebook".into(), field("notebook_path"), None),
+        "Read" => (AskKind::Read, "read a file".into(), field("file_path"), None),
+        "Glob" | "Grep" => (AskKind::SearchFiles, "search your files".into(), field("pattern"), None),
         _ => {
             let action = said("title")
                 .or_else(|| said("description"))
@@ -55,7 +55,7 @@ pub fn parse(request_id: &str, req: &Value) -> (PermissionAsk, Pending) {
                     None => format!("use {name}"),
                 });
             let detail = (!input.is_null() && input.as_object().is_none_or(|o| !o.is_empty())).then(|| input.to_string());
-            (action, detail, None)
+            (AskKind::Tool, action, detail, None)
         }
     };
     let spoken = match &spoken_detail {
@@ -72,6 +72,7 @@ pub fn parse(request_id: &str, req: &Value) -> (PermissionAsk, Pending) {
             action,
             detail: detail.map(|d| truncate(&d, MAX_DETAIL)),
             spoken,
+            kind,
             can_always,
         },
         Pending { id: request_id.to_string(), input: input.clone(), suggestions },

@@ -22,7 +22,8 @@ use tokio::sync::mpsc;
 use fsc_audio::{AudioEvent, AudioHandle};
 use fsc_core::Phase;
 use fsc_core::agent::{AgentEvent, AgentHandle, Choices, Setting, pretty_model, pretty_tool};
-use fsc_core::config::{AgentKind, Config, SpeakMode, Surface};
+use fsc_core::config::{self as config, AgentKind, Config, SpeakMode, Surface};
+use fsc_core::lang::{self, Language, Spoken};
 use fsc_core::ipc::{Command, Reply};
 use fsc_core::permission::{self, Answer, PermissionAsk};
 
@@ -106,6 +107,29 @@ struct State {
     /// `voice.input_device` and `voice.speak`, as changed from the tray.
     mic: String,
     speak: SpeakMode,
+    /// `voice.language` as set (empty: the locale's) and what it comes to.
+    language: String,
+    spoken: Spoken,
+    /// `voice.piper_voice` as set (empty: the language's usual one).
+    piper_voice: String,
+    /// The voice the audio engine speaks with (when the language changed
+    /// and its voice is still downloading, that voice: silent meanwhile).
+    voice_name: String,
+    /// A voice being switched to once it's downloaded.
+    wanted: Option<String>,
+    /// A voice chosen that isn't in the list, saved once its download
+    /// works (with the `piper_voice` to go back to if it doesn't).
+    unsaved: Option<(String, String)>,
+    /// The voice in use being downloaded, and how far (percent).
+    fetching: Option<(String, u32)>,
+    /// Every voice download running (one per voice: two would write the
+    /// same file).
+    downloads: Vec<String>,
+    /// Say a sample when this voice has loaded (it was just chosen).
+    sample_for: Option<String>,
+    /// Tell the agent about a language change with the next prompt (its
+    /// session started with the old one).
+    language_note: Option<String>,
     model: String,
     /// The agent answering, and which are installed (`AgentKind::ALL` order).
     agent: AgentKind,
@@ -170,6 +194,8 @@ pub struct Ui {
     claude: AgentHandle,
     audio: AudioHandle,
     tray_tx: mpsc::UnboundedSender<TrayUpdate>,
+    /// For work done off the main thread (voice downloads) to report back.
+    events: async_channel::Sender<crate::AppEvent>,
     app: gtk::Application,
     window: gtk::ApplicationWindow,
     panel: gtk::DrawingArea,
@@ -189,6 +215,7 @@ pub struct Ui {
 }
 
 impl Ui {
+    #[allow(clippy::too_many_arguments)] // each is a separate handle it needs
     pub fn new(
         app: &gtk::Application,
         cfg: Config,
@@ -197,6 +224,7 @@ impl Ui {
         claude: AgentHandle,
         audio: AudioHandle,
         tray_tx: mpsc::UnboundedSender<TrayUpdate>,
+        events: async_channel::Sender<crate::AppEvent>,
     ) -> Rc<Self> {
         let window = gtk::ApplicationWindow::builder()
             .application(app)
@@ -303,12 +331,17 @@ impl Ui {
         let memory_on = cfg.memory();
         let wake_phrase = cfg.voice.wake_phrase.clone();
         let (mic, speak) = (cfg.voice.input_device.clone(), cfg.voice.speak);
+        let (language, spoken, piper_voice, voice_name) =
+            (cfg.voice.language.clone(), cfg.voice.spoken(), cfg.voice.piper_voice.clone(), cfg.voice.voice());
+        let mut sentences = SentenceBuffer::default();
+        sentences.set_language(spoken.language());
         let viz = Viz::new(&cfg.ui);
         let ui = Rc::new(Ui {
             cfg,
             claude,
             audio,
             tray_tx,
+            events,
             app: app.clone(),
             window,
             panel,
@@ -331,6 +364,16 @@ impl Ui {
                 wake_phrase,
                 mic,
                 speak,
+                language,
+                spoken,
+                piper_voice,
+                voice_name,
+                fetching: None,
+                wanted: None,
+                unsaved: None,
+                downloads: Vec::new(),
+                sample_for: None,
+                language_note: None,
                 model,
                 agent,
                 agents,
@@ -342,7 +385,7 @@ impl Ui {
                 last_frame: None,
                 current: None,
                 voice_turn: false,
-                sentences: SentenceBuffer::default(),
+                sentences,
                 conversation: false,
                 speech_pending: false,
                 follow_up: false,
@@ -426,7 +469,8 @@ impl Ui {
                 let text = e.text().to_string();
                 // "y" / "yes" / "always" / "no" answers an open permission question.
                 let open = ui.st.borrow().asks.first().map(|a| a.ask.id.clone());
-                if let (Some(id), Some(answer)) = (open, permission::parse_answer(&text)) {
+                let lang = ui.st.borrow().spoken.language();
+                if let (Some(id), Some(answer)) = (open, permission::parse_answer(&text, lang)) {
                     e.set_text("");
                     ui.answer_ask(&id, answer);
                     return;
@@ -503,6 +547,7 @@ impl Ui {
             }
             AppEvent::Agent(e) => self.agent_event(e),
             AppEvent::Audio(e) => self.audio_event(e),
+            AppEvent::VoiceFetch { voice, progress } => self.voice_fetch(voice, progress),
             AppEvent::Theme(mode) => self.set_theme(mode),
             AppEvent::Accent(c) => {
                 self.st.borrow_mut().desktop_accent = c;
@@ -597,6 +642,8 @@ impl Ui {
             Command::Mic { name } => return self.set_mic(name),
             Command::Speak { mode } => return self.set_speak(mode),
             Command::Settings => return self.open_settings(),
+            Command::Language { code } => return self.set_language(code),
+            Command::Voice { name } => return self.set_voice(name),
             Command::Quit => self.quit(),
         }
         Reply::ok()
@@ -746,9 +793,34 @@ impl Ui {
         match e {
             AudioEvent::Ready { stt, tts, missing_models } => {
                 self.st.borrow_mut().voice = Voice { stt, tts, loaded: true };
-                if missing_models {
+                let voice = self.st.borrow().voice_name.clone();
+                if missing_models && !fsc_core::models::has_voice(&voice) && stt {
+                    // Only the voice is missing (a new language, or the
+                    // locale's after an update): fetch it now.
+                    self.fetch_voice(&voice);
+                } else if missing_models {
                     self.flash_meta("MODELS MISSING · FSC FETCH-MODELS");
                 }
+            }
+            AudioEvent::Voice { voice, ok } => {
+                let sample = {
+                    let mut st = self.st.borrow_mut();
+                    if voice != st.voice_name {
+                        return; // superseded by another choice
+                    }
+                    st.voice.tts = ok;
+                    (ok && st.sample_for.as_deref() == Some(voice.as_str())).then(|| {
+                        st.sample_for = None;
+                        st.spoken.language().phrases.sample
+                    })
+                };
+                if let Some(sample) = sample {
+                    // Just chosen: let it say hello, whatever `speak` is set to.
+                    self.audio.speak(sample);
+                } else if !ok && self.st.borrow().fetching.is_none() {
+                    self.flash_meta_for(&format!("VOICE {} UNAVAILABLE", voice.to_uppercase()), Duration::from_secs(6));
+                }
+                self.push_tray();
             }
             AudioEvent::Spectrum(bands) => {
                 self.st.borrow_mut().viz.set_spectrum(Some(bands));
@@ -757,7 +829,7 @@ impl Ui {
             AudioEvent::MicLive => {
                 let open = self.st.borrow().asks.first().map(|a| a.ask.can_always);
                 if let Some(can_always) = open {
-                    self.flash_meta_for(choices(can_always).1, Duration::from_secs(8));
+                    self.flash_meta_for(choices(lang::english(), can_always).1, Duration::from_secs(8));
                 } else if self.st.borrow().follow_up {
                     self.flash_meta_for("GO AHEAD · ESC ENDS CONVERSATION", Duration::from_secs(5));
                 } else {
@@ -886,7 +958,10 @@ impl Ui {
             st.sentences.clear();
         }
         self.set_claude(Phase::Thinking);
-        self.claude.ask(text);
+        match self.st.borrow_mut().language_note.take() {
+            Some(note) => self.claude.ask(format!("({note})\n\n{text}")),
+            None => self.claude.ask(text),
+        }
         self.scroll_to_end();
         true
     }
@@ -1035,6 +1110,292 @@ impl Ui {
                 notify(&format!("{msg}. Settings are in {}", Config::path().map(|p| p.display().to_string()).unwrap_or_default()));
                 Reply::err(msg)
             }
+        }
+    }
+
+    /// `fsc language` and the tray's Language menu: list the languages, or
+    /// speak and listen in another (saved as `voice.language`). Its usual
+    /// voice comes with it unless the chosen one is already for it.
+    fn set_language(self: &Rc<Self>, code: Option<String>) -> Reply {
+        let Some(code) = code else {
+            let st = self.st.borrow();
+            let mut lines: Vec<String> = lang::LANGUAGES
+                .iter()
+                .map(|l| {
+                    let mark = if l.code == st.spoken.code && st.spoken.whisper == l.code { "*" } else { " " };
+                    format!("{mark} {}  {} ({})", l.code, l.native, l.name)
+                })
+                .collect();
+            lines.push(format!(
+                "{} default  your desktop's language{}",
+                if st.language.trim().is_empty() { "*" } else { " " },
+                if st.language.trim().is_empty() { format!(" ({})", st.spoken.language().name) } else { String::new() }
+            ));
+            if st.spoken.whisper != st.spoken.code {
+                lines.push(format!("* {}  (heard as is; spoken prompts in English)", st.spoken.whisper));
+            }
+            return Reply::state(lines.join("\n"));
+        };
+        let code = code.trim().to_lowercase();
+        let setting = if code.is_empty() || code == "default" { String::new() } else { code };
+        if !setting.is_empty() && lang::find(&setting).is_none() && setting != "auto" {
+            return Reply::err(format!(
+                "no language {setting:?} in the list (`fsc language` shows it); set `voice.language` in config.toml for whisper's others"
+            ));
+        }
+        let spoken = lang::resolve(&setting);
+        let lang = spoken.language();
+        // A voice chosen for the old language doesn't carry over. Saved by
+        // name (not left empty) so tools reading the config, like
+        // HyprCustard, see which files it needs.
+        let piper_voice = config::voice_for(&spoken, &self.st.borrow().piper_voice);
+        let saved = Config::save_value("voice", "language", &setting)
+            .and_then(|()| Config::save_value("voice", "piper_voice", &piper_voice));
+        let changed = {
+            let mut st = self.st.borrow_mut();
+            let changed = st.spoken != spoken;
+            st.language = setting;
+            st.spoken = spoken.clone();
+            st.piper_voice = piper_voice;
+            st.sentences.set_language(lang);
+            changed
+        };
+        if changed {
+            let instruction = spoken.instruction();
+            let note = instruction.clone().unwrap_or_else(|| "The user now speaks English. Reply in English.".into());
+            // Sessions from now on are told in their instructions; the one
+            // running started with the old language, so it's told with the
+            // next prompt.
+            self.claude.set_language(instruction);
+            self.st.borrow_mut().language_note = Some(note);
+        }
+        let what = if spoken.whisper == spoken.code {
+            format!("speaking {}", lang.name)
+        } else {
+            format!("listening for {} (its own questions in English)", if spoken.whisper == "auto" { "any language" } else { &spoken.whisper })
+        };
+        self.flash_meta(&format!("LANGUAGE: {}", if spoken.whisper == spoken.code { lang.native.to_uppercase() } else { spoken.whisper.to_uppercase() }));
+        self.apply_voice(true);
+        match saved {
+            Ok(()) => Reply::state(what),
+            Err(e) => Reply::state(format!("{what} until fscd restarts (not saved: {e:#})")),
+        }
+    }
+
+    /// `fsc voice` and the tray's Voice menu: list the language's voices, or
+    /// speak with another (saved as `voice.piper_voice`; downloaded first
+    /// if need be).
+    fn set_voice(self: &Rc<Self>, name: Option<String>) -> Reply {
+        let (code, current) = {
+            let st = self.st.borrow();
+            (st.spoken.code, st.voice_name.clone())
+        };
+        let Some(name) = name else {
+            let mut lines: Vec<String> = fsc_core::voices::for_language(code)
+                .map(|v| {
+                    let mark = if v.key == current { "*" } else { " " };
+                    let have = if fsc_core::models::has_voice(v.key) { String::new() } else { format!(", {} MB to download", v.mb) };
+                    format!("{mark} {}  ({}{have})", v.key, v.label)
+                })
+                .collect();
+            if fsc_core::voices::find(&current).is_none() {
+                lines.push(format!("* {current}"));
+            }
+            return Reply::state(lines.join("\n"));
+        };
+        let name = name.trim().to_string();
+        let setting = if name.is_empty() || name == "default" {
+            let st = self.st.borrow();
+            st.spoken.language().voice(&st.spoken.region).to_string()
+        } else {
+            name
+        };
+        if !setting.is_empty() {
+            if setting.split('-').count() != 3 {
+                return Reply::err(format!("{setting:?} isn't a Piper voice name (like de_DE-thorsten-medium; `fsc voice` lists them)"));
+            }
+            if config::voice_language(&setting) != code && self.st.borrow().spoken.whisper == code {
+                return Reply::err(format!(
+                    "{setting} speaks another language; change the language first (`fsc language {}`)",
+                    config::voice_language(&setting)
+                ));
+            }
+        }
+        // A voice from the list exists; any other is saved only once its
+        // download shows it does, so a misspelt name isn't kept.
+        let known = fsc_core::voices::find(&setting).is_some() || fsc_core::models::has_voice(&setting);
+        let saved = {
+            let mut st = self.st.borrow_mut();
+            let previous = std::mem::replace(&mut st.piper_voice, setting.clone());
+            if known {
+                st.unsaved = None;
+                Some(Config::save_value("voice", "piper_voice", &setting))
+            } else {
+                st.unsaved = Some((setting.clone(), previous));
+                None
+            }
+        };
+        let voice = self.apply_voice(true);
+        let label = fsc_core::voices::find(&voice).map(|v| v.label).unwrap_or(&voice);
+        let coming = self.st.borrow().wanted.is_some();
+        match saved {
+            None => Reply::state(format!("downloading {label}; it's saved as your voice once it's here")),
+            Some(Ok(())) if coming => Reply::state(format!("downloading {label}; the current voice speaks until then")),
+            Some(Ok(())) => Reply::state(format!("speaking with {label}")),
+            Some(Err(e)) => Reply::state(format!("speaking with {label} until fscd restarts (not saved: {e:#})")),
+        }
+    }
+
+    /// Point the audio engine at the language and voice now set, fetching
+    /// the voice first if it isn't here. `sample`: say hello in it once
+    /// it's loaded. Returns the voice.
+    fn apply_voice(self: &Rc<Self>, sample: bool) -> String {
+        let here = |v: &str| fsc_core::models::has_voice(v);
+        let (whisper, voice, speak_with) = {
+            let mut st = self.st.borrow_mut();
+            let voice = config::voice_for(&st.spoken, &st.piper_voice);
+            if sample && voice != st.voice_name {
+                st.sample_for = Some(voice.clone());
+            }
+            if here(&voice) {
+                st.wanted = None;
+                st.voice_name = voice.clone();
+            } else {
+                // Until it's here, the voice in use carries on if it speaks
+                // this language; otherwise speech pauses.
+                st.wanted = Some(voice.clone());
+                let fits = config::voice_language(&st.voice_name) == st.spoken.code && here(&st.voice_name);
+                if !fits {
+                    st.voice_name = voice.clone();
+                }
+            }
+            (st.spoken.whisper.clone(), voice, st.voice_name.clone())
+        };
+        self.audio.set_language(whisper, speak_with);
+        if here(&voice) {
+            let label = fsc_core::voices::find(&voice).map(|v| v.label).unwrap_or(&voice);
+            self.flash_meta(&format!("VOICE: {}", label.to_uppercase()));
+        } else {
+            self.fetch_voice(&voice);
+        }
+        self.push_tray();
+        voice
+    }
+
+    /// Download `voice` in the background (once at a time per voice).
+    fn fetch_voice(self: &Rc<Self>, voice: &str) {
+        {
+            let mut st = self.st.borrow_mut();
+            if st.downloads.iter().any(|v| v == voice) {
+                // Already coming: just show its progress again.
+                if st.fetching.as_ref().is_none_or(|(v, _)| v != voice) {
+                    st.fetching = Some((voice.to_string(), 0));
+                }
+                return;
+            }
+            st.downloads.push(voice.to_string());
+            st.fetching = Some((voice.to_string(), 0));
+        }
+        self.flash_meta_for("DOWNLOADING VOICE…", Duration::from_secs(60));
+        self.push_tray();
+        let tx = self.events.clone();
+        let voice = voice.to_string();
+        std::thread::spawn(move || {
+            let files = fsc_core::models::voice_files(&voice);
+            let mut last = u32::MAX;
+            let mut result = Ok(None);
+            for (i, m) in files.iter().enumerate() {
+                if m.path.exists() {
+                    continue;
+                }
+                let r = fsc_core::models::download(m, |done, total| {
+                    // The model is nearly all of it; the config is tiny.
+                    let pct = match total {
+                        Some(t) if i == 0 => (done * 100 / t.max(1)).min(99) as u32,
+                        _ => 99,
+                    };
+                    if pct != last && pct % 5 == 0 {
+                        last = pct;
+                        let _ = tx.send_blocking(crate::AppEvent::VoiceFetch { voice: voice.clone(), progress: Ok(Some(pct)) });
+                    }
+                });
+                if let Err(e) = r {
+                    result = Err(format!("{e:#}"));
+                    break;
+                }
+            }
+            let _ = tx.send_blocking(crate::AppEvent::VoiceFetch { voice, progress: result });
+        });
+    }
+
+    fn voice_fetch(self: &Rc<Self>, voice: String, progress: Result<Option<u32>, String>) {
+        let current = {
+            let st = self.st.borrow();
+            st.wanted.as_deref() == Some(voice.as_str()) || st.voice_name == voice
+        };
+        match progress {
+            Ok(Some(pct)) => {
+                {
+                    let mut st = self.st.borrow_mut();
+                    if current && st.fetching.is_none() {
+                        st.fetching = Some((voice.clone(), pct));
+                    }
+                    if let Some(f) = st.fetching.as_mut().filter(|(v, _)| *v == voice) {
+                        f.1 = pct;
+                    }
+                }
+                if current {
+                    self.flash_meta_for(&format!("DOWNLOADING VOICE · {pct}%"), Duration::from_secs(60));
+                }
+            }
+            Ok(None) => {
+                eprintln!("fsc: downloaded voice {voice}");
+                self.end_fetch(&voice);
+                if current {
+                    let unsaved = {
+                        let mut st = self.st.borrow_mut();
+                        st.wanted = None;
+                        st.voice_name = voice.clone();
+                        st.unsaved.take_if(|(v, _)| *v == voice)
+                    };
+                    if unsaved.is_some()
+                        && let Err(e) = Config::save_value("voice", "piper_voice", &voice)
+                    {
+                        eprintln!("fsc: could not save the voice: {e:#}");
+                    }
+                    let whisper = self.st.borrow().spoken.whisper.clone();
+                    self.audio.set_language(whisper, voice);
+                    self.restore_meta();
+                }
+            }
+            Err(e) => {
+                eprintln!("fsc: could not download voice {voice}: {e}");
+                self.end_fetch(&voice);
+                {
+                    // Back to what was there: the voice in use speaks on.
+                    let mut st = self.st.borrow_mut();
+                    if st.wanted.as_deref() == Some(voice.as_str()) {
+                        st.wanted = None;
+                    }
+                    if let Some((_, previous)) = st.unsaved.take_if(|(v, _)| *v == voice) {
+                        st.piper_voice = previous;
+                    }
+                }
+                if current {
+                    self.flash_meta_for("VOICE DOWNLOAD FAILED", Duration::from_secs(8));
+                    notify(&format!("Couldn't download the voice {voice}: {e}"));
+                }
+            }
+        }
+        self.push_tray();
+    }
+
+    /// `voice`'s download is over (another may have started since).
+    fn end_fetch(&self, voice: &str) {
+        let mut st = self.st.borrow_mut();
+        st.downloads.retain(|v| v != voice);
+        if st.fetching.as_ref().is_some_and(|(v, _)| v == voice) {
+            st.fetching = None;
         }
     }
 
@@ -1422,13 +1783,21 @@ impl Ui {
             if let Some(rest) = rest {
                 self.speak(rest);
             }
-            self.speak(format!("{} {}", ask.spoken, choices(ask.can_always).0));
+            let lang = self.st.borrow().spoken.language();
+            let question = if lang.is_english() {
+                ask.spoken.clone()
+            } else {
+                // "Google Calendar · create event" -> "Google Calendar".
+                lang.question(ask.kind, ask.tool.split(" · ").next().unwrap_or(&ask.tool))
+            };
+            self.speak(format!("{question} {}", choices(lang, ask.can_always).0));
         }
         self.maybe_follow_up();
     }
 
     fn spoken_answer(self: &Rc<Self>, id: &str, text: &str) {
-        if let Some(answer) = permission::parse_answer(text) {
+        let lang = self.st.borrow().spoken.language();
+        if let Some(answer) = permission::parse_answer(text, lang) {
             self.answer_ask(id, answer);
             return;
         }
@@ -1439,10 +1808,11 @@ impl Ui {
         };
         if tries < MAX_ANSWER_TRIES {
             let can_always = self.st.borrow().asks.iter().find(|a| a.ask.id == id).is_some_and(|a| a.ask.can_always);
-            let (spoken, meta) = choices(can_always);
+            let lang = self.st.borrow().spoken.language();
+            let (spoken, meta) = choices(lang, can_always);
             self.flash_meta(meta);
             if !text.trim().is_empty() && self.should_speak() {
-                self.speak(format!("Sorry. {spoken}"));
+                self.speak(format!("{} {spoken}", lang.phrases.sorry));
             }
             self.maybe_follow_up();
         } else {
@@ -1625,6 +1995,9 @@ impl Ui {
             choices: st.choices.clone(),
             mic: st.mic.clone(),
             speak: st.speak,
+            language: st.spoken.code,
+            voice: st.wanted.clone().unwrap_or_else(|| st.voice_name.clone()),
+            fetching: st.fetching.clone(),
         };
         if st.menu_sent.as_ref() != Some(&menu) {
             st.menu_sent = Some(menu.clone());
@@ -1772,6 +2145,10 @@ fn notify(text: &str) {
 
 /// How to ask for an answer: (spoken, status line). "Always" is only offered
 /// when the request comes with a rule that can be saved.
-fn choices(can_always: bool) -> (&'static str, &'static str) {
-    if can_always { ("Yes, always, or no?", "SAY YES, ALWAYS OR NO") } else { ("Yes or no?", "SAY YES OR NO") }
+fn choices(lang: &Language, can_always: bool) -> (&'static str, &'static str) {
+    if can_always {
+        (lang.phrases.yes_always_no, "SAY YES, ALWAYS OR NO")
+    } else {
+        (lang.phrases.yes_no, "SAY YES OR NO")
+    }
 }

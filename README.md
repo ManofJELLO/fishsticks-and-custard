@@ -16,6 +16,7 @@ See [Choosing an agent](#choosing-an-agent).
 | 4 | Safe system control: permission prompts routed to the popup | **done** |
 | 5 | Polish: police-box tray icon, LED-segment visualiser, window/layer/headless modes, spoken-reply cleanup | **done** |
 | 6 | Any agent: Codex, Antigravity and OpenCode through the Agent Client Protocol, beside Claude Code; agent, model and mode menus | **done** |
+| 7 | 18 languages (following the desktop's), a choice of voices, and microphone, speech and settings menus in the tray | **done** |
 
 ## Layout
 
@@ -199,6 +200,8 @@ show in rofi with `rofi -show drun -drun-show-actions`.
 | `fsc mic [name]` / tray **Microphone** | list the microphones, or listen with another (`default` for the system's; saved as `voice.input_device`) |
 | `fsc speak [voice\|always\|never]` / tray **Speak replies** | when replies are read aloud: replies to spoken prompts (*When I talk*), always or never (saved as `voice.speak`) |
 | `fsc settings` / tray **Settings…** | open HyprCustard if it's installed, otherwise `config.toml` in your editor |
+| `fsc language [code]` / tray **Language** | list the languages, or speak and listen in another (saved as `voice.language`) |
+| `fsc voice [name]` / tray **Voice** | list the language's voices, or speak with another (downloaded if need be; saved as `voice.piper_voice`) |
 
 ## Customise
 
@@ -242,6 +245,29 @@ into every new session. `fsc memory` shows it, `fsc forget` deletes it, and
 `agent.memory = false` turns the feature off. (Both were in `[claude]` before 0.7,
 and are still read from there.) Saving costs one small extra turn per
 session.
+
+## Languages and voices
+
+It speaks and listens in 18 languages: English, German, French, Spanish, Italian,
+Portuguese, Dutch, Polish, Swedish, Danish, Norwegian, Finnish, Czech, Russian,
+Ukrainian, Turkish, Hungarian and Romanian. Out of the box it follows your desktop's
+language (`LANG`), or English when that isn't one of them. Pick another from the tray's
+**Language** menu or with `fsc language de`. The change covers:
+
+- **what it hears:** whisper listens for that language;
+- **what it says:** a voice for that language. The voice is downloaded (60 to 120 MB) the
+  first time, and it says hello when it's ready;
+- **the agent:** it is told which language to reply in;
+- **permission questions:** they're asked in that language, and *yes*, *always* and *no*
+  are understood in it, as well as in English.
+
+The tray's **Voice** menu lists every voice Piper has for the language, with each one's
+download size until it's downloaded; `fsc voice` prints the same list. Any other Piper voice
+can be set by name in `voice.piper_voice`.
+
+The wake phrase stays as it is; `fsc wake` sets one in your language.
+whisper also knows languages that aren't on the list: set `voice.language` (e.g. `"ja"`)
+and `voice.piper_voice` by hand, and its own questions stay in English.
 
 ## Wake phrase
 

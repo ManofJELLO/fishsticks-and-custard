@@ -716,7 +716,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsc-app"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "fsc-audio"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "cpal",
@@ -749,17 +749,16 @@ dependencies = [
 
 [[package]]
 name = "fsc-cli"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
  "fsc-core",
- "ureq",
 ]
 
 [[package]]
 name = "fsc-core"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -768,6 +767,7 @@ dependencies = [
  "tokio",
  "toml",
  "toml_edit",
+ "ureq",
 ]
 
 [[package]]

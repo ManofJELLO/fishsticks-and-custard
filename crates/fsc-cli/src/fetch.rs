@@ -1,7 +1,6 @@
 //! `fsc fetch-models`: download whatever the configured voice pipeline needs.
 
-use anyhow::{Context, Result, bail};
-use std::io::{Read, Write};
+use anyhow::{Context, Result};
 use std::process::ExitCode;
 
 use fsc_core::config::Config;
@@ -43,36 +42,9 @@ fn fetch_all() -> Result<()> {
 }
 
 fn fetch(m: &ModelFile) -> Result<()> {
-    let name = m.path.file_name().unwrap_or_default().to_string_lossy();
-    let Some(url) = m.url.as_deref() else {
-        bail!(
-            "can't download the {}: `voice.piper_voice` must look like locale-name-quality, e.g. \"en_GB-alan-medium\"",
-            m.label
-        );
-    };
-    let resp = ureq::get(url).call()?;
-    if resp.status() != 200 {
-        bail!("HTTP {}", resp.status());
-    }
-    let total: Option<u64> = resp
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok());
-    let mut body = resp.into_body().into_with_config().limit(u64::MAX).reader();
-
-    let part = m.path.with_extension("part");
-    let mut out = std::fs::File::create(&part)?;
-    let mut buf = vec![0u8; 1 << 16];
-    let mut done: u64 = 0;
+    let name = m.path.file_name().unwrap_or_default().to_string_lossy().to_string();
     let mut last_pct = u64::MAX;
-    loop {
-        let n = body.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        out.write_all(&buf[..n])?;
-        done += n as u64;
+    models::download(m, |done, total| {
         if let Some(t) = total {
             let pct = done * 100 / t.max(1);
             if pct != last_pct {
@@ -80,9 +52,7 @@ fn fetch(m: &ModelFile) -> Result<()> {
                 eprint!("\r{name} ({}): {pct:>3}% of {:.0} MB", m.label, t as f64 / 1e6);
             }
         }
-    }
+    })?;
     eprintln!("\r{name} ({}): done{:>20}", m.label, "");
-    out.flush()?;
-    std::fs::rename(&part, &m.path)?;
     Ok(())
 }
