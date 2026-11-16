@@ -63,7 +63,8 @@ gpu = true                               # whisper on Vulkan
 piper_voice = ""                         # empty = the language's usual one; any from huggingface.co/rhasspy/piper-voices (tray: Voice)
 speech_rate = 1.0
 speak = "voice"                          # speak replies to spoken prompts: "voice", "always", "never" (tray: Speak replies)
-input_device = ""                        # the mic's name or part of it; empty = system default (tray: Microphone, `fsc mic`)
+input_device = ""                        # the mic's name or part of it; empty = system default (tray: Microphone, `fsc mic`).
+                                         # A named mic that's unplugged is waited for, never swapped for another.
 end_silence_ms = 1500                    # pause that ends an utterance; raise it if you get cut off mid-thought
 no_speech_timeout_ms = 6000
 max_utterance_secs = 30

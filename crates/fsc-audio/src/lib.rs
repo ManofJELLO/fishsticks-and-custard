@@ -38,7 +38,7 @@ use tts::Tts;
 use vad::{CHUNK, Vad};
 
 pub use spectrum::BANDS;
-pub use io::microphones;
+pub use io::{Microphone, is_device_id, microphones, which_mic};
 pub use wake::check_phrase as check_wake_phrase;
 
 #[derive(Debug, Clone)]
@@ -50,6 +50,9 @@ pub enum AudioEvent {
     MicWaiting,
     /// Real audio is now arriving: speak.
     MicLive,
+    /// The mic named in `voice.input_device` is missing (`Some(name)`): it's
+    /// waited for, never swapped for another. `None`: it's back.
+    MicMissing(Option<String>),
     /// Band levels 0..1, low to high frequency.
     Spectrum(Vec<f32>),
     /// The VAD heard speech start.
@@ -465,6 +468,8 @@ struct Engine<F> {
     watching: Option<Watching>,
     wake_enabled: bool,
     watch_failed_at: Option<Instant>,
+    /// The named mic was reported missing (so it's said once, not on every retry).
+    mic_missing: bool,
     conversation: bool,
     speaking: Option<Speaking>,
     /// When a spoken sentence last contained the wake phrase.
@@ -521,6 +526,7 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             watching: None,
             wake_enabled: true,
             watch_failed_at: None,
+            mic_missing: false,
             conversation: false,
             speaking: None,
             said_phrase_at: None,
@@ -640,7 +646,15 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                 // Reuse an open mic: it's already live (no Bluetooth switch wait).
                 let held = self.take_mic();
                 let reused = held.is_some();
-                match held.map(Ok).unwrap_or_else(|| Mic::open(&self.cfg.input_device)) {
+                let opened = match held {
+                    Some(mic) => Ok(mic),
+                    None => {
+                        let opened = Mic::open(&self.cfg.input_device);
+                        self.mic_result(opened.as_ref().map(|_| ()));
+                        opened
+                    }
+                };
+                match opened {
                     Ok(mic) => {
                         if let Some(v) = self.vad.as_mut() {
                             v.reset();
@@ -660,7 +674,11 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                         self.analyzer.reset();
                     }
                     Err(e) => {
-                        (self.emit)(AudioEvent::Error(format!("microphone: {e:#}")));
+                        match e.downcast_ref::<io::MicMissing>() {
+                            // Said every time it's asked for, not just the first.
+                            Some(m) => (self.emit)(AudioEvent::MicMissing(Some(m.0.clone()))),
+                            None => (self.emit)(AudioEvent::Error(format!("microphone: {e:#}"))),
+                        }
                         (self.emit)(AudioEvent::Transcript(String::new()));
                     }
                 }
@@ -708,6 +726,12 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             Cmd::InputDevice(name) => {
                 eprintln!("fsc: microphone is now {:?}", if name.is_empty() { "the system default" } else { &name });
                 self.cfg.input_device = name;
+                // Say now whether it's there (opening it may be a while off,
+                // with the wake word muted).
+                // Always said: the UI has just shown the new mic as chosen.
+                let missing = !io::mic_present(&self.cfg.input_device);
+                self.mic_missing = missing;
+                (self.emit)(AudioEvent::MicMissing(missing.then(|| self.cfg.input_device.clone())));
                 // The wake watch moves over now (step_watch reopens it). A
                 // recording in progress finishes on the old one, and a mic
                 // held for a reply or a conversation is let go when next
@@ -859,6 +883,26 @@ impl<F: Fn(AudioEvent)> Engine<F> {
         }
     }
 
+    /// Say when the named mic goes missing or comes back (once each).
+    fn mic_result(&mut self, r: std::result::Result<(), &anyhow::Error>) {
+        let missing = r.err().and_then(|e| e.downcast_ref::<io::MicMissing>());
+        match (missing, self.mic_missing) {
+            (Some(m), false) => {
+                eprintln!("fsc: {m}; waiting for it");
+                self.mic_missing = true;
+                (self.emit)(AudioEvent::MicMissing(Some(m.0.clone())));
+            }
+            // Back (opening it may still fail for another reason, which is
+            // reported as that).
+            (None, true) => {
+                eprintln!("fsc: microphone {:?} is back", self.cfg.input_device);
+                self.mic_missing = false;
+                (self.emit)(AudioEvent::MicMissing(None));
+            }
+            _ => {}
+        }
+    }
+
     fn wake_active(&self) -> bool {
         self.cfg.wake_word && self.wake_enabled && self.vad.is_some() && self.stt.is_some()
     }
@@ -894,7 +938,9 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             if self.watch_failed_at.is_some_and(|t| t.elapsed() < WATCH_RETRY) {
                 return;
             }
-            match Mic::open(&self.cfg.input_device) {
+            let opened = Mic::open(&self.cfg.input_device);
+            self.mic_result(opened.as_ref().map(|_| ()));
+            match opened {
                 Ok(mic) => {
                     eprintln!("fsc: watching for the wake phrase");
                     self.watch_failed_at = None;
@@ -904,7 +950,10 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                     self.watching = Some(Watching::new(mic));
                 }
                 Err(e) => {
-                    eprintln!("fsc: wake word mic unavailable: {e:#}");
+                    // Said once; a missing mic is retried every WATCH_RETRY.
+                    if e.downcast_ref::<io::MicMissing>().is_none() {
+                        eprintln!("fsc: wake word mic unavailable: {e:#}");
+                    }
                     self.watch_failed_at = Some(Instant::now());
                     return;
                 }

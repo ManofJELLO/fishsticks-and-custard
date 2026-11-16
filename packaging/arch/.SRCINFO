@@ -1,6 +1,6 @@
 pkgbase = fishsticks-and-custard
 	pkgdesc = Voice desktop assistant for Hyprland on Claude, Codex, Antigravity or OpenCode (wake word, push-to-talk, tray)
-	pkgver = 0.8.0
+	pkgver = 0.8.1
 	pkgrel = 1
 	url = https://github.com/ManofJELLO/fishsticks-and-custard
 	install = fishsticks-and-custard.install
@@ -32,7 +32,7 @@ pkgbase = fishsticks-and-custard
 	optdepends = opencode: OpenCode (free models, or your own providers) as the agent
 	options = !lto
 	options = !debug
-	source = fishsticks-and-custard::git+https://github.com/ManofJELLO/fishsticks-and-custard.git#tag=v0.8.0
+	source = fishsticks-and-custard::git+https://github.com/ManofJELLO/fishsticks-and-custard.git#tag=v0.8.1
 	sha256sums = SKIP
 
 pkgname = fishsticks-and-custard

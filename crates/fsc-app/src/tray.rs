@@ -21,6 +21,8 @@ pub struct MenuState {
     pub choices: Choices,
     /// `voice.input_device`: "" is the system's default mic.
     pub mic: String,
+    /// That mic is named but not connected (said in the tooltip).
+    pub mic_missing: bool,
     pub speak: SpeakMode,
     /// The language's code (`fsc_core::lang`).
     pub language: &'static str,
@@ -36,6 +38,7 @@ impl MenuState {
             agents: AgentKind::ALL.map(|k| cfg.available(k)),
             choices: Choices::default(),
             mic: cfg.voice.input_device.clone(),
+            mic_missing: false,
             speak: cfg.voice.speak,
             language: cfg.voice.spoken().code,
             voice: cfg.voice.voice(),
@@ -53,7 +56,9 @@ struct FscTray {
     st: IconState,
     menu: MenuState,
     /// The microphones PipeWire has, looked up again whenever the menu opens.
-    mics: Vec<String>,
+    mics: Vec<fsc_audio::Microphone>,
+    /// Every mic seen while running, id -> name: to name one that's gone.
+    seen: std::collections::HashMap<String, String>,
     refresh: mpsc::UnboundedSender<()>,
     tx: async_channel::Sender<AppEvent>,
 }
@@ -149,25 +154,28 @@ impl FscTray {
     fn mic_menu(&self) -> MenuItem<Self> {
         let current = self.menu.mic.trim();
         let default = current.is_empty() || current.eq_ignore_ascii_case("default");
-        // What to save for each entry; "" is the default.
+        // What to save for each entry (a mic's id; "" is the default), and
+        // what to show.
         let mut values: Vec<String> = vec![String::new()];
-        values.extend(self.mics.iter().cloned());
-        let lower = current.to_lowercase();
+        let mut labels: Vec<String> = vec!["System default".into()];
+        for m in &self.mics {
+            values.push(m.id.clone());
+            labels.push(menu_label(&m.name));
+        }
         let selected = if default {
-            Some(0)
+            0
         } else {
-            // Saved by the menu: the exact name. Typed in the file: part of it.
-            values.iter().skip(1).position(|m| m.to_lowercase() == lower)
-                .or_else(|| values.iter().skip(1).position(|m| m.to_lowercase().contains(&lower)))
-                .map(|i| i + 1)
+            match fsc_audio::which_mic(current, &self.mics) {
+                Some(m) => self.mics.iter().position(|x| x.id == m.id).map_or(0, |i| i + 1),
+                None => {
+                    let name = self.seen.get(current).map(String::as_str).unwrap_or(current);
+                    values.push(current.to_string());
+                    labels.push(format!("{} (not connected)", menu_label(name)));
+                    values.len() - 1
+                }
+            }
         };
-        let mut labels: Vec<String> = values.iter().map(|v| if v.is_empty() { "System default".into() } else { menu_label(v) }).collect();
-        let selected = selected.unwrap_or_else(|| {
-            values.push(current.to_string());
-            labels.push(format!("{} (not connected)", menu_label(current)));
-            values.len() - 1
-        });
-        let title = if default { "System default".to_string() } else { labels[selected].clone() };
+        let title = labels[selected].clone();
         let options = labels.into_iter().map(|label| RadioItem { label, ..Default::default() }).collect();
         SubMenu {
             label: format!("Microphone: {title}"),
@@ -306,6 +314,9 @@ impl ksni::Tray for FscTray {
         if self.st.muted {
             desc.push_str(" · wake word muted");
         }
+        if self.menu.mic_missing {
+            desc.push_str(" · microphone not connected");
+        }
         ToolTip { title: "Fishsticks & Custard".into(), description: desc, ..Default::default() }
     }
 
@@ -392,7 +403,8 @@ pub async fn run(
     // appears; with it, ksni waits and registers once the watcher shows up.
     let (refresh, mut refreshes) = mpsc::unbounded_channel();
     let mut mics = list_mics().await;
-    let handle = match (FscTray { st: initial, menu, mics: mics.clone(), refresh, tx }).assume_sni_available(true).spawn().await {
+    let seen = mics.iter().map(|m| (m.id.clone(), m.name.clone())).collect();
+    let handle = match (FscTray { st: initial, menu, mics: mics.clone(), seen, refresh, tx }).assume_sni_available(true).spawn().await {
         Ok(h) => h,
         Err(e) => {
             eprintln!("fsc: tray icon unavailable: {e}");
@@ -413,7 +425,12 @@ pub async fn run(
                 if now != mics {
                     mics = now;
                     let m = mics.clone();
-                    handle.update(|t| t.mics = m).await;
+                    handle
+                        .update(|t| {
+                            t.seen.extend(m.iter().map(|x| (x.id.clone(), x.name.clone())));
+                            t.mics = m;
+                        })
+                        .await;
                 }
             }
         }
@@ -421,6 +438,6 @@ pub async fn run(
 }
 
 /// `fsc_audio::microphones`, off the async threads (it runs `pw-dump`).
-async fn list_mics() -> Vec<String> {
+async fn list_mics() -> Vec<fsc_audio::Microphone> {
     tokio::task::spawn_blocking(fsc_audio::microphones).await.unwrap_or_default()
 }

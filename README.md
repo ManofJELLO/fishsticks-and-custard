@@ -197,7 +197,7 @@ show in rofi with `rofi -show drun -drun-show-actions`.
 | `fsc forget` / tray **Forget memories** | delete that memory and start a fresh session |
 | `fsc agent [name]` / tray **Agent** | say which agent answers, or switch (claude, codex, antigravity, opencode, acp) |
 | `fsc model [id]` / `fsc mode [id]` / tray **Model**, **Mode** | list the agent's models or modes, or switch |
-| `fsc mic [name]` / tray **Microphone** | list the microphones, or listen with another (`default` for the system's; saved as `voice.input_device`) |
+| `fsc mic [name]` / tray **Microphone** | list the microphones, or listen with another (`default` for the system's; saved as `voice.input_device`). A named mic that's unplugged is waited for, and the tray says so; no other mic is opened in its place |
 | `fsc speak [voice\|always\|never]` / tray **Speak replies** | when replies are read aloud: replies to spoken prompts (*When I talk*), always or never (saved as `voice.speak`) |
 | `fsc settings` / tray **Settings…** | open HyprCustard if it's installed, otherwise `config.toml` in your editor |
 | `fsc language [code]` / tray **Language** | list the languages, or speak and listen in another (saved as `voice.language`) |
@@ -299,7 +299,10 @@ mic, WirePlumber switches them to headset mode (HFP), which takes about 1–5 s.
 says **WAITING FOR MIC…** until audio actually arrives. The mic then stays open until the
 spoken reply finishes (`voice.hold_mic_while_speaking`), because closing it flips the
 headset back and removes the device the reply would play on. Replies therefore play at
-headset quality. An always-on wake word (step 3) works better with a separate mic.
+headset quality. An always-on wake word (step 3) works better with a separate mic: name
+it in the tray's **Microphone** menu. Then, if it's unplugged, the wake word waits for it
+to come back instead of opening the headset's mic, which would drop the headset into
+call quality whenever the separate mic goes away.
 
 **Conversation mode** (`voice.conversation`, on by default): after a spoken reply it
 listens again automatically, like a phone call, keeping the mic and a warm output

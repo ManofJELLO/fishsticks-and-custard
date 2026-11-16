@@ -106,6 +106,8 @@ struct State {
     wake_phrase: String,
     /// `voice.input_device` and `voice.speak`, as changed from the tray.
     mic: String,
+    /// That mic is named but not connected (it's waited for).
+    mic_missing: bool,
     speak: SpeakMode,
     /// `voice.language` as set (empty: the locale's) and what it comes to.
     language: String,
@@ -363,6 +365,7 @@ impl Ui {
                 muted: false,
                 wake_phrase,
                 mic,
+                mic_missing: false,
                 speak,
                 language,
                 spoken,
@@ -908,10 +911,22 @@ impl Ui {
                 self.maybe_follow_up();
             }
             AudioEvent::Wake { command } => self.on_wake(command),
+            AudioEvent::MicMissing(name) => {
+                let was = std::mem::replace(&mut self.st.borrow_mut().mic_missing, name.is_some());
+                match name {
+                    Some(n) => {
+                        // By the name it's listed under, if it's an id.
+                        let shown = if fsc_audio::is_device_id(&n) { "MIC".to_string() } else { format!("MIC {}", n.to_uppercase()) };
+                        self.flash_meta_for(&short_meta(&format!("{shown} NOT CONNECTED")), Duration::from_secs(8));
+                    }
+                    None if was => self.flash_meta("MIC CONNECTED"),
+                    None => {}
+                }
+                self.push_tray();
+            }
             AudioEvent::Error(err) => {
                 eprintln!("fsc: {err}");
-                let short: String = err.to_uppercase().chars().take(44).collect();
-                self.flash_meta(&short);
+                self.flash_meta(&short_meta(&err.to_uppercase()));
             }
         }
     }
@@ -1028,36 +1043,44 @@ impl Ui {
     fn set_mic(self: &Rc<Self>, name: Option<String>) -> Reply {
         let current = self.st.borrow().mic.clone();
         let is_default = |s: &str| s.trim().is_empty() || s.trim().eq_ignore_ascii_case("default");
+        let mics = fsc_audio::microphones();
         let Some(name) = name else {
-            let mics = fsc_audio::microphones();
-            let low = current.trim().to_lowercase();
-            // As Mic::open picks: the exact name, else the first containing it.
-            let chosen = if is_default(&current) {
-                None
-            } else {
-                mics.iter().position(|m| m.to_lowercase() == low).or_else(|| mics.iter().position(|m| m.to_lowercase().contains(&low)))
-            };
+            let chosen = fsc_audio::which_mic(&current, &mics);
             let mark = |on: bool| if on { "*" } else { " " };
             let mut lines = vec![format!("{} default  (the system's)", mark(is_default(&current)))];
-            lines.extend(mics.iter().enumerate().map(|(i, m)| format!("{} {m}", mark(chosen == Some(i)))));
+            lines.extend(mics.iter().map(|m| format!("{} {}  ({})", mark(chosen.is_some_and(|c| c.id == m.id)), m.name, m.id)));
             if !is_default(&current) && chosen.is_none() {
-                lines.push(format!("* {current}  (not connected: using the system's)"));
+                lines.push(format!("* {current}  (not connected: waiting for it)"));
             }
             return Reply::state(lines.join("\n"));
         };
-        let name = if is_default(&name) { String::new() } else { name.trim().to_string() };
+        let name = name.trim();
         if name.contains('\n') {
             return Reply::err("a microphone name is one line");
         }
-        self.audio.set_input_device(name.clone());
-        self.st.borrow_mut().mic = name.clone();
+        // A mic's full name, as listed, is saved as its id: that one mic and
+        // no other. Part of a name, or one not connected, is saved as typed.
+        let (setting, shown) = if is_default(name) {
+            (String::new(), "the system's default microphone".to_string())
+        } else {
+            match mics.iter().find(|m| m.name.eq_ignore_ascii_case(name) || m.id == name) {
+                Some(m) => (m.id.clone(), m.name.clone()),
+                None => (name.to_string(), name.to_string()),
+            }
+        };
+        self.audio.set_input_device(setting.clone());
+        {
+            let mut st = self.st.borrow_mut();
+            st.mic = setting.clone();
+            // The audio thread says if the new one is missing.
+            st.mic_missing = false;
+        }
         self.push_tray();
-        let shown = if name.is_empty() { "SYSTEM DEFAULT".to_string() } else { name.to_uppercase() };
-        self.flash_meta(&format!("MIC: {shown}"));
-        let what = if name.is_empty() { "the system's default microphone".to_string() } else { format!("{name:?}") };
-        match Config::save_value("voice", "input_device", &name) {
-            Ok(()) => Reply::state(format!("listening with {what}")),
-            Err(e) => Reply::state(format!("listening with {what} until fscd restarts (not saved: {e:#})")),
+        let flash = if setting.is_empty() { "SYSTEM DEFAULT".to_string() } else { shown.to_uppercase() };
+        self.flash_meta(&short_meta(&format!("MIC: {flash}")));
+        match Config::save_value("voice", "input_device", &setting) {
+            Ok(()) => Reply::state(format!("listening with {shown}")),
+            Err(e) => Reply::state(format!("listening with {shown} until fscd restarts (not saved: {e:#})")),
         }
     }
 
@@ -1994,6 +2017,7 @@ impl Ui {
             agents: st.agents,
             choices: st.choices.clone(),
             mic: st.mic.clone(),
+            mic_missing: st.mic_missing,
             speak: st.speak,
             language: st.spoken.code,
             voice: st.wanted.clone().unwrap_or_else(|| st.voice_name.clone()),
@@ -2116,6 +2140,17 @@ fn label(text: &str, class: &str) -> gtk::Label {
     l.set_max_width_chars(1);
     l.set_hexpand(true);
     l
+}
+
+/// What fits the panel's status line.
+fn short_meta(s: &str) -> String {
+    const MAX: usize = 44;
+    if s.chars().count() <= MAX {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(MAX - 1).collect();
+    out.push('…');
+    out
 }
 
 /// "search the web" -> "Search the web."

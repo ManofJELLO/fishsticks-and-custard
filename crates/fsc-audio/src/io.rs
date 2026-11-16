@@ -14,7 +14,38 @@ use std::time::{Duration, Instant};
 
 pub const MIC_RATE: u32 = 16_000;
 
-fn find_input(host: &cpal::Host, name: &str) -> Option<Device> {
+/// The mic named in `voice.input_device` isn't there (unplugged, switched
+/// away, a headset gone). It's waited for rather than replaced: the system's
+/// default could be a Bluetooth headset, whose mic forces it into
+/// call-quality audio.
+#[derive(Debug)]
+pub struct MicMissing(pub String);
+
+impl std::fmt::Display for MicMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "microphone {:?} isn't connected", self.0)
+    }
+}
+
+impl std::error::Error for MicMissing {}
+
+/// PipeWire's id for a node ("alsa_input.usb-046d_HD_Pro_Webcam_C920_…"),
+/// as the tray saves a mic: matched exactly, never in part, so a missing
+/// mic is never taken to mean another whose name contains it.
+pub fn is_device_id(name: &str) -> bool {
+    !name.trim().is_empty() && !name.contains(char::is_whitespace) && name.contains('.')
+}
+
+/// Whether the mic `name` names is there (or `name` means the default).
+pub fn mic_present(name: &str) -> bool {
+    find_input(&cpal::default_host(), name).is_ok()
+}
+
+/// The mic to open: the one `name` names (`Err` if it isn't there), or the
+/// system's default when `name` is empty or "default". A device id
+/// (`is_device_id`) must match exactly; any other name is a mic's name, or
+/// part of it, as typed in config.toml ("C920").
+fn find_input(host: &cpal::Host, name: &str) -> Result<Device> {
     let name = name.trim();
     if !name.is_empty() && !name.eq_ignore_ascii_case("default") {
         // Only real inputs: PipeWire's host also lists every speaker (as a
@@ -34,22 +65,50 @@ fn find_input(host: &cpal::Host, name: &str) -> Option<Device> {
             })
             .unwrap_or_default();
         let needle = name.to_lowercase();
-        // The exact name (as the tray menu saves it), else part of the name
-        // or of PipeWire's node name.
-        let exact = inputs.iter().position(|(_, n, _)| *n == needle);
-        let partial = || inputs.iter().position(|(_, n, id)| n.contains(&needle) || id.contains(&needle));
-        if let Some(i) = exact.or_else(partial) {
-            return Some(inputs.into_iter().nth(i)?.0);
-        }
-        eprintln!("fsc: input device matching {name:?} not found; using default");
+        let found = if is_device_id(name) {
+            let id = format!("pipewire:{needle}");
+            inputs.iter().position(|(_, _, i)| *i == id)
+        } else {
+            let exact = inputs.iter().position(|(_, n, _)| *n == needle);
+            exact.or_else(|| inputs.iter().position(|(_, n, id)| n.contains(&needle) || id.contains(&needle)))
+        };
+        return found
+            .and_then(|i| inputs.into_iter().nth(i))
+            .map(|(d, _, _)| d)
+            .ok_or_else(|| MicMissing(name.to_string()).into());
     }
-    host.default_input_device()
+    host.default_input_device().ok_or_else(|| anyhow!("no microphone found"))
 }
 
-/// The microphones PipeWire knows, by name (`node.description`), as the
-/// tray lists them. Asks `pw-dump` (part of PipeWire), which says what each
-/// node is: cpal's list also has speakers and other programs' recordings.
-pub fn microphones() -> Vec<String> {
+/// A microphone PipeWire knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Microphone {
+    /// `node.name`: what's saved (see `is_device_id`).
+    pub id: String,
+    /// `node.description`: what's shown.
+    pub name: String,
+}
+
+/// Which of `mics` the setting `voice.input_device` names, matched as
+/// `Mic::open` matches it. `None` for the default, or a mic not connected.
+pub fn which_mic<'a>(setting: &str, mics: &'a [Microphone]) -> Option<&'a Microphone> {
+    let s = setting.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("default") {
+        return None;
+    }
+    let low = s.to_lowercase();
+    if is_device_id(s) {
+        return mics.iter().find(|m| m.id.to_lowercase() == low);
+    }
+    mics.iter()
+        .find(|m| m.name.to_lowercase() == low)
+        .or_else(|| mics.iter().find(|m| m.name.to_lowercase().contains(&low) || m.id.to_lowercase().contains(&low)))
+}
+
+/// The microphones PipeWire knows, as the tray lists them. Asks `pw-dump`
+/// (part of PipeWire), which says what each node is: cpal's list also has
+/// speakers and other programs' recordings.
+pub fn microphones() -> Vec<Microphone> {
     let out = match std::process::Command::new("pw-dump").stderr(std::process::Stdio::null()).output() {
         Ok(o) if o.status.success() => o.stdout,
         Ok(o) => {
@@ -64,24 +123,25 @@ pub fn microphones() -> Vec<String> {
     parse_microphones(&out)
 }
 
-fn parse_microphones(json: &[u8]) -> Vec<String> {
+fn parse_microphones(json: &[u8]) -> Vec<Microphone> {
     let Ok(serde_json::Value::Array(objects)) = serde_json::from_slice(json) else { return Vec::new() };
-    let mut names: Vec<String> = Vec::new();
+    let mut mics: Vec<Microphone> = Vec::new();
     for o in &objects {
         let props = &o["info"]["props"];
         let class = props["media.class"].as_str().unwrap_or("");
         if !(class == "Audio/Source" || class == "Audio/Source/Virtual" || class == "Audio/Duplex") {
             continue;
         }
+        let Some(id) = props["node.name"].as_str().filter(|s| !s.trim().is_empty()) else { continue };
         let name = ["node.description", "node.nick", "node.name"]
             .iter()
             .find_map(|k| props[*k].as_str().filter(|s| !s.trim().is_empty()))
-            .unwrap_or("");
-        if !name.is_empty() && !names.iter().any(|n| n == name) {
-            names.push(name.to_string());
+            .unwrap_or(id);
+        if !mics.iter().any(|m| m.id == id) {
+            mics.push(Microphone { id: id.to_string(), name: name.to_string() });
         }
     }
-    names
+    mics
 }
 
 /// Linear resampler for the fallback path (fine for speech/visuals).
@@ -177,7 +237,7 @@ pub struct Mic {
 impl Mic {
     pub fn open(device_name: &str) -> Result<Self> {
         let host = cpal::default_host();
-        let dev = find_input(&host, device_name).ok_or_else(|| anyhow!("no microphone found"))?;
+        let dev = find_input(&host, device_name)?;
         let buf: Arc<Mutex<Vec<f32>>> = Arc::default();
 
         let dead = Arc::new(AtomicBool::new(false));
@@ -491,12 +551,29 @@ mod tests {
             props("Audio/Sink", "bluez_output.94_DB", Some("WH-XB900N")),
             props("Audio/Source", "bluez_input.94:DB", Some("WH-XB900N")),
             props("Audio/Source/Virtual", "noise_cancel", None),
-            props("Audio/Source", "alsa_input.usb-C920-dup", Some("HD Pro Webcam C920 Analog Stereo")),
+            props("Audio/Source", "alsa_input.usb-C920", Some("HD Pro Webcam C920 Analog Stereo")),
         ]);
-        assert_eq!(
-            parse_microphones(dump.to_string().as_bytes()),
-            ["HD Pro Webcam C920 Analog Stereo", "WH-XB900N", "noise_cancel"]
-        );
+        let names: Vec<(String, String)> =
+            parse_microphones(dump.to_string().as_bytes()).into_iter().map(|m| (m.id, m.name)).collect();
+        let want = [
+            ("alsa_input.usb-C920", "HD Pro Webcam C920 Analog Stereo"),
+            ("bluez_input.94:DB", "WH-XB900N"),
+            ("noise_cancel", "noise_cancel"),
+        ];
+        assert_eq!(names, want.map(|(a, b)| (a.to_string(), b.to_string())));
         assert!(parse_microphones(b"not json").is_empty());
     }
+
+    #[test]
+    fn device_ids() {
+        assert!(is_device_id("alsa_input.usb-046d_HD_Pro_Webcam_C920_98793E2F-02.analog-stereo"));
+        assert!(is_device_id("bluez_input.94:DB:56:40:85:61"));
+        assert!(!is_device_id("C920"));
+        assert!(!is_device_id("USB Audio"));
+        assert!(!is_device_id("HD Pro Webcam C920 Analog Stereo"));
+        assert!(!is_device_id(""));
+    }
 }
+
+
+
