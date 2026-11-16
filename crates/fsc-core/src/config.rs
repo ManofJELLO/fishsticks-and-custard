@@ -28,6 +28,32 @@ pub enum SpeakMode {
     Never,
 }
 
+impl SpeakMode {
+    pub const ALL: [SpeakMode; 3] = [SpeakMode::Voice, SpeakMode::Always, SpeakMode::Never];
+
+    /// As written in config.toml.
+    pub fn key(self) -> &'static str {
+        match self {
+            SpeakMode::Voice => "voice",
+            SpeakMode::Always => "always",
+            SpeakMode::Never => "never",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.key().eq_ignore_ascii_case(s.trim()))
+    }
+
+    /// For the tray menu.
+    pub fn name(self) -> &'static str {
+        match self {
+            SpeakMode::Voice => "When I talk",
+            SpeakMode::Always => "Always",
+            SpeakMode::Never => "Never",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct VoiceConfig {
@@ -525,6 +551,26 @@ impl Config {
         Ok(())
     }
 
+    /// The config file, created first if there isn't one: the packaged
+    /// example (every setting, with its default and a note) with its values
+    /// commented out, so later versions' defaults still apply.
+    pub fn ensure_file() -> Result<PathBuf> {
+        let path = Self::path().context("no config directory")?;
+        if path.exists() {
+            return Ok(path);
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        const EXAMPLE: &str = "/usr/share/fishsticks-and-custard/config.example.toml";
+        let text = match std::fs::read_to_string(EXAMPLE) {
+            Ok(example) => commented_out(&example),
+            Err(_) => format!("# Fishsticks & Custard settings. Every key is optional; see {EXAMPLE}.\n"),
+        };
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+        Ok(path)
+    }
+
     /// The assistant's home (`[agent] home`).
     pub fn home(&self) -> PathBuf {
         let base = directories::BaseDirs::new();
@@ -561,6 +607,17 @@ fn set_value(text: &str, table: &str, key: &str, value: &str) -> Result<String> 
 #[cfg(test)]
 fn set_backend(text: &str, kind: AgentKind) -> Result<String> {
     set_value(text, "agent", "backend", kind.key())
+}
+
+/// A config file's settings turned into comments; table headers and
+/// comments stay as they are.
+fn commented_out(text: &str) -> String {
+    text.lines()
+        .map(|l| {
+            let t = l.trim_start();
+            if t.is_empty() || t.starts_with('#') || t.starts_with('[') { format!("{l}\n") } else { format!("# {l}\n") }
+        })
+        .collect()
 }
 
 /// Look `prog` up like a shell would: a path as given, a name on `$PATH`.
@@ -657,5 +714,31 @@ mod tests {
         assert_eq!(t("~"), PathBuf::from("/home/u"));
         assert_eq!(t("/srv/fsc"), PathBuf::from("/srv/fsc"));
         assert_eq!(t("~other/x"), PathBuf::from("~other/x"));
+    }
+
+    #[test]
+    fn starter_config_keeps_defaults_open() {
+        let example = include_str!("../../../packaging/config.example.toml");
+        let text = commented_out(example);
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.voice.end_silence_ms, Config::default().voice.end_silence_ms);
+        // Every setting is a comment; the tables are there to add to.
+        assert!(text.lines().all(|l| l.trim().is_empty() || l.trim_start().starts_with(['#', '['])));
+        assert!(text.contains("[voice]") && text.contains("# speak = \"voice\""));
+        // Saving into it keeps working.
+        let saved = set_value(&text, "voice", "speak", "always").unwrap();
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(cfg.voice.speak, SpeakMode::Always);
+    }
+
+    #[test]
+    fn speak_mode_keys() {
+        for m in SpeakMode::ALL {
+            assert_eq!(SpeakMode::from_key(m.key()), Some(m));
+            let cfg: Config = toml::from_str(&format!("[voice]\nspeak = \"{}\"", m.key())).unwrap();
+            assert_eq!(cfg.voice.speak, m);
+        }
+        assert_eq!(SpeakMode::from_key(" Always "), Some(SpeakMode::Always));
+        assert_eq!(SpeakMode::from_key("loud"), None);
     }
 }

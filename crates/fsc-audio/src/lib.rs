@@ -38,6 +38,7 @@ use tts::Tts;
 use vad::{CHUNK, Vad};
 
 pub use spectrum::BANDS;
+pub use io::microphones;
 pub use wake::check_phrase as check_wake_phrase;
 
 #[derive(Debug, Clone)]
@@ -87,6 +88,8 @@ enum Cmd {
     WakeEnabled(bool),
     /// Listen for another phrase (already checked with `check_wake_phrase`).
     WakePhrase(String),
+    /// Use another microphone (`voice.input_device`) from now on.
+    InputDevice(String),
 }
 
 #[derive(Clone)]
@@ -124,6 +127,10 @@ impl AudioHandle {
     }
     pub fn set_wake_phrase(&self, phrase: impl Into<String>) {
         let _ = self.tx.send(Cmd::WakePhrase(phrase.into()));
+    }
+    /// Use another microphone: a substring of its name, "" for the system's.
+    pub fn set_input_device(&self, name: impl Into<String>) {
+        let _ = self.tx.send(Cmd::InputDevice(name.into()));
     }
 }
 
@@ -619,6 +626,16 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                 }
                 self.cfg.wake_phrase = phrase;
             }
+            Cmd::InputDevice(name) => {
+                eprintln!("fsc: microphone is now {:?}", if name.is_empty() { "the system default" } else { &name });
+                self.cfg.input_device = name;
+                // The wake watch moves over now (step_watch reopens it). A
+                // recording in progress finishes on the old one, and a mic
+                // held for a reply or a conversation is let go when next
+                // handed over (take_mic / park_mic).
+                self.watching = None;
+                self.watch_failed_at = None;
+            }
             Cmd::ReleaseMic => {
                 if !self.conversation
                     && self.held.is_some()
@@ -770,13 +787,16 @@ impl<F: Fn(AudioEvent)> Engine<F> {
     /// Take the open mic from whoever is idling with it.
     fn take_mic(&mut self) -> Option<Mic> {
         let mic = self.held.take().map(|h| h.mic).or_else(|| self.watching.take().map(|w| w.mic))?;
+        if mic.device != self.cfg.input_device {
+            return None; // another mic was chosen since: open that one
+        }
         mic.drain();
         Some(mic)
     }
 
     /// A mode is done with the mic: watch for the wake phrase with it, or close it.
     fn park_mic(&mut self, mic: Mic) {
-        if self.wake_active() {
+        if self.wake_active() && mic.device == self.cfg.input_device {
             mic.drain();
             if let Some(v) = self.vad.as_mut() {
                 v.reset();

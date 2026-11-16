@@ -103,6 +103,9 @@ struct State {
     muted: bool,
     /// `voice.wake_phrase`, as changed by `fsc wake`.
     wake_phrase: String,
+    /// `voice.input_device` and `voice.speak`, as changed from the tray.
+    mic: String,
+    speak: SpeakMode,
     model: String,
     /// The agent answering, and which are installed (`AgentKind::ALL` order).
     agent: AgentKind,
@@ -299,6 +302,7 @@ impl Ui {
         let (agent, agents) = (cfg.agent.backend, AgentKind::ALL.map(|k| cfg.available(k)));
         let memory_on = cfg.memory();
         let wake_phrase = cfg.voice.wake_phrase.clone();
+        let (mic, speak) = (cfg.voice.input_device.clone(), cfg.voice.speak);
         let viz = Viz::new(&cfg.ui);
         let ui = Rc::new(Ui {
             cfg,
@@ -325,6 +329,8 @@ impl Ui {
                 desktop_accent: None,
                 muted: false,
                 wake_phrase,
+                mic,
+                speak,
                 model,
                 agent,
                 agents,
@@ -588,6 +594,9 @@ impl Ui {
             }
             Command::Model { value } => return self.set_choice(Setting::Model, value),
             Command::Mode { value } => return self.set_choice(Setting::Mode, value),
+            Command::Mic { name } => return self.set_mic(name),
+            Command::Speak { mode } => return self.set_speak(mode),
+            Command::Settings => return self.open_settings(),
             Command::Quit => self.quit(),
         }
         Reply::ok()
@@ -885,7 +894,7 @@ impl Ui {
     fn should_speak(&self) -> bool {
         let st = self.st.borrow();
         st.voice.tts
-            && match self.cfg.voice.speak {
+            && match st.speak {
                 SpeakMode::Voice => st.voice_turn,
                 SpeakMode::Always => true,
                 SpeakMode::Never => false,
@@ -936,6 +945,96 @@ impl Ui {
         match Config::save_value("voice", "wake_phrase", &phrase) {
             Ok(()) => Reply::state(format!("listening for {phrase:?}")),
             Err(e) => Reply::state(format!("listening for {phrase:?} until fscd restarts (not saved: {e:#})")),
+        }
+    }
+
+    /// `fsc mic` and the tray's Microphone menu: list the mics, or listen
+    /// with another (saved as `voice.input_device`).
+    fn set_mic(self: &Rc<Self>, name: Option<String>) -> Reply {
+        let current = self.st.borrow().mic.clone();
+        let is_default = |s: &str| s.trim().is_empty() || s.trim().eq_ignore_ascii_case("default");
+        let Some(name) = name else {
+            let mics = fsc_audio::microphones();
+            let low = current.trim().to_lowercase();
+            // As Mic::open picks: the exact name, else the first containing it.
+            let chosen = if is_default(&current) {
+                None
+            } else {
+                mics.iter().position(|m| m.to_lowercase() == low).or_else(|| mics.iter().position(|m| m.to_lowercase().contains(&low)))
+            };
+            let mark = |on: bool| if on { "*" } else { " " };
+            let mut lines = vec![format!("{} default  (the system's)", mark(is_default(&current)))];
+            lines.extend(mics.iter().enumerate().map(|(i, m)| format!("{} {m}", mark(chosen == Some(i)))));
+            if !is_default(&current) && chosen.is_none() {
+                lines.push(format!("* {current}  (not connected: using the system's)"));
+            }
+            return Reply::state(lines.join("\n"));
+        };
+        let name = if is_default(&name) { String::new() } else { name.trim().to_string() };
+        if name.contains('\n') {
+            return Reply::err("a microphone name is one line");
+        }
+        self.audio.set_input_device(name.clone());
+        self.st.borrow_mut().mic = name.clone();
+        self.push_tray();
+        let shown = if name.is_empty() { "SYSTEM DEFAULT".to_string() } else { name.to_uppercase() };
+        self.flash_meta(&format!("MIC: {shown}"));
+        let what = if name.is_empty() { "the system's default microphone".to_string() } else { format!("{name:?}") };
+        match Config::save_value("voice", "input_device", &name) {
+            Ok(()) => Reply::state(format!("listening with {what}")),
+            Err(e) => Reply::state(format!("listening with {what} until fscd restarts (not saved: {e:#})")),
+        }
+    }
+
+    /// `fsc speak` and the tray's Speak replies menu (saved as `voice.speak`).
+    fn set_speak(self: &Rc<Self>, mode: Option<String>) -> Reply {
+        let Some(mode) = mode else { return Reply::state(self.st.borrow().speak.key()) };
+        let Some(mode) = SpeakMode::from_key(&mode) else {
+            return Reply::err(format!("speak {mode:?}? Use voice (replies to spoken prompts), always or never"));
+        };
+        self.st.borrow_mut().speak = mode;
+        self.push_tray();
+        if mode == SpeakMode::Never {
+            // Quiet now, not after the reply being read.
+            self.audio.stop_speaking();
+        }
+        self.flash_meta(&format!("SPEAK REPLIES: {}", mode.name().to_uppercase()));
+        match Config::save_value("voice", "speak", mode.key()) {
+            Ok(()) => Reply::state(format!("speaking replies: {}", mode.name().to_lowercase())),
+            Err(e) => Reply::state(format!("speaking replies: {} until fscd restarts (not saved: {e:#})", mode.name().to_lowercase())),
+        }
+    }
+
+    /// The tray's Settings…: HyprCustard (whose FSC page covers everything)
+    /// when it's installed, else config.toml in the desktop's editor.
+    fn open_settings(&self) -> Reply {
+        let (prog, args, what) = if fsc_core::config::find_program("hyprcustard").is_some() {
+            ("hyprcustard", vec![], "HyprCustard".to_string())
+        } else {
+            match Config::ensure_file() {
+                Ok(path) => ("xdg-open", vec![path.display().to_string()], path.display().to_string()),
+                Err(e) => return Reply::err(format!("no config file: {e:#}")),
+            }
+        };
+        use std::os::unix::process::CommandExt;
+        // Its own process group, so it outlives fscd and isn't sent fscd's
+        // signals; reaped in the background.
+        let child = std::process::Command::new(prog)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .process_group(0)
+            .spawn();
+        match child {
+            Ok(mut c) => {
+                std::thread::spawn(move || c.wait());
+                Reply::state(format!("opened {what}"))
+            }
+            Err(e) => {
+                let msg = format!("could not run {prog}: {e}");
+                notify(&format!("{msg}. Settings are in {}", Config::path().map(|p| p.display().to_string()).unwrap_or_default()));
+                Reply::err(msg)
+            }
         }
     }
 
@@ -1520,7 +1619,13 @@ impl Ui {
             st.tray_sent = Some(state);
             let _ = self.tray_tx.send(TrayUpdate::Icon(state));
         }
-        let menu = tray::MenuState { agent: st.agent, agents: st.agents, choices: st.choices.clone() };
+        let menu = tray::MenuState {
+            agent: st.agent,
+            agents: st.agents,
+            choices: st.choices.clone(),
+            mic: st.mic.clone(),
+            speak: st.speak,
+        };
         if st.menu_sent.as_ref() != Some(&menu) {
             st.menu_sent = Some(menu.clone());
             let _ = self.tray_tx.send(TrayUpdate::Menu(menu));

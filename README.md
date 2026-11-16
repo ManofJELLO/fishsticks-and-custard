@@ -69,7 +69,9 @@ The tray menu's **Model** and **Mode** submenus list what the current agent offe
 applies to the conversation you're in, and is saved in that agent's section of the config
 so later sessions keep it. The mode is the agent's own idea of how much to ask first: for
 Claude, Ask (default), Accept edits, Auto or Plan; Codex's read-only asks before edits,
-commands and network use. The popup shows the model and mode in its top line.
+commands and network use. The popup shows the model and mode in its top line. Both
+submenus stay in the tray menu, greyed out, while an agent is starting and hasn't said
+what it offers yet, so the menu never changes length under the pointer.
 
 | `backend` | Needs | Sign in with |
 |---|---|---|
@@ -194,6 +196,9 @@ show in rofi with `rofi -show drun -drun-show-actions`.
 | `fsc forget` / tray **Forget memories** | delete that memory and start a fresh session |
 | `fsc agent [name]` / tray **Agent** | say which agent answers, or switch (claude, codex, antigravity, opencode, acp) |
 | `fsc model [id]` / `fsc mode [id]` / tray **Model**, **Mode** | list the agent's models or modes, or switch |
+| `fsc mic [name]` / tray **Microphone** | list the microphones, or listen with another (`default` for the system's; saved as `voice.input_device`) |
+| `fsc speak [voice\|always\|never]` / tray **Speak replies** | when replies are read aloud: replies to spoken prompts (*When I talk*), always or never (saved as `voice.speak`) |
+| `fsc settings` / tray **Settings…** | open HyprCustard if it's installed, otherwise `config.toml` in your editor |
 
 ## Customise
 
@@ -206,7 +211,10 @@ show in rofi with `rofi -show drun -drun-show-actions`.
   allow-list until you've trusted the folder interactively.) File edits (`Edit`, `Write`)
   are asked about. Versions before 0.6.4 denied them; updating removes those three deny rules
   once, so add them back to `deny` if you'd rather it never edits files.
-- **Look and model:** `~/.config/fsc/config.toml` (see `packaging/config.example.toml`).
+- **Everything else:** `~/.config/fsc/config.toml` (see `packaging/config.example.toml`), or
+  HyprCustard's Fishsticks & Custard page. The tray's **Settings…** opens whichever you
+  have; with no config file yet it starts one listing every setting, commented out. Edits
+  to the file apply when fscd restarts; the tray menus and `fsc` commands apply at once.
 - Preview the tray icons: `fscd --dump-icons /some/dir`.
 
 ## Permission questions

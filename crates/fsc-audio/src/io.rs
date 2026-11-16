@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
+use cpal::{BufferSize, Device, DeviceDirection, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,20 +15,73 @@ use std::time::{Duration, Instant};
 pub const MIC_RATE: u32 = 16_000;
 
 fn find_input(host: &cpal::Host, name: &str) -> Option<Device> {
-    if !name.is_empty() {
+    let name = name.trim();
+    if !name.is_empty() && !name.eq_ignore_ascii_case("default") {
+        // Only real inputs: PipeWire's host also lists every speaker (as a
+        // capture of what it plays), and a headset's speaker and mic often
+        // share a name.
+        let inputs: Vec<(Device, String, String)> = host
+            .input_devices()
+            .map(|devs| {
+                devs.filter_map(|d| {
+                    let desc = d.description().ok()?;
+                    (desc.direction() == DeviceDirection::Input).then(|| {
+                        let id = d.id().map(|i| i.to_string()).unwrap_or_default();
+                        (d, desc.name().to_lowercase(), id.to_lowercase())
+                    })
+                })
+                .collect()
+            })
+            .unwrap_or_default();
         let needle = name.to_lowercase();
-        if let Ok(devs) = host.input_devices() {
-            for d in devs {
-                if let Ok(desc) = d.description()
-                    && desc.name().to_lowercase().contains(&needle)
-                {
-                    return Some(d);
-                }
-            }
+        // The exact name (as the tray menu saves it), else part of the name
+        // or of PipeWire's node name.
+        let exact = inputs.iter().position(|(_, n, _)| *n == needle);
+        let partial = || inputs.iter().position(|(_, n, id)| n.contains(&needle) || id.contains(&needle));
+        if let Some(i) = exact.or_else(partial) {
+            return Some(inputs.into_iter().nth(i)?.0);
         }
         eprintln!("fsc: input device matching {name:?} not found; using default");
     }
     host.default_input_device()
+}
+
+/// The microphones PipeWire knows, by name (`node.description`), as the
+/// tray lists them. Asks `pw-dump` (part of PipeWire), which says what each
+/// node is: cpal's list also has speakers and other programs' recordings.
+pub fn microphones() -> Vec<String> {
+    let out = match std::process::Command::new("pw-dump").stderr(std::process::Stdio::null()).output() {
+        Ok(o) if o.status.success() => o.stdout,
+        Ok(o) => {
+            eprintln!("fsc: pw-dump failed ({})", o.status);
+            return Vec::new();
+        }
+        Err(e) => {
+            eprintln!("fsc: could not run pw-dump: {e}");
+            return Vec::new();
+        }
+    };
+    parse_microphones(&out)
+}
+
+fn parse_microphones(json: &[u8]) -> Vec<String> {
+    let Ok(serde_json::Value::Array(objects)) = serde_json::from_slice(json) else { return Vec::new() };
+    let mut names: Vec<String> = Vec::new();
+    for o in &objects {
+        let props = &o["info"]["props"];
+        let class = props["media.class"].as_str().unwrap_or("");
+        if !(class == "Audio/Source" || class == "Audio/Source/Virtual" || class == "Audio/Duplex") {
+            continue;
+        }
+        let name = ["node.description", "node.nick", "node.name"]
+            .iter()
+            .find_map(|k| props[*k].as_str().filter(|s| !s.trim().is_empty()))
+            .unwrap_or("");
+        if !name.is_empty() && !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
 }
 
 /// Linear resampler for the fallback path (fine for speech/visuals).
@@ -112,6 +165,8 @@ const MIC_STALL: Duration = Duration::from_secs(10);
 
 /// An open microphone. Captured 16 kHz mono samples accumulate in `buf`.
 pub struct Mic {
+    /// `voice.input_device` when it was opened.
+    pub device: String,
     _stream: Stream,
     buf: Arc<Mutex<Vec<f32>>>,
     /// The stream reported an error (e.g. the device was unplugged).
@@ -152,7 +207,7 @@ impl Mic {
             }
         };
         stream.play()?;
-        Ok(Self { _stream: stream, buf, dead, last_data: std::cell::Cell::new(Instant::now()) })
+        Ok(Self { device: device_name.to_string(), _stream: stream, buf, dead, last_data: std::cell::Cell::new(Instant::now()) })
     }
 
     /// Take everything captured since the last call.
@@ -418,5 +473,30 @@ mod tests {
             rs.push(&[s], &mut pulled);
         }
         assert_eq!(bulk, Vec::from(pulled));
+    }
+
+    #[test]
+    fn microphones_from_pw_dump() {
+        let props = |class: &str, name: &str, desc: Option<&str>| {
+            let mut p = serde_json::json!({ "media.class": class, "node.name": name });
+            if let Some(d) = desc {
+                p["node.description"] = d.into();
+            }
+            serde_json::json!({ "type": "PipeWire:Interface:Node", "info": { "props": p } })
+        };
+        let dump = serde_json::json!([
+            { "type": "PipeWire:Interface:Core", "info": { "props": {} } },
+            props("Audio/Source", "alsa_input.usb-C920", Some("HD Pro Webcam C920 Analog Stereo")),
+            props("Stream/Input/Audio", "fscd", None),
+            props("Audio/Sink", "bluez_output.94_DB", Some("WH-XB900N")),
+            props("Audio/Source", "bluez_input.94:DB", Some("WH-XB900N")),
+            props("Audio/Source/Virtual", "noise_cancel", None),
+            props("Audio/Source", "alsa_input.usb-C920-dup", Some("HD Pro Webcam C920 Analog Stereo")),
+        ]);
+        assert_eq!(
+            parse_microphones(dump.to_string().as_bytes()),
+            ["HD Pro Webcam C920 Analog Stereo", "WH-XB900N", "noise_cancel"]
+        );
+        assert!(parse_microphones(b"not json").is_empty());
     }
 }

@@ -5,7 +5,7 @@ use ksni::{MenuItem, ToolTip, TrayMethods};
 use tokio::sync::mpsc;
 
 use fsc_core::agent::{Choices, Select};
-use fsc_core::config::{AgentKind, Config};
+use fsc_core::config::{AgentKind, Config, SpeakMode};
 use fsc_core::ipc::Command;
 
 use crate::AppEvent;
@@ -19,11 +19,20 @@ pub struct MenuState {
     /// Which agents are installed, in `AgentKind::ALL` order.
     pub agents: [bool; AgentKind::ALL.len()],
     pub choices: Choices,
+    /// `voice.input_device`: "" is the system's default mic.
+    pub mic: String,
+    pub speak: SpeakMode,
 }
 
 impl MenuState {
     pub fn new(cfg: &Config) -> Self {
-        Self { agent: cfg.agent.backend, agents: AgentKind::ALL.map(|k| cfg.available(k)), choices: Choices::default() }
+        Self {
+            agent: cfg.agent.backend,
+            agents: AgentKind::ALL.map(|k| cfg.available(k)),
+            choices: Choices::default(),
+            mic: cfg.voice.input_device.clone(),
+            speak: cfg.voice.speak,
+        }
     }
 }
 
@@ -35,6 +44,9 @@ pub enum TrayUpdate {
 struct FscTray {
     st: IconState,
     menu: MenuState,
+    /// The microphones PipeWire has, looked up again whenever the menu opens.
+    mics: Vec<String>,
+    refresh: mpsc::UnboundedSender<()>,
     tx: async_channel::Sender<AppEvent>,
 }
 
@@ -87,32 +99,109 @@ impl FscTray {
         .into()
     }
 
-    /// Model ▸ or Mode ▸: the current agent's options. `None` when it
-    /// offers none.
-    fn choice_menu(&self, title: &str, sel: Option<&Select>, cmd: fn(String) -> Command) -> Option<MenuItem<Self>> {
-        let sel = sel.filter(|s| !s.options.is_empty())?;
+    /// Model ▸ or Mode ▸: the current agent's options. Always there, so the
+    /// menu keeps its length and order; greyed out until the agent has said
+    /// what it offers (while it starts, or if it offers none).
+    fn choice_menu(&self, title: &str, sel: Option<&Select>, cmd: fn(String) -> Command) -> MenuItem<Self> {
+        let Some(sel) = sel.filter(|s| !s.options.is_empty()) else {
+            return SubMenu {
+                label: format!("{title}: not loaded"),
+                enabled: false,
+                submenu: vec![StandardItem { label: "Not loaded yet".into(), enabled: false, ..Default::default() }.into()],
+                ..Default::default()
+            }
+            .into();
+        };
         let ids: Vec<String> = sel.options.iter().map(|o| o.id.clone()).collect();
         let selected = ids.iter().position(|id| *id == sel.current).unwrap_or(usize::MAX);
         let options = sel.options.iter().map(|o| RadioItem { label: menu_label(&o.name), ..Default::default() }).collect();
-        Some(
-            SubMenu {
-                label: format!("{title}: {}", menu_label(sel.current_name())),
-                submenu: vec![
-                    RadioGroup {
-                        selected,
-                        select: Box::new(move |t: &mut Self, i: usize| {
-                            if let Some(id) = ids.get(i) {
-                                t.send(cmd(id.clone()));
-                            }
-                        }),
-                        options,
-                    }
-                    .into(),
-                ],
-                ..Default::default()
-            }
-            .into(),
-        )
+        SubMenu {
+            label: format!("{title}: {}", menu_label(sel.current_name())),
+            submenu: vec![
+                RadioGroup {
+                    selected,
+                    select: Box::new(move |t: &mut Self, i: usize| {
+                        if let Some(id) = ids.get(i) {
+                            t.send(cmd(id.clone()));
+                        }
+                    }),
+                    options,
+                }
+                .into(),
+            ],
+            ..Default::default()
+        }
+        .into()
+    }
+}
+
+impl FscTray {
+    /// Microphone ▸ System default / each mic PipeWire has. A saved mic
+    /// that isn't plugged in stays listed (and chosen) so you can see why.
+    fn mic_menu(&self) -> MenuItem<Self> {
+        let current = self.menu.mic.trim();
+        let default = current.is_empty() || current.eq_ignore_ascii_case("default");
+        // What to save for each entry; "" is the default.
+        let mut values: Vec<String> = vec![String::new()];
+        values.extend(self.mics.iter().cloned());
+        let lower = current.to_lowercase();
+        let selected = if default {
+            Some(0)
+        } else {
+            // Saved by the menu: the exact name. Typed in the file: part of it.
+            values.iter().skip(1).position(|m| m.to_lowercase() == lower)
+                .or_else(|| values.iter().skip(1).position(|m| m.to_lowercase().contains(&lower)))
+                .map(|i| i + 1)
+        };
+        let mut labels: Vec<String> = values.iter().map(|v| if v.is_empty() { "System default".into() } else { menu_label(v) }).collect();
+        let selected = selected.unwrap_or_else(|| {
+            values.push(current.to_string());
+            labels.push(format!("{} (not connected)", menu_label(current)));
+            values.len() - 1
+        });
+        let title = if default { "System default".to_string() } else { labels[selected].clone() };
+        let options = labels.into_iter().map(|label| RadioItem { label, ..Default::default() }).collect();
+        SubMenu {
+            label: format!("Microphone: {title}"),
+            icon_name: "audio-input-microphone-symbolic".into(),
+            submenu: vec![
+                RadioGroup {
+                    selected,
+                    select: Box::new(move |t: &mut Self, i: usize| {
+                        if let Some(v) = values.get(i) {
+                            t.send(Command::Mic { name: Some(v.clone()) });
+                        }
+                    }),
+                    options,
+                }
+                .into(),
+            ],
+            ..Default::default()
+        }
+        .into()
+    }
+
+    /// Speak replies ▸ When I talk / Always / Never.
+    fn speak_menu(&self) -> MenuItem<Self> {
+        let selected = SpeakMode::ALL.iter().position(|&m| m == self.menu.speak).unwrap_or(0);
+        SubMenu {
+            label: format!("Speak replies: {}", self.menu.speak.name()),
+            icon_name: "audio-speakers-symbolic".into(),
+            submenu: vec![
+                RadioGroup {
+                    selected,
+                    select: Box::new(|t: &mut Self, i: usize| {
+                        if let Some(m) = SpeakMode::ALL.get(i) {
+                            t.send(Command::Speak { mode: Some(m.key().into()) });
+                        }
+                    }),
+                    options: SpeakMode::ALL.iter().map(|m| RadioItem { label: m.name().into(), ..Default::default() }).collect(),
+                }
+                .into(),
+            ],
+            ..Default::default()
+        }
+        .into()
     }
 }
 
@@ -146,6 +235,10 @@ impl ksni::Tray for FscTray {
         self.send(Command::Toggle);
     }
 
+    fn menu_about_to_show(&mut self) {
+        let _ = self.refresh.send(());
+    }
+
     fn menu(&self) -> Vec<MenuItem<Self>> {
         vec![
             StandardItem {
@@ -170,12 +263,12 @@ impl ksni::Tray for FscTray {
                 ..Default::default()
             }
             .into(),
+            self.mic_menu(),
+            self.speak_menu(),
+            MenuItem::Separator,
             self.agent_menu(),
-        ]
-        .into_iter()
-        .chain(self.choice_menu("Model", self.menu.choices.model.as_ref(), |v| Command::Model { value: Some(v) }))
-        .chain(self.choice_menu("Mode", self.menu.choices.mode.as_ref(), |v| Command::Mode { value: Some(v) }))
-        .chain([
+            self.choice_menu("Model", self.menu.choices.model.as_ref(), |v| Command::Model { value: Some(v) }),
+            self.choice_menu("Mode", self.menu.choices.mode.as_ref(), |v| Command::Mode { value: Some(v) }),
             StandardItem {
                 label: "New conversation".into(),
                 activate: Box::new(|t: &mut Self| t.send(Command::New)),
@@ -191,13 +284,19 @@ impl ksni::Tray for FscTray {
             .into(),
             MenuItem::Separator,
             StandardItem {
+                label: "Settings…".into(),
+                icon_name: "preferences-system-symbolic".into(),
+                activate: Box::new(|t: &mut Self| t.send(Command::Settings)),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
                 label: "Quit".into(),
                 activate: Box::new(|t: &mut Self| t.send(Command::Quit)),
                 ..Default::default()
             }
             .into(),
-        ])
-        .collect()
+        ]
     }
 }
 
@@ -211,17 +310,37 @@ pub async fn run(
     // At login fscd can start before the bar's StatusNotifierWatcher is on
     // the bus. Without this, ksni treats that as fatal and the icon never
     // appears; with it, ksni waits and registers once the watcher shows up.
-    let handle = match (FscTray { st: initial, menu, tx }).assume_sni_available(true).spawn().await {
+    let (refresh, mut refreshes) = mpsc::unbounded_channel();
+    let mut mics = list_mics().await;
+    let handle = match (FscTray { st: initial, menu, mics: mics.clone(), refresh, tx }).assume_sni_available(true).spawn().await {
         Ok(h) => h,
         Err(e) => {
             eprintln!("fsc: tray icon unavailable: {e}");
             return;
         }
     };
-    while let Some(u) = updates.recv().await {
-        match u {
-            TrayUpdate::Icon(st) => handle.update(|t| t.st = st).await,
-            TrayUpdate::Menu(m) => handle.update(|t| t.menu = m).await,
-        };
+    loop {
+        tokio::select! {
+            u = updates.recv() => match u {
+                Some(TrayUpdate::Icon(st)) => { handle.update(|t| t.st = st).await; }
+                Some(TrayUpdate::Menu(m)) => { handle.update(|t| t.menu = m).await; }
+                None => break,
+            },
+            Some(()) = refreshes.recv() => {
+                while refreshes.try_recv().is_ok() {}
+                let now = list_mics().await;
+                // Only when something changed: an update redraws the open menu.
+                if now != mics {
+                    mics = now;
+                    let m = mics.clone();
+                    handle.update(|t| t.mics = m).await;
+                }
+            }
+        }
     }
+}
+
+/// `fsc_audio::microphones`, off the async threads (it runs `pw-dump`).
+async fn list_mics() -> Vec<String> {
+    tokio::task::spawn_blocking(fsc_audio::microphones).await.unwrap_or_default()
 }

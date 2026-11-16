@@ -50,6 +50,15 @@ pub enum Command {
     Model { value: Option<String> },
     /// Use another mode (an id the agent lists), or list them (`None`).
     Mode { value: Option<String> },
+    /// Listen with another microphone (saved; "" or "default" is the
+    /// system's), or list them (`None`).
+    Mic { name: Option<String> },
+    /// When to read replies aloud ("voice", "always" or "never"; saved), or
+    /// say which (`None`).
+    Speak { mode: Option<String> },
+    /// Open the settings: HyprCustard when it's installed, otherwise the
+    /// config file in the desktop's editor.
+    Settings,
     Quit,
 }
 

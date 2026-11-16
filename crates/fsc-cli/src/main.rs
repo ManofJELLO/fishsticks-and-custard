@@ -74,6 +74,19 @@ enum Cmd {
         /// An id from the list
         id: Option<String>,
     },
+    /// List the microphones, or listen with another (saved in config.toml)
+    Mic {
+        /// A name from the list, or part of it; `default` for the system's
+        #[arg(num_args = 0..)]
+        name: Vec<String>,
+    },
+    /// Say when replies are read aloud, or change it (saved in config.toml)
+    Speak {
+        #[arg(value_enum)]
+        mode: Option<SpeakArg>,
+    },
+    /// Open the settings (HyprCustard if installed, else config.toml)
+    Settings,
     /// Quit the daemon
     Quit,
     /// Download any missing speech models (whisper, silero VAD, piper voice)
@@ -82,6 +95,14 @@ enum Cmd {
         #[arg(long, hide = true)]
         urls: bool,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SpeakArg {
+    /// Replies to spoken prompts (typed ones stay silent)
+    Voice,
+    Always,
+    Never,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -120,6 +141,16 @@ fn main() -> ExitCode {
         Cmd::Agent { backend } => Command::Agent { backend },
         Cmd::Model { id } => Command::Model { value: id },
         Cmd::Mode { id } => Command::Mode { value: id },
+        Cmd::Mic { name } => Command::Mic { name: (!name.is_empty()).then(|| name.join(" ")) },
+        Cmd::Speak { mode } => Command::Speak {
+            mode: mode.map(|m| match m {
+                SpeakArg::Voice => "voice",
+                SpeakArg::Always => "always",
+                SpeakArg::Never => "never",
+            }
+            .into()),
+        },
+        Cmd::Settings => Command::Settings,
         Cmd::Quit => Command::Quit,
     };
 
