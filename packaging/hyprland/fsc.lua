@@ -30,7 +30,7 @@ hl.layer_rule({
 })
 
 -- Keys ---------------------------------------------------------------------
--- SUPER+A: type to Claude.
+-- SUPER+A: type a question.
 hl.bind("SUPER + A", hl.dsp.exec_cmd("fsc type"))
 -- SUPER+SHIFT+A: hold to talk. A quick tap also works: it listens until you stop talking.
 hl.bind("SUPER + SHIFT + A", hl.dsp.exec_cmd("fsc listen"))
