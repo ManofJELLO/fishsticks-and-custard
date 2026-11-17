@@ -38,7 +38,7 @@ use tts::Tts;
 use vad::{CHUNK, Vad};
 
 pub use spectrum::BANDS;
-pub use io::{Microphone, is_device_id, microphones, which_mic};
+pub use io::{Microphone, device_setting, is_device_id, microphones, which_mic};
 pub use wake::check_phrase as check_wake_phrase;
 
 #[derive(Debug, Clone)]
@@ -577,7 +577,7 @@ impl<F: Fn(AudioEvent)> Engine<F> {
     fn load_voice(&mut self) {
         self.tts = None;
         let Some(env) = &self.env else { return };
-        if !models::has_voice(&self.voice) {
+        if !models::voice_ready(&self.voice) {
             eprintln!("fsc: voice {} isn't downloaded", self.voice);
             return;
         }
@@ -729,7 +729,7 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                 // Say now whether it's there (opening it may be a while off,
                 // with the wake word muted).
                 // Always said: the UI has just shown the new mic as chosen.
-                let missing = !io::mic_present(&self.cfg.input_device);
+                let missing = io::mic_missing(&self.cfg.input_device);
                 self.mic_missing = missing;
                 (self.emit)(AudioEvent::MicMissing(missing.then(|| self.cfg.input_device.clone())));
                 // The wake watch moves over now (step_watch reopens it). A

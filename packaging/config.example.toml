@@ -6,7 +6,8 @@ backend = "claude"            # "claude", "codex", "antigravity", "opencode", or
 session_idle_minutes = 20     # start a fresh session after this long idle (0 = never)
 memory = true                 # remember durable facts across sessions (fsc memory / fsc forget)
 # Switch from the tray's Agent menu or with `fsc agent <name>`; that rewrites `backend` here.
-# auto_allow = ["read", "search", "fetch", "think"]   # ACP agents: tool kinds that run without asking
+# auto_allow = ["read", "search", "think"]   # ACP agents: tool kinds that run without asking
+#   ("fetch" would open web pages unasked; a page can carry instructions for the agent)
 
 # Each ACP agent's own settings (the same keys in [codex], [antigravity], [opencode] and [acp]).
 # The tray's Model and Mode menus (or `fsc model` / `fsc mode`) write model and mode here.
@@ -64,6 +65,7 @@ piper_voice = ""                         # empty = the language's usual one; any
 speech_rate = 1.0
 speak = "voice"                          # speak replies to spoken prompts: "voice", "always", "never" (tray: Speak replies)
 input_device = ""                        # the mic's name or part of it; empty = system default (tray: Microphone, `fsc mic`).
+                                         # The tray saves PipeWire's id (exact: "alsa_input.…", or "pipewire:<id>").
                                          # A named mic that's unplugged is waited for, never swapped for another.
 end_silence_ms = 1500                    # pause that ends an utterance; raise it if you get cut off mid-thought
 no_speech_timeout_ms = 6000

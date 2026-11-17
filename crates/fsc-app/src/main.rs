@@ -40,7 +40,17 @@ pub enum AppEvent {
 
 const APP_ID: &str = "dev.fsc.FishsticksAndCustard";
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    let result = run();
+    // Said here, not by the runtime after main, so it reaches the log.
+    if let Err(e) = &result {
+        eprintln!("fscd: {e:#}");
+    }
+    log::drain();
+    if result.is_ok() { std::process::ExitCode::SUCCESS } else { std::process::ExitCode::FAILURE }
+}
+
+fn run() -> Result<()> {
     // Before any threads exist (these set environment variables).
     fsc_audio::prepare_env();
     // Wayland only: the popup is a layer-shell surface, which has no X11
@@ -186,6 +196,7 @@ fn main() -> Result<()> {
             tokio::select! { _ = int.recv() => {}, _ = term.recv() => {} }
             eprintln!("fsc: second signal, exiting now");
             server::cleanup();
+            log::drain();
             std::process::exit(130);
         });
     }

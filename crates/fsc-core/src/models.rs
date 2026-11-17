@@ -1,10 +1,13 @@
 //! Where the speech models live and where they come from.
 //! `fsc fetch-models` downloads anything missing into `models_dir()`.
 //!
-//! Downloads come from fixed upstream revisions (`model_hashes`), and each
-//! file is checked against the SHA-256 recorded for it before it's used:
-//! whisper.cpp and ONNX Runtime parse these files in C/C++, so a replaced
-//! upload must never load.
+//! Downloads come from fixed upstream revisions (`model_hashes`), and every
+//! file this version offers is checked against the SHA-256 recorded for it:
+//! when downloaded, and once more before its first use (files fetched by
+//! older versions included). whisper.cpp and ONNX Runtime parse these files
+//! in C/C++, so a replaced upload must never load. A model named in the
+//! config that isn't listed has no checksum: it comes from the same fixed
+//! revision, unchecked, and the log says so.
 
 use std::path::PathBuf;
 
@@ -59,9 +62,76 @@ pub fn voice_files(voice: &str) -> [ModelFile; 2] {
     ]
 }
 
-/// The voice is downloaded.
+/// The voice is downloaded. Cheap (no hashing), for menus.
 pub fn has_voice(voice: &str) -> bool {
     voice_files(voice).iter().all(|m| m.path.exists())
+}
+
+/// The voice is downloaded and its files check out (see `verified`).
+pub fn voice_ready(voice: &str) -> bool {
+    voice_files(voice).iter().all(|m| m.path.exists() && verified(m))
+}
+
+/// `m`'s file on disk matches its recorded SHA-256, or has none recorded.
+/// Hashed once: a match leaves `<file>.ok` with its size and time, so
+/// later checks are a `stat`. A mismatch moves the file to `<file>.bad`,
+/// so it's missing (and downloaded again) rather than loaded.
+pub fn verified(m: &ModelFile) -> bool {
+    let Some(want) = m.sha256() else { return true };
+    let Some(stamp) = stamp(m, want) else { return false };
+    let marker = marker(m);
+    if std::fs::read_to_string(&marker).is_ok_and(|s| s.trim() == stamp) {
+        return true;
+    }
+    match sha256_of(&m.path) {
+        Ok(got) if got == want => {
+            let _ = std::fs::write(&marker, format!("{stamp}\n"));
+            true
+        }
+        Ok(got) => {
+            let bad = PathBuf::from(format!("{}.bad", m.path.display()));
+            eprintln!(
+                "fsc: {} doesn't match its checksum (SHA-256 {got}, expected {want}); moved to {} and not used",
+                m.path.display(),
+                bad.display()
+            );
+            let _ = std::fs::rename(&m.path, &bad);
+            let _ = std::fs::remove_file(&marker);
+            false
+        }
+        Err(e) => {
+            eprintln!("fsc: couldn't check {}: {e}", m.path.display());
+            false
+        }
+    }
+}
+
+/// `<file>.ok`: the file matched its checksum as it was then.
+fn marker(m: &ModelFile) -> PathBuf {
+    PathBuf::from(format!("{}.ok", m.path.display()))
+}
+
+/// The file's size and time, with the checksum it matched.
+fn stamp(m: &ModelFile, sha: &str) -> Option<String> {
+    let meta = std::fs::metadata(&m.path).ok()?;
+    let time = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    Some(format!("{} {time} {sha}", meta.len()))
+}
+
+fn sha256_of(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+    }
+    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// "en_GB-alan-medium" -> ".../en/en_GB/alan/medium/en_GB-alan-medium"
@@ -156,6 +226,12 @@ pub fn download(m: &ModelFile, mut progress: impl FnMut(u64, Option<u64>)) -> an
         None => eprintln!("fsc: {} has no recorded checksum (SHA-256 {got})", m.path.display()),
     }
     std::fs::rename(&part, &m.path)?;
+    // Just checked: no need to hash it again before first use.
+    if let Some(want) = m.sha256()
+        && let Some(stamp) = stamp(m, want)
+    {
+        let _ = std::fs::write(marker(m), format!("{stamp}\n"));
+    }
     Ok(())
 }
 
@@ -173,8 +249,10 @@ fn encode_url(url: &str) -> String {
     out
 }
 
+/// What's not downloaded, or doesn't check out (`verified`, which may hash
+/// a file the first time: not for the UI thread).
 pub fn missing(v: &VoiceConfig) -> Vec<ModelFile> {
-    required(v).into_iter().filter(|m| !m.path.exists()).collect()
+    required(v).into_iter().filter(|m| !m.path.exists() || !verified(m)).collect()
 }
 
 #[cfg(test)]
@@ -213,6 +291,23 @@ mod tests {
         for m in super::required(&VoiceConfig { language: "en".into(), ..Default::default() }) {
             assert!(m.sha256().is_some(), "{} has no checksum", m.label);
         }
+    }
+
+    #[test]
+    fn files_on_disk_are_checked_once() {
+        let dir = std::env::temp_dir().join(format!("fsc-models-verify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("silero_vad.onnx");
+        let m = super::ModelFile { label: "test", url: None, path: path.clone() };
+        // A replaced file is moved aside, not used.
+        std::fs::write(&path, b"evil").unwrap();
+        assert!(!super::verified(&m));
+        assert!(!path.exists() && dir.join("silero_vad.onnx.bad").exists());
+        // A file with no recorded checksum passes, unhashed.
+        let other = super::ModelFile { label: "test", url: None, path: dir.join("my-own-voice.onnx") };
+        std::fs::write(&other.path, b"anything").unwrap();
+        assert!(super::verified(&other));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

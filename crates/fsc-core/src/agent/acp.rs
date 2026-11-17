@@ -71,6 +71,9 @@ struct Settings {
 impl Acp {
     /// `kind`'s usual set-up, changed by its own config table.
     pub(crate) fn new(kind: AgentKind, cfg: &AcpAgentConfig, auto_allow: &[String]) -> Self {
+        if auto_allow.iter().any(|k| k == "fetch") {
+            eprintln!("fsc: agent.auto_allow has \"fetch\": web pages open without asking (remove it to be asked)");
+        }
         let preset = kind.preset();
         let (login, install, mode) = (preset.login, preset.install, preset.mode);
         let mut args: Vec<String> = preset.args.iter().map(|a| a.to_string()).collect();
@@ -423,7 +426,7 @@ impl AcpConn {
         // The session decides: a hidden turn refuses even these.
         let auto = self.settings.auto_allow.iter().any(|k| k == kind)
             && pick(&pending.options, &["allow_once"]).is_some()
-            && !touches_secret(call);
+            && !touches_secret(call, &self.cwd);
         let ask = describe_tool(&pending.id, call, pending.options.iter().any(|(_, k)| k == "allow_always"));
         self.pending.push(pending);
         vec![Event::Permission { ask, auto }]
@@ -709,15 +712,26 @@ fn tool_kind(call: &Value) -> &str {
 }
 
 /// The tool call names a path among `permission::SECRET_PATHS`, so it's
-/// asked about whatever its kind.
-fn touches_secret(call: &Value) -> bool {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return false };
+/// asked about whatever its kind. A relative path is from `cwd`, where the
+/// agent works ("../../../.ssh/id_ed25519" from the workspace is in
+/// ~/.ssh), and "~" is home. Without a home to compare with, every path
+/// counts as secret: asking is the safe way to be wrong.
+fn touches_secret(call: &Value, cwd: &Path) -> bool {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return true };
+    let resolve = |p: &str| -> PathBuf {
+        match p.strip_prefix('~') {
+            Some("") => home.clone(),
+            Some(rest) if rest.starts_with('/') => home.join(rest.trim_start_matches('/')),
+            _ if Path::new(p).is_absolute() => PathBuf::from(p),
+            _ => cwd.join(p),
+        }
+    };
     let input = &call["rawInput"];
     let located = call["locations"].as_array().into_iter().flatten().map(|l| &l["path"]);
     let named = ["path", "file_path", "filePath", "abs_path", "AbsolutePath", "SearchPath", "DirectoryPath"]
         .into_iter()
         .map(|k| &input[k]);
-    located.chain(named).filter_map(Value::as_str).any(|p| crate::permission::is_secret(Path::new(p), &home))
+    located.chain(named).filter_map(Value::as_str).any(|p| crate::permission::is_secret(&resolve(p), &home))
 }
 
 /// Where ACP agents work: see the module docs.
@@ -802,11 +816,16 @@ mod tests {
     #[test]
     fn secret_reads_are_never_auto_allowed() {
         let home = std::env::var("HOME").unwrap();
+        let cwd = PathBuf::from(&home).join(".local/share/fsc/home/workspace");
         let read = |path: &str| json!({ "kind": "read", "locations": [{ "path": path }] });
-        assert!(touches_secret(&read(&format!("{home}/.ssh/id_ed25519"))));
-        assert!(touches_secret(&json!({ "kind": "read", "rawInput": { "file_path": format!("{home}/.aws/credentials") } })));
-        assert!(!touches_secret(&read(&format!("{home}/notes.txt"))));
-        assert!(!touches_secret(&json!({ "kind": "read", "title": "Read notes.txt" })));
+        assert!(touches_secret(&read(&format!("{home}/.ssh/id_ed25519")), &cwd));
+        assert!(touches_secret(&json!({ "kind": "read", "rawInput": { "file_path": format!("{home}/.aws/credentials") } }), &cwd));
+        // From the workspace, and from "~".
+        assert!(touches_secret(&json!({ "kind": "read", "rawInput": { "path": "../../../../../.ssh/id_ed25519" } }), &cwd));
+        assert!(touches_secret(&read("~/.ssh/id_rsa"), &cwd));
+        assert!(!touches_secret(&read(&format!("{home}/notes.txt")), &cwd));
+        assert!(!touches_secret(&read("notes.txt"), &cwd));
+        assert!(!touches_secret(&json!({ "kind": "read", "title": "Read notes.txt" }), &cwd));
     }
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 

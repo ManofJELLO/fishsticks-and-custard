@@ -498,14 +498,15 @@ impl Ui {
                     ui.hide();
                     glib::Propagation::Stop
                 }
-                // Ctrl+Shift+C copies the whole conversation shown.
-                gdk::Key::C if ctrl => {
+                // Ctrl+Shift+C copies the whole conversation shown. Not Caps
+                // Lock's "C": that's still Ctrl+C.
+                gdk::Key::C | gdk::Key::c if ctrl && mods.contains(gdk::ModifierType::SHIFT_MASK) => {
                     ui.copy_history();
                     glib::Propagation::Stop
                 }
                 // Ctrl+C copies highlighted text in the history. With nothing
                 // highlighted anywhere it stops everything, like a terminal.
-                gdk::Key::c if ctrl && ui.entry.selection_bounds().is_none() => {
+                gdk::Key::c | gdk::Key::C if ctrl && ui.entry.selection_bounds().is_none() => {
                     if !ui.copy_picked() {
                         ui.cancel_listen();
                         ui.interrupt();
@@ -954,6 +955,10 @@ impl Ui {
             return false;
         }
         self.audio.stop_speaking();
+        // A highlight from before is done with: Ctrl+C during this reply stops it.
+        if let Some(l) = self.picked.take().upgrade() {
+            l.select_region(0, 0);
+        }
         // Been a while? Start a fresh session (saving memory) before this
         // prompt; the session actor holds the prompt until it's ready.
         if self.session_idle() {
@@ -1054,6 +1059,11 @@ impl Ui {
     fn set_mic(self: &Rc<Self>, name: Option<String>) -> Reply {
         let current = self.st.borrow().mic.clone();
         let is_default = |s: &str| s.trim().is_empty() || s.trim().eq_ignore_ascii_case("default");
+        // A device id (what the tray sends) needs no lookup, so pw-dump isn't
+        // run here on the UI thread: a stuck PipeWire would freeze the popup.
+        if let Some(id) = name.as_deref().map(str::trim).filter(|n| fsc_audio::is_device_id(n)) {
+            return self.use_mic(id.to_string(), id.to_string());
+        }
         let mics = fsc_audio::microphones();
         let Some(name) = name else {
             let chosen = fsc_audio::which_mic(&current, &mics);
@@ -1075,10 +1085,26 @@ impl Ui {
             (String::new(), "the system's default microphone".to_string())
         } else {
             match mics.iter().find(|m| m.name.eq_ignore_ascii_case(name) || m.id == name) {
-                Some(m) => (m.id.clone(), m.name.clone()),
+                Some(m) => (fsc_audio::device_setting(&m.id), m.name.clone()),
                 None => (name.to_string(), name.to_string()),
             }
         };
+        self.use_mic(setting, shown)
+    }
+
+    /// Listen with `setting` (saved as `voice.input_device`). `shown`: its
+    /// name; a device id is looked up off the UI thread for the flash.
+    fn use_mic(self: &Rc<Self>, setting: String, shown: String) -> Reply {
+        if fsc_audio::is_device_id(&setting) {
+            let weak = Rc::downgrade(self);
+            let id = setting.clone();
+            glib::spawn_future_local(async move {
+                let mics = tokio::task::spawn_blocking(fsc_audio::microphones).await.unwrap_or_default();
+                if let (Some(ui), Some(m)) = (weak.upgrade(), fsc_audio::which_mic(&id, &mics)) {
+                    ui.flash_meta(&short_meta(&format!("MIC: {}", m.name.to_uppercase())));
+                }
+            });
+        }
         self.audio.set_input_device(setting.clone());
         {
             let mut st = self.st.borrow_mut();

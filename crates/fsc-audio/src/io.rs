@@ -31,14 +31,28 @@ impl std::error::Error for MicMissing {}
 
 /// PipeWire's id for a node ("alsa_input.usb-046d_HD_Pro_Webcam_C920_…"),
 /// as the tray saves a mic: matched exactly, never in part, so a missing
-/// mic is never taken to mean another whose name contains it.
+/// mic is never taken to mean another whose name contains it. An id
+/// without a dot ("easyeffects_source") is saved as "pipewire:<id>"
+/// (`device_setting`), as it can't be told from a name typed in part.
 pub fn is_device_id(name: &str) -> bool {
-    !name.trim().is_empty() && !name.contains(char::is_whitespace) && name.contains('.')
+    let name = name.trim();
+    name.starts_with("pipewire:") || (!name.is_empty() && !name.contains(char::is_whitespace) && name.contains('.'))
 }
 
-/// Whether the mic `name` names is there (or `name` means the default).
-pub fn mic_present(name: &str) -> bool {
-    find_input(&cpal::default_host(), name).is_ok()
+/// What to save for the mic with PipeWire id `id`, so it's matched exactly.
+pub fn device_setting(id: &str) -> String {
+    if is_device_id(id) { id.to_string() } else { format!("pipewire:{id}") }
+}
+
+/// The PipeWire id a device setting names.
+fn node_name(setting: &str) -> &str {
+    setting.trim().strip_prefix("pipewire:").unwrap_or(setting.trim())
+}
+
+/// The mic `name` names isn't there. Not when `name` means the default,
+/// even with no mic at all: that isn't a named mic gone missing.
+pub fn mic_missing(name: &str) -> bool {
+    find_input(&cpal::default_host(), name).is_err_and(|e| e.is::<MicMissing>())
 }
 
 /// The mic to open: the one `name` names (`Err` if it isn't there), or the
@@ -66,7 +80,7 @@ fn find_input(host: &cpal::Host, name: &str) -> Result<Device> {
             .unwrap_or_default();
         let needle = name.to_lowercase();
         let found = if is_device_id(name) {
-            let id = format!("pipewire:{needle}");
+            let id = format!("pipewire:{}", node_name(&needle));
             inputs.iter().position(|(_, _, i)| *i == id)
         } else {
             let exact = inputs.iter().position(|(_, n, _)| *n == needle);
@@ -98,7 +112,7 @@ pub fn which_mic<'a>(setting: &str, mics: &'a [Microphone]) -> Option<&'a Microp
     }
     let low = s.to_lowercase();
     if is_device_id(s) {
-        return mics.iter().find(|m| m.id.to_lowercase() == low);
+        return mics.iter().find(|m| m.id.to_lowercase() == node_name(&low));
     }
     mics.iter()
         .find(|m| m.name.to_lowercase() == low)
@@ -572,6 +586,16 @@ mod tests {
         assert!(!is_device_id("USB Audio"));
         assert!(!is_device_id("HD Pro Webcam C920 Analog Stereo"));
         assert!(!is_device_id(""));
+        assert!(is_device_id("pipewire:easyeffects_source"));
+        assert!(!is_device_id("easyeffects_source"));
+        assert_eq!(device_setting("easyeffects_source"), "pipewire:easyeffects_source");
+        assert_eq!(device_setting("alsa_input.x.analog-stereo"), "alsa_input.x.analog-stereo");
+        let mics = vec![
+            Microphone { id: "easyeffects_source_2".into(), name: "Easy Effects 2".into() },
+            Microphone { id: "easyeffects_source".into(), name: "Easy Effects".into() },
+        ];
+        assert_eq!(which_mic("pipewire:easyeffects_source", &mics).map(|m| m.name.as_str()), Some("Easy Effects"));
+        assert!(which_mic("pipewire:easyeffects_source", &mics[..1]).is_none());
     }
 }
 

@@ -11,11 +11,39 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, Write};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 const MAX_BYTES: u64 = 8 << 20;
+
+/// The pipe's read end, for `drain` to see what's still in it (-1: none).
+static READ_FD: AtomicI32 = AtomicI32::new(-1);
+/// The copying thread holds text it hasn't written yet.
+static PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Wait (a second at most) until everything written to stderr is in the
+/// log: before exiting, and after a panic's message, which would otherwise
+/// die in the pipe with the process.
+pub fn drain() {
+    let fd = READ_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while std::time::Instant::now() < until {
+        let mut queued: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one int; `fd` stays open for the process.
+        let ok = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut queued) } == 0;
+        if !ok || (queued == 0 && !PENDING.load(Ordering::Acquire)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // The thread may have just taken the last bytes off the pipe.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+}
 
 /// Where the log goes: `$XDG_STATE_HOME/fsc/fscd.log`.
 pub fn path() -> Option<PathBuf> {
@@ -72,7 +100,13 @@ fn open() -> std::io::Result<PathBuf> {
         libc::close(fds[1]);
         (File::from(OwnedFd::from_raw_fd(fds[0])), terminal)
     };
+    READ_FD.store(read.as_raw_fd(), Ordering::Relaxed);
     std::thread::Builder::new().name("fsc-log".into()).spawn(move || copy(read, file, terminal))?;
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report(info);
+        drain();
+    }));
     eprintln!(
         "fscd {} started {}",
         env!("CARGO_PKG_VERSION"),
@@ -90,7 +124,7 @@ fn copy(read: File, mut file: File, mut terminal: Option<File>) {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
             Ok(0) | Err(_) => return,
-            Ok(_) => {}
+            Ok(_) => PENDING.store(true, Ordering::Release),
         }
         if let Some(t) = terminal.as_mut() {
             let _ = t.write_all(&line);
@@ -114,5 +148,6 @@ fn copy(read: File, mut file: File, mut terminal: Option<File>) {
         if reader.buffer().is_empty() {
             let _ = file.sync_data();
         }
+        PENDING.store(!reader.buffer().is_empty(), Ordering::Release);
     }
 }

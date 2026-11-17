@@ -250,7 +250,9 @@ fn invented(sentence: &str) -> bool {
     INVENTED.iter().any(|line| {
         let line = squashed(line);
         let m = fsc_core::lang::weight(&line);
-        (s.starts_with(&line) && m * 10 >= n * 7) || (line.starts_with(&s) && n >= 12 && n * 10 >= m * 4)
+        // The start of a line only counts when it's most of it: "Thank you
+        // so much." is someone thanking, not an outro.
+        (s.starts_with(&line) && m * 10 >= n * 7) || (line.starts_with(&s) && n >= 16 && n * 4 >= m * 3)
     })
 }
 
@@ -291,7 +293,9 @@ mod tests {
         assert_eq!(super::clean("Thanks for watching!"), "");
         assert_eq!(super::clean("Turn the music down. Thank you for watching."), "Turn the music down.");
         assert_eq!(super::clean("Hãy subscribe cho kênh Ghiền Mì Gõ Để không bỏ lỡ những video hấp dẫn"), "");
-        assert_eq!(super::clean("你好。请不吝点赞 订阅 转发"), "你好。");
+        assert_eq!(super::clean("你好。请不吝点赞 订阅 转发 打赏支持明镜与点点栏目"), "你好。");
+        assert_eq!(super::clean("Thank you so much."), "Thank you so much.");
+        assert_eq!(super::clean("Cảm ơn các bạn đã giúp."), "Cảm ơn các bạn đã giúp.");
         assert_eq!(super::clean("Thanks, that's all."), "Thanks, that's all.");
         assert_eq!(super::clean("Subtitles by the Amara.org community"), "");
         assert_eq!(super::clean("Thank you for watching the kids, remind me at five."), "Thank you for watching the kids, remind me at five.");

@@ -159,7 +159,7 @@ impl FscTray {
         let mut values: Vec<String> = vec![String::new()];
         let mut labels: Vec<String> = vec!["System default".into()];
         for m in &self.mics {
-            values.push(m.id.clone());
+            values.push(fsc_audio::device_setting(&m.id));
             labels.push(menu_label(&m.name));
         }
         let selected = if default {
@@ -168,7 +168,8 @@ impl FscTray {
             match fsc_audio::which_mic(current, &self.mics) {
                 Some(m) => self.mics.iter().position(|x| x.id == m.id).map_or(0, |i| i + 1),
                 None => {
-                    let name = self.seen.get(current).map(String::as_str).unwrap_or(current);
+                    let id = current.strip_prefix("pipewire:").unwrap_or(current);
+                    let name = self.seen.get(id).map(String::as_str).unwrap_or(id);
                     values.push(current.to_string());
                     labels.push(format!("{} (not connected)", menu_label(name)));
                     values.len() - 1
