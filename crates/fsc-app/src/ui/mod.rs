@@ -214,6 +214,8 @@ pub struct Ui {
     accent_pin: Option<Rgb>,
     /// Headless: a voice session is "open" though nothing is shown.
     open: Cell<bool>,
+    /// The text line last clicked in the history, whose highlight Ctrl+C copies.
+    picked: RefCell<glib::WeakRef<gtk::Label>>,
 }
 
 impl Ui {
@@ -406,6 +408,7 @@ impl Ui {
             scroll_pending: Cell::new(false),
             accent_pin,
             open: Cell::new(false),
+            picked: RefCell::default(),
         });
         ui.wire();
         ui.restore_meta();
@@ -495,10 +498,18 @@ impl Ui {
                     ui.hide();
                     glib::Propagation::Stop
                 }
-                // Ctrl+C with nothing selected stops everything, like a terminal.
+                // Ctrl+Shift+C copies the whole conversation shown.
+                gdk::Key::C if ctrl => {
+                    ui.copy_history();
+                    glib::Propagation::Stop
+                }
+                // Ctrl+C copies highlighted text in the history. With nothing
+                // highlighted anywhere it stops everything, like a terminal.
                 gdk::Key::c if ctrl && ui.entry.selection_bounds().is_none() => {
-                    ui.cancel_listen();
-                    ui.interrupt();
+                    if !ui.copy_picked() {
+                        ui.cancel_listen();
+                        ui.interrupt();
+                    }
                     glib::Propagation::Stop
                 }
                 gdk::Key::n if ctrl => {
@@ -953,10 +964,11 @@ impl Ui {
 
         let ex = gtk::Box::new(gtk::Orientation::Vertical, 6);
         let prefix = if voice { "󰍬" } else { "›" };
-        ex.append(&label(&format!("{prefix} {text}"), "prompt"));
+        let prompt = label(&format!("{prefix} {text}"), "prompt");
+        self.selectable(&prompt);
+        ex.append(&prompt);
         let reply = label("", "reply");
-        reply.set_selectable(true);
-        reply.set_focusable(false);
+        self.selectable(&reply);
         reply.set_visible(false);
         ex.append(&reply);
         self.history.append(&ex);
@@ -1746,8 +1758,7 @@ impl Ui {
         card.append(&label(&sentence(&ask.action), "ask-action"));
         if let Some(d) = &ask.detail {
             let l = label(d, "ask-detail");
-            l.set_selectable(true);
-            l.set_focusable(false);
+            self.selectable(&l);
             card.append(&l);
         }
         let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -2095,6 +2106,54 @@ impl Ui {
         }
     }
 
+    /// Let `l`'s text be highlighted for copying. It never takes focus from
+    /// the text field. Clicking it clears the highlight in the line clicked
+    /// before, so the one highlight shown is what Ctrl+C copies.
+    fn selectable(self: &Rc<Self>, l: &gtk::Label) {
+        l.set_selectable(true);
+        l.set_focusable(false);
+        let click = gtk::GestureClick::new();
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        let me = l.downgrade();
+        click.connect_pressed(move |_, _, _, _| {
+            let (Some(ui), Some(me)) = (weak.upgrade(), me.upgrade()) else { return };
+            let old = ui.picked.replace(me.downgrade()).upgrade();
+            if let Some(old) = old
+                && old != me
+            {
+                old.select_region(0, 0);
+            }
+        });
+        l.add_controller(click);
+    }
+
+    /// Copy the highlighted text of the line last clicked, if any is.
+    fn copy_picked(self: &Rc<Self>) -> bool {
+        let Some(l) = self.picked.borrow().upgrade() else { return false };
+        if l.selection_bounds().is_none_or(|(a, b)| a == b) {
+            return false;
+        }
+        // GTK's own copy: it knows the highlight's exact extent.
+        l.emit_by_name::<()>("copy-clipboard", &[]);
+        self.flash_meta("COPIED");
+        true
+    }
+
+    /// Copy every question and reply shown, as plain text.
+    fn copy_history(self: &Rc<Self>) {
+        if let Some(cur) = self.st.borrow_mut().current.as_mut() {
+            cur.show();
+        }
+        let text = history_text(&self.history);
+        if text.is_empty() {
+            self.flash_meta("NOTHING TO COPY");
+            return;
+        }
+        self.window.clipboard().set_text(&text);
+        self.flash_meta("CONVERSATION COPIED");
+    }
+
     fn trim_history(&self) {
         let mut n = 0;
         let mut child = self.history.first_child();
@@ -2128,6 +2187,33 @@ impl Ui {
             }
         });
     }
+}
+
+/// The questions and replies under `history`, oldest first, one paragraph each.
+fn history_text(history: &gtk::Box) -> String {
+    let mut parts = Vec::new();
+    let mut ex = history.first_child();
+    while let Some(e) = ex {
+        let mut child = e.first_child();
+        while let Some(c) = child {
+            if let Some(l) = c.downcast_ref::<gtk::Label>()
+                && l.is_visible()
+            {
+                let text = l.text();
+                let text = text.trim();
+                if l.has_css_class("prompt") {
+                    // The mic/keyboard mark is an icon-font glyph; plain text gets "›".
+                    let q = text.split_once(' ').map_or(text, |(_, q)| q);
+                    parts.push(format!("› {q}"));
+                } else if l.has_css_class("reply") && !text.is_empty() {
+                    parts.push(text.to_string());
+                }
+            }
+            child = c.next_sibling();
+        }
+        ex = e.next_sibling();
+    }
+    parts.join("\n\n")
 }
 
 fn label(text: &str, class: &str) -> gtk::Label {

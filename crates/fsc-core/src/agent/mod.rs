@@ -292,7 +292,7 @@ fn session_prompt(home: &Path, memory: bool) -> String {
         None => persona,
     };
     let facts = if memory { memory::load(home) } else { Vec::new() };
-    memory::session_prompt(&persona, &facts)
+    memory::session_prompt(&persona, &facts, memory)
 }
 
 #[derive(Default)]

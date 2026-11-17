@@ -74,16 +74,27 @@ pub fn save(home: &Path, facts: &[String]) -> std::io::Result<()> {
 }
 
 /// persona + remembered facts, for `--append-system-prompt-file`.
-pub fn session_prompt(persona: &str, facts: &[String]) -> String {
-    if facts.is_empty() {
-        return persona.to_string();
+/// The system prompt: the persona, how memory works, and what's remembered.
+/// `saves`: memory is on, so this session's facts are saved when it ends.
+pub fn session_prompt(persona: &str, facts: &[String], saves: bool) -> String {
+    let mut out = persona.trim_end().to_string();
+    if saves {
+        out.push_str(
+            "\n\n## Memory\n\n\
+The app saves what's worth remembering from this conversation when it ends, on its own. \
+When the user asks you to remember something, just confirm it in a few words. \
+Don't write memory files or use tools for it.",
+        );
     }
-    format!(
-        "{}\n\n## What you remember about the user\n\n\
-From earlier conversations. Use it naturally; don't recite it unless asked.\n\n{}\n",
-        persona.trim_end(),
-        facts.join("\n")
-    )
+    if !facts.is_empty() {
+        out.push_str(&format!(
+            "\n\n## What you remember about the user\n\n\
+From earlier conversations. Use it naturally; don't recite it unless asked.\n\n{}",
+            facts.join("\n")
+        ));
+    }
+    out.push('\n');
+    out
 }
 
 fn bullets(s: &str) -> Vec<String> {
@@ -140,7 +151,7 @@ mod tests {
         let f = facts(&["- Lives in Springfield", "- Prefers metric units"]);
         save(&dir, &f).unwrap();
         assert_eq!(load(&dir), f);
-        assert!(session_prompt("Persona.", &f).contains("- Prefers metric units"));
+        assert!(session_prompt("Persona.", &f, true).contains("- Prefers metric units"));
         forget(&dir).unwrap();
         assert!(load(&dir).is_empty());
         forget(&dir).unwrap(); // idempotent

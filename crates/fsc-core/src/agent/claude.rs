@@ -32,7 +32,8 @@ const SETTINGS: &str = include_str!("../../../../voice-home/.claude/settings.loc
 /// Version of the seeded settings. Bump it with a step in `migrate_settings`
 /// when an existing home's `settings.local.json` needs changing.
 /// 1: Edit/Write/NotebookEdit denied. 2: they're asked about instead.
-const SETTINGS_VERSION: u32 = 2;
+/// 3: also in the `settings.json` seeded before 0.5.0, whose denials won.
+const SETTINGS_VERSION: u32 = 3;
 const SETTINGS_VERSION_FILE: &str = ".claude/fsc-settings-version";
 
 pub(crate) struct ClaudeCli {
@@ -129,13 +130,14 @@ fn seed_settings(home: &Path) -> std::io::Result<()> {
         // No version file: seeded before versions were tracked, i.e. version 1.
         let from = std::fs::read_to_string(&version_file).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(1);
         if from < SETTINGS_VERSION {
-            let text = std::fs::read_to_string(&settings)?;
-            match migrate_settings(&text, from) {
-                Some(new) => std::fs::write(&settings, new)?,
-                None => {
-                    eprintln!("fsc: {} isn't valid JSON; left as it is", settings.display());
-                    current = false;
-                }
+            current = migrate_file(&settings, from)?;
+            // Before 0.5.0 the lists were seeded into the shared settings.json,
+            // and later versions never touched it. Claude Code still reads it,
+            // and a denial anywhere beats an ask, so its file-edit denials
+            // kept refusing Write outright.
+            let legacy = home.join(".claude/settings.json");
+            if from < 3 && legacy.exists() {
+                current &= migrate_file(&legacy, 1)?;
             }
         }
     } else {
@@ -147,6 +149,19 @@ fn seed_settings(home: &Path) -> std::io::Result<()> {
         std::fs::write(&version_file, format!("{SETTINGS_VERSION}\n"))?;
     }
     Ok(())
+}
+
+/// Migrate one settings file in place. False if it isn't valid JSON and was
+/// left alone.
+fn migrate_file(path: &Path, from: u32) -> std::io::Result<bool> {
+    let text = std::fs::read_to_string(path)?;
+    match migrate_settings(&text, from) {
+        Some(new) => std::fs::write(path, new).map(|()| true),
+        None => {
+            eprintln!("fsc: {} isn't valid JSON; left as it is", path.display());
+            Ok(false)
+        }
+    }
 }
 
 /// Bring settings written for version `from` up to `SETTINGS_VERSION`,
@@ -342,6 +357,9 @@ fn start(cfg: &ClaudeConfig, home: &Path, prompt: &str) -> Result<ClaudeConn, St
         // Don't let a parent Claude Code session (e.g. while developing this
         // app from inside one) leak into the child.
         .env_remove("CLAUDECODE")
+        // The app keeps its own memory (memory.md), the same for every agent.
+        // Claude Code's auto-memory would be a second, separate one.
+        .env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -503,6 +521,26 @@ mod tests {
         assert_eq!(read()["permissions"]["deny"], json!(["Write"]));
         super::super::ensure_home(&home).unwrap();
         assert!(home.join("persona.md").exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn legacy_shared_settings_lose_edit_denials() {
+        let home = std::env::temp_dir().join(format!("fsc-home-test-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let local = home.join(".claude/settings.local.json");
+        let legacy = home.join(".claude/settings.json");
+        std::fs::write(&local, r#"{"permissions":{"deny":["Bash(rm:*)"]}}"#).unwrap();
+        std::fs::write(home.join(SETTINGS_VERSION_FILE), "2\n").unwrap();
+        std::fs::write(&legacy, r#"{"permissions":{"allow":["Read"],"deny":["Bash(sudo:*)","Edit","Write","NotebookEdit"]}}"#)
+            .unwrap();
+        seed_settings(&home).unwrap();
+        let read = |p: &Path| serde_json::from_str::<Value>(&std::fs::read_to_string(p).unwrap()).unwrap();
+        assert_eq!(read(&legacy)["permissions"]["deny"], json!(["Bash(sudo:*)"]));
+        assert_eq!(read(&legacy)["permissions"]["allow"], json!(["Read"]));
+        assert_eq!(read(&local)["permissions"]["deny"], json!(["Bash(rm:*)"]));
+        assert_eq!(std::fs::read_to_string(home.join(SETTINGS_VERSION_FILE)).unwrap().trim(), "3");
         std::fs::remove_dir_all(&home).unwrap();
     }
 

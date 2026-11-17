@@ -168,7 +168,8 @@ Changes made from the menu take effect straight away and are saved.
 | **Super+Shift+A** | Hold to talk, or tap to talk until you stop. |
 | **Enter** | Sends your message. |
 | **Esc** | Hides the popup, and hangs up a voice conversation. A reply still in progress finishes as text, and you get a notification. |
-| **Ctrl+C** | Stops the reply (when no text is selected). |
+| **Ctrl+C** | Copies the text you highlighted in the popup. With nothing highlighted, stops the reply. |
+| **Ctrl+Shift+C** | Copies the whole conversation in the popup, questions and replies, as plain text. |
 | **Ctrl+N** | Starts a new conversation. |
 
 The `fsc` command does the same from a terminal or a script. Run `fsc --help` for the
