@@ -5,6 +5,7 @@ pub mod config;
 pub mod ipc;
 pub mod lang;
 pub mod memory;
+pub mod model_hashes;
 pub mod models;
 pub mod permission;
 pub mod phase;

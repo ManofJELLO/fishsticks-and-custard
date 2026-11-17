@@ -245,6 +245,30 @@ def check_models(tested, now):
                    "(delete it from ~/.local/share/fsc/models and `fsc fetch-models`)")
         else:
             report("OK", "models", label)
+    check_model_pins()
+
+
+def check_model_pins():
+    """Downloads are pinned (crates/fsc-core/src/model_hashes.rs). Say when
+    upstream has moved on, so a release can pick it up on purpose."""
+    pins = dict(re.findall(r'pub const (\w+_REV): &str = "([0-9a-f]+)"',
+                           (ROOT / "crates/fsc-core/src/model_hashes.rs").read_text()))
+    try:
+        heads = {
+            "PIPER_REV": json.loads(get("https://huggingface.co/api/models/rhasspy/piper-voices"))["sha"],
+            "WHISPER_REV": json.loads(get("https://huggingface.co/api/models/ggerganov/whisper.cpp"))["sha"],
+            "SILERO_REV": json.loads(get("https://api.github.com/repos/snakers4/silero-vad/commits"
+                                         "?path=src/silero_vad/data/silero_vad.onnx&per_page=1"))[0]["sha"],
+        }
+    except Exception as e:
+        report("WARN", "models", f"couldn't look up the newest model revisions: {e}")
+        return
+    moved = [k.removesuffix("_REV").lower() for k, sha in heads.items() if pins.get(k) != sha]
+    if moved:
+        report("NOTE", "models", f"newer upstream revision for {', '.join(moved)}: to take it, run "
+               "packaging/release/model_hashes.py, then test speech")
+    else:
+        report("OK", "models", "downloads pinned to the newest revisions, with checksums")
 
 
 def check_voices():

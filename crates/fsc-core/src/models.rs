@@ -1,9 +1,15 @@
 //! Where the speech models live and where they come from.
 //! `fsc fetch-models` downloads anything missing into `models_dir()`.
+//!
+//! Downloads come from fixed upstream revisions (`model_hashes`), and each
+//! file is checked against the SHA-256 recorded for it before it's used:
+//! whisper.cpp and ONNX Runtime parse these files in C/C++, so a replaced
+//! upload must never load.
 
 use std::path::PathBuf;
 
 use crate::config::VoiceConfig;
+use crate::model_hashes::{PIPER_REV, SHA256, SILERO_REV, WHISPER_REV};
 
 pub struct ModelFile {
     /// What it's for, shown while downloading.
@@ -11,6 +17,15 @@ pub struct ModelFile {
     /// `None` when the configured name can't be turned into a download.
     pub url: Option<String>,
     pub path: PathBuf,
+}
+
+impl ModelFile {
+    /// The SHA-256 this version expects, for any file it offers. `None` for a
+    /// voice or whisper model named in the config but not known here.
+    pub fn sha256(&self) -> Option<&'static str> {
+        let name = self.path.file_name()?.to_str()?;
+        SHA256.iter().find(|(n, _)| *n == name).map(|(_, sha)| *sha)
+    }
 }
 
 pub fn models_dir() -> PathBuf {
@@ -55,7 +70,7 @@ fn piper_base_url(voice: &str) -> Option<String> {
     let (locale, name, quality) = (parts.next()?, parts.next()?, parts.next()?);
     let lang = locale.split('_').next()?;
     Some(format!(
-        "https://huggingface.co/rhasspy/piper-voices/resolve/main/{lang}/{locale}/{name}/{quality}/{voice}"
+        "https://huggingface.co/rhasspy/piper-voices/resolve/{PIPER_REV}/{lang}/{locale}/{name}/{quality}/{voice}"
     ))
 }
 
@@ -64,17 +79,16 @@ pub fn required(v: &VoiceConfig) -> Vec<ModelFile> {
         ModelFile {
             label: "speech recognition (whisper)",
             url: Some(format!(
-                "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{}.bin",
+                "https://huggingface.co/ggerganov/whisper.cpp/resolve/{WHISPER_REV}/ggml-{}.bin",
                 v.whisper_model
             )),
             path: whisper_path(v),
         },
         ModelFile {
             label: "voice activity detection (silero)",
-            url: Some(
-                "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx"
-                    .into(),
-            ),
+            url: Some(format!(
+                "https://raw.githubusercontent.com/snakers4/silero-vad/{SILERO_REV}/src/silero_vad/data/silero_vad.onnx"
+            )),
             path: vad_path(),
         },
     ];
@@ -88,6 +102,7 @@ pub fn required(v: &VoiceConfig) -> Vec<ModelFile> {
 /// never looks finished). `progress(done, total)` is called as it goes.
 pub fn download(m: &ModelFile, mut progress: impl FnMut(u64, Option<u64>)) -> anyhow::Result<()> {
     use anyhow::{Context, bail};
+    use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     let Some(url) = m.url.as_deref() else {
         bail!(
@@ -109,12 +124,14 @@ pub fn download(m: &ModelFile, mut progress: impl FnMut(u64, Option<u64>)) -> an
     let mut out = std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
     let mut buf = vec![0u8; 1 << 16];
     let mut done: u64 = 0;
+    let mut hash = Sha256::new();
     loop {
         let n = body.read(&mut buf)?;
         if n == 0 {
             break;
         }
         out.write_all(&buf[..n])?;
+        hash.update(&buf[..n]);
         done += n as u64;
         progress(done, total);
     }
@@ -124,6 +141,19 @@ pub fn download(m: &ModelFile, mut progress: impl FnMut(u64, Option<u64>)) -> an
     if total.is_some_and(|t| done < t) {
         let _ = std::fs::remove_file(&part);
         bail!("{url} ended early ({done} of {} bytes)", total.unwrap_or(0));
+    }
+    let got: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    match m.sha256() {
+        Some(want) if got != want => {
+            let _ = std::fs::remove_file(&part);
+            bail!(
+                "{url} isn't the file this version was tested with (SHA-256 {got}, expected {want}). \
+                 It wasn't saved. Try again later, and report it if it keeps happening."
+            );
+        }
+        Some(_) => {}
+        // A model chosen by name in the config: still from a fixed revision.
+        None => eprintln!("fsc: {} has no recorded checksum (SHA-256 {got})", m.path.display()),
     }
     std::fs::rename(&part, &m.path)?;
     Ok(())
@@ -149,6 +179,8 @@ pub fn missing(v: &VoiceConfig) -> Vec<ModelFile> {
 
 #[cfg(test)]
 mod tests {
+    use crate::model_hashes::PIPER_REV;
+
     #[test]
     fn bad_voice_name_is_reported_not_skipped() {
         let v = crate::config::VoiceConfig { piper_voice: "alan".into(), language: "auto".into(), ..Default::default() };
@@ -166,7 +198,41 @@ mod tests {
     fn piper_url() {
         assert_eq!(
             super::piper_base_url("en_GB-alan-medium").unwrap(),
-            "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium/en_GB-alan-medium"
+            format!("https://huggingface.co/rhasspy/piper-voices/resolve/{PIPER_REV}/en/en_GB/alan/medium/en_GB-alan-medium")
         );
+    }
+
+    #[test]
+    fn every_offered_model_has_a_checksum() {
+        use crate::config::VoiceConfig;
+        for v in crate::voices::VOICES {
+            for m in super::voice_files(v.key) {
+                assert!(m.sha256().is_some(), "{} has no checksum: run packaging/release/model_hashes.py", v.key);
+            }
+        }
+        for m in super::required(&VoiceConfig { language: "en".into(), ..Default::default() }) {
+            assert!(m.sha256().is_some(), "{} has no checksum", m.label);
+        }
+    }
+
+    #[test]
+    fn a_replaced_file_is_refused() {
+        // A tiny "model" served locally whose bytes don't match the checksum.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = [0u8; 1024];
+            let _ = s.read(&mut req);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nevil");
+        });
+        let dir = std::env::temp_dir().join(format!("fsc-models-test-{}", std::process::id()));
+        let path = dir.join("silero_vad.onnx");
+        let m = super::ModelFile { label: "test", url: Some(format!("http://127.0.0.1:{port}/x")), path: path.clone() };
+        let err = super::download(&m, |_, _| {}).unwrap_err().to_string();
+        assert!(err.contains("isn't the file"), "{err}");
+        assert!(!path.exists() && !path.with_extension("part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

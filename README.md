@@ -133,7 +133,9 @@ wants to do and the exact command, address or file. You can answer in four ways:
   when the agent offers it.
 - **DENY** refuses. Closing the popup also counts as no.
 - **By voice:** if you asked out loud, it also asks out loud (*"May I open a web page?
-  Yes, always, or no?"*). Answer *yes*, *always* or *no*.
+  Yes or no?"*). Answer *yes* or *no*. **ALWAYS** takes a click: anything within earshot,
+  such as a video or a call on speaker, could say "always", so a spoken one only allows
+  it this once.
 
 Reading files, searching the web and thinking don't need your permission. Places that
 hold keys, passwords and logins are the exception: SSH and GPG keys, password stores,
@@ -296,6 +298,8 @@ mic) for listening: choose it in the tray's **Microphone** menu.
 - **What is sent:** the text of your questions goes to the agent you chose, and through
   it to that company, just as if you typed it into that agent yourself.
 - **Your memory file:** kept on your computer. You can read, edit or delete it.
+- **Speech models:** downloaded from fixed versions on Hugging Face and GitHub, and each
+  file is checked against a fingerprint (SHA-256) built into the app before it's used.
 - **Actions:** anything that changes your computer or opens a web page is asked about
   first, unless you've answered **ALWAYS** for it. Web searches aren't asked about.
 

@@ -841,9 +841,8 @@ impl Ui {
             }
             AudioEvent::MicWaiting => self.flash_meta_for("WAITING FOR MIC…", Duration::from_secs(15)),
             AudioEvent::MicLive => {
-                let open = self.st.borrow().asks.first().map(|a| a.ask.can_always);
-                if let Some(can_always) = open {
-                    self.flash_meta_for(choices(lang::english(), can_always).1, Duration::from_secs(8));
+                if !self.st.borrow().asks.is_empty() {
+                    self.flash_meta_for(choices(lang::english()).1, Duration::from_secs(8));
                 } else if self.st.borrow().follow_up {
                     self.flash_meta_for("GO AHEAD · ESC ENDS CONVERSATION", Duration::from_secs(5));
                 } else {
@@ -1824,15 +1823,22 @@ impl Ui {
                 // "Google Calendar · create event" -> "Google Calendar".
                 lang.question(ask.kind, ask.tool.split(" · ").next().unwrap_or(&ask.tool))
             };
-            self.speak(format!("{question} {}", choices(lang, ask.can_always).0));
+            self.speak(format!("{question} {}", choices(lang).0));
         }
         self.maybe_follow_up();
     }
 
+    /// An answer heard on the mic. "Always" counts as a plain yes: anything
+    /// within earshot (a video, a call on speaker) can say it, and a saved
+    /// rule outlives the moment. ALWAYS takes a click, or typing it.
     fn spoken_answer(self: &Rc<Self>, id: &str, text: &str) {
         let lang = self.st.borrow().spoken.language();
         if let Some(answer) = permission::parse_answer(text, lang) {
-            self.answer_ask(id, answer);
+            if answer == Answer::Always {
+                self.answer_ask_noted(id, Answer::Once, "✓ ALLOWED ONCE · ALWAYS NEEDS A CLICK");
+            } else {
+                self.answer_ask(id, answer);
+            }
             return;
         }
         let tries = {
@@ -1841,9 +1847,7 @@ impl Ui {
             st.answer_tries
         };
         if tries < MAX_ANSWER_TRIES {
-            let can_always = self.st.borrow().asks.iter().find(|a| a.ask.id == id).is_some_and(|a| a.ask.can_always);
-            let lang = self.st.borrow().spoken.language();
-            let (spoken, meta) = choices(lang, can_always);
+            let (spoken, meta) = choices(lang);
             self.flash_meta(meta);
             if !text.trim().is_empty() && self.should_speak() {
                 self.speak(format!("{} {spoken}", lang.phrases.sorry));
@@ -1858,12 +1862,17 @@ impl Ui {
         // Nothing can be saved for this request: an "always" is a plain allow.
         let can_always = self.st.borrow().asks.iter().find(|a| a.ask.id == id).is_some_and(|a| a.ask.can_always);
         let answer = if answer == Answer::Always && !can_always { Answer::Once } else { answer };
-        self.claude.answer(id, answer);
         let note = match answer {
             Answer::Once => "✓ ALLOWED",
             Answer::Always => "✓ ALLOWED · WON'T ASK AGAIN",
             Answer::Deny => "✕ DENIED",
         };
+        self.answer_ask_noted(id, answer, note);
+    }
+
+    /// Send `answer`, mark the card with `note`, and move on to the next question.
+    fn answer_ask_noted(self: &Rc<Self>, id: &str, answer: Answer, note: &str) {
+        self.claude.answer(id, answer);
         self.close_ask(id, note);
         let next = self.st.borrow().asks.first().map(|a| a.ask.clone());
         match next {
@@ -2264,12 +2273,8 @@ fn notify(text: &str) {
     });
 }
 
-/// How to ask for an answer: (spoken, status line). "Always" is only offered
-/// when the request comes with a rule that can be saved.
-fn choices(lang: &Language, can_always: bool) -> (&'static str, &'static str) {
-    if can_always {
-        (lang.phrases.yes_always_no, "SAY YES, ALWAYS OR NO")
-    } else {
-        (lang.phrases.yes_no, "SAY YES OR NO")
-    }
+/// How to ask for an answer: (spoken, status line). "Always" is never
+/// offered by voice: see `spoken_answer`.
+fn choices(lang: &Language) -> (&'static str, &'static str) {
+    (lang.phrases.yes_no, "SAY YES OR NO")
 }
