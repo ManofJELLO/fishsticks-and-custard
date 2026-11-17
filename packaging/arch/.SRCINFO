@@ -1,6 +1,6 @@
 pkgbase = fishsticks-and-custard
 	pkgdesc = Voice desktop assistant for Hyprland on Claude, Codex, Antigravity or OpenCode (wake word, push-to-talk, tray)
-	pkgver = 0.8.4
+	pkgver = 0.8.5
 	pkgrel = 1
 	url = https://github.com/ManofJELLO/fishsticks-and-custard
 	install = fishsticks-and-custard.install
@@ -25,14 +25,16 @@ pkgbase = fishsticks-and-custard
 	depends = espeak-ng
 	depends = pcaudiolib
 	depends = libsonic
+	optdepends = vulkan-driver: speech recognition on the GPU (vulkan-radeon, vulkan-intel, nvidia-utils or vulkan-nouveau); without it, the CPU
 	optdepends = hyprland: the compositor this is designed for (any wlroots-style layer-shell compositor works)
+	optdepends = noto-fonts-cjk: Chinese and Korean text in the popup
 	optdepends = libnotify: desktop notifications when a reply finishes while the popup is hidden
 	optdepends = codex-acp: Codex (ChatGPT) as the agent (AUR; needs nodejs)
 	optdepends = antigravity-cli: Antigravity (Google) as the agent (AUR)
 	optdepends = opencode: OpenCode (free models, or your own providers) as the agent
 	options = !lto
 	options = !debug
-	source = fishsticks-and-custard::git+https://github.com/ManofJELLO/fishsticks-and-custard.git#tag=v0.8.4
+	source = fishsticks-and-custard::git+https://github.com/ManofJELLO/fishsticks-and-custard.git#tag=v0.8.5
 	sha256sums = SKIP
 
 pkgname = fishsticks-and-custard

@@ -17,7 +17,7 @@ if you spoke, reads the reply aloud.
   locally. Only the text of what you ask goes to the agent.
 - **Remembers what matters.** It keeps a short list of facts about you between
   conversations. It's a plain file you can read, edit or delete.
-- **Speaks 18 languages**, with a choice of voices for each.
+- **Speaks 23 languages**, with a choice of voices for each.
 
 ## Contents
 
@@ -45,8 +45,11 @@ if you spoke, reads the reply aloud.
 - **An account with one of the agents** (see [Choosing an agent](#choosing-an-agent)).
   Claude Code is the default. OpenCode needs no account at all.
 - **For voice:** a microphone, and speakers or headphones. Typing works without either.
-- **About 700 MB of disk** for the speech models. A graphics card with Vulkan drivers
-  makes speech recognition fast. It also runs on the CPU, more slowly.
+- **About 700 MB of disk** for the speech models.
+- **A graphics card with Vulkan drivers** makes speech recognition fast: AMD
+  (`vulkan-radeon`), Intel (`vulkan-intel`) or NVIDIA (`nvidia-utils`, or `vulkan-nouveau`
+  with the open driver). Without one it runs on the CPU, which takes several seconds per
+  question. The log says which it's using.
 
 ## Install
 
@@ -233,14 +236,21 @@ can be used too: set `backend = "acp"` and its `command` in the settings file.
 ## Languages and voices
 
 It speaks and listens in English, German, French, Spanish, Italian, Portuguese, Dutch,
-Polish, Swedish, Danish, Norwegian, Finnish, Czech, Russian, Ukrainian, Turkish, Hungarian
-and Romanian. At first it uses your desktop's language, or English if that isn't on the
-list.
+Polish, Swedish, Danish, Norwegian, Finnish, Czech, Russian, Ukrainian, Turkish, Hungarian,
+Romanian, Chinese (Mandarin), Korean, Hindi, Vietnamese and Indonesian. At first it uses
+your desktop's language, or English if that isn't on the list.
+
+Chinese, Korean, Hindi, Vietnamese and Indonesian are new. Their spoken *yes* and *no*
+were tested with synthetic voices only, and Vietnamese answers often weren't recognised
+that way. If you speak one of them, a report of how it does for you would help. Japanese
+and Thai aren't available yet: their voices need a different speech engine.
+
+For Chinese and Korean text in the popup, install `noto-fonts-cjk`.
 
 Pick another language from the tray's **Language** menu, or with `fsc language de`. It
 then listens for that language, speaks it, and tells the agent to reply in it.
-Permission questions are asked in it too, and *yes*, *always* and *no* are understood in
-that language as well as in English. The first time you pick a language, its voice
+Permission questions are asked in it too, and *yes* and *no* are understood in that
+language as well as in English. The first time you pick a language, its voice
 downloads (60 to 120 MB), and it says hello when it's ready.
 
 The **Voice** menu lists every voice available for the language, with its download size.

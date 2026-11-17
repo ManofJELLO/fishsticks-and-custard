@@ -43,7 +43,8 @@ const MAX_WORDS: usize = 5;
 pub fn check_phrase(phrase: &str) -> Result<String, String> {
     let tidy = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
     let norm = normalize(&tidy);
-    let letters = norm.chars().filter(|c| c.is_alphanumeric()).count();
+    // A Chinese character says as much as a couple of letters.
+    let letters: usize = norm.chars().filter(|c| fsc_core::lang::is_word_char(*c)).map(|c| if fsc_core::lang::is_han(c) { 2 } else { 1 }).sum();
     let words = norm.split_whitespace().count();
     if letters < MIN_LETTERS {
         return Err(format!("{tidy:?} is too short for a wake phrase (at least {MIN_LETTERS} letters)"));
@@ -120,6 +121,8 @@ pub fn mentions(text: &str, phrase: &str) -> bool {
 
 fn match_after(text: &str, phrase: &str, lead: Lead, language: &str) -> Option<String> {
     let target: String = sound(&normalize(phrase).split_whitespace().collect::<String>());
+    // Chinese a character at a time, as if spaced.
+    let text = &fsc_core::lang::spaced(text);
     if target.is_empty() {
         return None;
     }
@@ -181,8 +184,8 @@ fn match_after(text: &str, phrase: &str, lead: Lead, language: &str) -> Option<S
             let rest_from = words[end..].iter().map(|(_, i)| *i).find(|i| *i != last_orig).unwrap_or(original.len());
             let mut parts: Vec<&str> = tail_of_word;
             parts.extend(&original[rest_from.max(last_orig + 1).min(original.len())..]);
-            let rest = parts.join(" ");
-            let rest = rest.trim_start_matches(|c: char| !c.is_alphanumeric()).trim().to_string();
+            let rest = fsc_core::lang::unspaced(&parts.join(" "));
+            let rest = rest.trim_start_matches(|c: char| !fsc_core::lang::is_word_char(c)).trim().to_string();
             return Some(rest);
         }
     }
@@ -190,10 +193,10 @@ fn match_after(text: &str, phrase: &str, lead: Lead, language: &str) -> Option<S
 }
 
 fn normalize(s: &str) -> String {
-    s.to_lowercase()
+    fsc_core::lang::spaced(&fsc_core::lang::simplified(&s.to_lowercase()))
         .replace('&', " and ")
         .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .map(|c| if fsc_core::lang::is_word_char(c) { c } else { ' ' })
         .collect()
 }
 
@@ -223,6 +226,25 @@ mod tests {
     use super::{Lead, check_phrase, could_start, match_wake, match_wake_after, mentions, spelling};
 
     const P: &str = "fishsticks and custard";
+
+    #[test]
+    fn chinese_phrase_and_command() {
+        let p = check_phrase("小助手").unwrap();
+        assert_eq!(match_wake_after("小助手，今天天气怎么样？", &p, Lead::Fillers, "zh").as_deref(), Some("今天天气怎么样？"));
+        // Traditional characters, and a filler first.
+        assert_eq!(match_wake_after("嘿 小助手 打開音樂", &p, Lead::Fillers, "zh").as_deref(), Some("打開音樂"));
+        // Mentioned mid-sentence: no.
+        assert_eq!(match_wake_after("我昨天跟小助手说过了", &p, Lead::Fillers, "zh"), None);
+        assert!(check_phrase("小助").is_err());
+        assert!(check_phrase("助").is_err());
+        // The usual phrase, then Chinese.
+        assert_eq!(match_wake_after("Fishsticks and custard, 现在几点？", P, Lead::Fillers, "zh").as_deref(), Some("现在几点？"));
+    }
+
+    #[test]
+    fn hindi_words_stay_whole() {
+        assert_eq!(match_wake_after("अरे Fishsticks and custard, क्या समय हुआ है?", P, Lead::Fillers, "hi").as_deref(), Some("क्या समय हुआ है?"));
+    }
 
     #[test]
     fn plain_and_variants() {

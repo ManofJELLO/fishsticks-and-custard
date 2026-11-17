@@ -5,6 +5,18 @@
 /// Below this many characters, keep accumulating rather than speaking a
 /// fragment like "Yes." on its own (fewer gaps between clips).
 const MIN_CHUNK: usize = 24;
+/// The same for Chinese, whose characters carry more each.
+const MIN_CHUNK_CJK: usize = 8;
+
+/// Ends a sentence when followed by a space: ".", "!", "?", and Hindi's "।".
+fn spaced_end(c: char) -> bool {
+    matches!(c, '.' | '!' | '?' | '।')
+}
+
+/// Ends a Chinese sentence, with no space after it.
+fn cjk_end(c: char) -> bool {
+    matches!(c, '。' | '！' | '？')
+}
 /// Inline code longer than this isn't read out.
 const MAX_INLINE_CODE: usize = 40;
 
@@ -95,8 +107,9 @@ impl SentenceBuffer {
         if in_code || s.trim_start().starts_with("```") { None } else { speakable(&s, self.language()) }
     }
 
-    /// Byte index just past a sentence end: `.`/`!`/`?` followed by
-    /// whitespace (so "3.5" and "e.g.x" don't split), or a newline.
+    /// Byte index just past a sentence end: `.`/`!`/`?`/`।` followed by
+    /// whitespace (so "3.5" and "e.g.x" don't split), Chinese `。！？`, or a
+    /// newline.
     /// The text before each position never changes, so a position that
     /// wasn't a boundary never becomes one: the scan resumes where it stopped.
     fn boundary(&mut self) -> Option<usize> {
@@ -110,8 +123,12 @@ impl SentenceBuffer {
                 found = Some(i + 1);
                 break;
             }
-            if matches!(sc.prev, Some('.' | '!' | '?')) && c.is_whitespace() && sc.chars >= MIN_CHUNK {
+            if sc.prev.is_some_and(spaced_end) && c.is_whitespace() && sc.chars >= MIN_CHUNK {
                 found = Some(i + c.len_utf8());
+                break;
+            }
+            if sc.prev.is_some_and(cjk_end) && !cjk_end(c) && sc.chars >= MIN_CHUNK_CJK {
+                found = Some(i);
                 break;
             }
             if !c.is_whitespace() {
@@ -246,6 +263,17 @@ mod tests {
     }
 
     #[test]
+    fn splits_chinese_and_hindi() {
+        let mut b = SentenceBuffer::default();
+        let mut out = b.push("今天北京天气晴朗，最高气温二十度。明天");
+        out.extend(b.push("会下雨，记得带伞！好"));
+        assert_eq!(out, vec!["今天北京天气晴朗，最高气温二十度。", "明天会下雨，记得带伞！"]);
+        assert_eq!(b.flush().as_deref(), Some("好"));
+        let mut b = SentenceBuffer::default();
+        assert_eq!(b.push("आज मौसम साफ़ रहेगा और धूप खिली रहेगी। कल बारिश"), vec!["आज मौसम साफ़ रहेगा और धूप खिली रहेगी।"]);
+    }
+
+    #[test]
     fn splits_streamed_sentences() {
         let mut b = SentenceBuffer::default();
         assert!(b.push("The kernel is version 6").is_empty());
@@ -328,8 +356,11 @@ mod tests {
             if c == '\n' && buf[..i].trim().len() >= 2 {
                 return Some(i + 1);
             }
-            if matches!(prev, Some('.' | '!' | '?')) && c.is_whitespace() && buf[..i].trim().chars().count() >= MIN_CHUNK {
+            if prev.is_some_and(spaced_end) && c.is_whitespace() && buf[..i].trim().chars().count() >= MIN_CHUNK {
                 return Some(i + c.len_utf8());
+            }
+            if prev.is_some_and(cjk_end) && !cjk_end(c) && buf[..i].trim().chars().count() >= MIN_CHUNK_CJK {
+                return Some(i);
             }
             prev = Some(c);
         }

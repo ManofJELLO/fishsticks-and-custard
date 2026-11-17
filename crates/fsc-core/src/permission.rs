@@ -108,13 +108,17 @@ pub fn parse_answer(text: &str, lang: &Language) -> Option<Answer> {
     // An English word that's an everyday word in `lang` means what it means
     // there: Polish "no dobra" is "yeah, OK", Dutch "is goed" is "fine".
     let ordinary = |w: &str| !lang.is_english() && (lang.answers.consent.contains(&w) || lang.answers.filler.contains(&w));
-    let any = |f: fn(&AnswerWords) -> &'static [&'static str]| -> Vec<&'static str> {
+    // Phrases are read the way the reply is: "tidak apa-apa" as "tidak apa
+    // apa", Chinese a character at a time.
+    let any = |f: fn(&AnswerWords) -> &'static [&'static str]| -> Vec<String> {
         lists
             .iter()
             .flat_map(|l| {
                 let own = std::ptr::eq(*l, &lang.answers);
                 f(l).iter().copied().filter(move |w| own || !ordinary(w))
             })
+            .map(|w| words_of(w).join(" "))
+            .filter(|w| !w.is_empty())
             .collect()
     };
     let (always_words, deny, hedges, question_starts, consent, filler, agree) = (
@@ -129,33 +133,24 @@ pub fn parse_answer(text: &str, lang: &Language) -> Option<Answer> {
     // A question isn't a yes, but it can be a no ("Nie?", as whisper
     // sometimes hears a flat "nie").
     let asked = text.contains(['?', '¿', '？']);
-    let t: String = text
-        .to_lowercase()
-        .replace(['’', '‘'], "'")
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '\'' { c } else { ' ' })
-        .collect();
-    let words: Vec<&str> = t.split_whitespace().map(|w| match w {
-        "dont" => "don't",
-        "im" => "i'm",
-        w => w,
-    }).collect();
-    if words.is_empty() || words.len() > 8 {
-        return None;
-    }
-    if question_starts.contains(&words[0]) {
+    let words = words_of(text);
+    // Chinese counts each character, so it may run longer.
+    let max_words = if text.chars().any(crate::lang::is_han) { 16 } else { 8 };
+    if words.is_empty() || words.len() > max_words {
         return None;
     }
     let mut s = format!(" {} ", words.join(" "));
-    let has = |s: &str, list: &[&str]| list.iter().any(|w| s.contains(&format!(" {w} ")));
-
+    let has = |s: &str, list: &[String]| list.iter().any(|w| s.contains(&format!(" {w} ")));
+    if question_starts.iter().any(|q| s.starts_with(&format!(" {q} "))) {
+        return None;
+    }
     if has(&s, &hedges) {
         return None;
     }
     // Agreeing phrases that contain a negative word.
     let mut agreed = false;
     for p in &agree {
-        if let Some(i) = s.find(&format!(" {p} ")) {
+        while let Some(i) = s.find(&format!(" {p} ")) {
             s.replace_range(i..i + p.len() + 1, "");
             agreed = true;
         }
@@ -173,16 +168,42 @@ pub fn parse_answer(text: &str, lang: &Language) -> Option<Answer> {
     if asked {
         return None;
     }
-    let rest: Vec<&str> = s.split_whitespace().collect();
-    if !rest.iter().all(|w| consent.contains(w) || filler.contains(w)) {
+    // What's left must be all yes and filler: take those out, longest
+    // first (so "好的" goes before "好"), and nothing may remain.
+    let mut rest: Vec<(&String, bool)> = consent.iter().map(|w| (w, true)).chain(filler.iter().map(|w| (w, false))).collect();
+    rest.sort_by_key(|(w, _)| std::cmp::Reverse(w.len()));
+    for (p, yes) in rest {
+        while let Some(i) = s.find(&format!(" {p} ")) {
+            s.replace_range(i..i + p.len() + 1, "");
+            agreed |= yes;
+        }
+    }
+    if !s.trim().is_empty() {
         return None;
     }
-    agreed |= rest.iter().any(|w| consent.contains(w));
     match (always, agreed) {
         (true, _) => Some(Answer::Always),
         (false, true) => Some(Answer::Once),
         (false, false) => None,
     }
+}
+
+/// A reply, or a listed phrase, as lower-case words without punctuation.
+fn words_of(text: &str) -> Vec<String> {
+    let t: String = text
+        .to_lowercase()
+        .replace(['’', '‘'], "'")
+        .chars()
+        .map(|c| if crate::lang::is_word_char(c) || c == '\'' { c } else { ' ' })
+        .collect();
+    crate::lang::spaced(&crate::lang::simplified(&t))
+        .split_whitespace()
+        .map(|w| match w {
+            "dont" => "don't".to_string(),
+            "im" => "i'm".to_string(),
+            w => w.to_string(),
+        })
+        .collect()
 }
 
 /// "Write \"hi\" into note.txt." -> "write \"hi\" into note.txt", so it
@@ -208,6 +229,49 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asian_answers() {
+        let l = |c| crate::lang::find(c).unwrap();
+        let cases: &[(&str, &str, Option<Answer>)] = &[
+            ("zh", "好的。", Some(Answer::Once)),
+            ("zh", "可以，没问题。", Some(Answer::Once)),
+            ("zh", "好，以后不用问。", Some(Answer::Always)),
+            ("zh", "不行。", Some(Answer::Deny)),
+            ("zh", "不要。", Some(Answer::Deny)),
+            ("zh", "沒問題", Some(Answer::Once)),
+            ("zh", "我不知道。", None),
+            ("zh", "可以吗？", None),
+            ("zh", "这是什么？", None),
+            ("ko", "네.", Some(Answer::Once)),
+            ("ko", "네, 해도 돼요.", Some(Answer::Once)),
+            ("ko", "네, 항상.", Some(Answer::Always)),
+            ("ko", "아니요.", Some(Answer::Deny)),
+            ("ko", "안 돼요.", Some(Answer::Deny)),
+            ("ko", "잘 모르겠어요.", None),
+            ("hi", "हाँ।", Some(Answer::Once)),
+            ("hi", "हां, ठीक है।", Some(Answer::Once)),
+            ("hi", "हाँ, हमेशा।", Some(Answer::Always)),
+            ("hi", "नहीं।", Some(Answer::Deny)),
+            ("hi", "कोई बात नहीं।", Some(Answer::Once)),
+            ("hi", "पता नहीं।", None),
+            ("vi", "Có.", Some(Answer::Once)),
+            ("vi", "Vâng, được.", Some(Answer::Once)),
+            ("vi", "Có, từ giờ.", Some(Answer::Always)),
+            ("vi", "Không.", Some(Answer::Deny)),
+            ("vi", "Không sao.", Some(Answer::Once)),
+            ("vi", "Không biết.", None),
+            ("id", "Ya.", Some(Answer::Once)),
+            ("id", "Iya, boleh.", Some(Answer::Once)),
+            ("id", "Ya, selalu.", Some(Answer::Always)),
+            ("id", "Tidak.", Some(Answer::Deny)),
+            ("id", "Tidak apa-apa.", Some(Answer::Once)),
+            ("id", "Mungkin.", None),
+        ];
+        for (code, text, want) in cases {
+            assert_eq!(parse_answer(text, l(code)), *want, "{code}: {text}");
+        }
+    }
 
     #[test]
     fn secret_paths_are_recognised() {

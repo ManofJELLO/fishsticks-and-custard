@@ -111,6 +111,75 @@ impl Language {
     }
 }
 
+/// A Chinese character (CJK ideograph). Chinese is written without spaces,
+/// so each counts as a word of its own when matching words.
+pub fn is_han(c: char) -> bool {
+    matches!(c as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2A6DF)
+}
+
+/// Part of a word: a letter or digit, or a Devanagari mark. Unicode doesn't
+/// count every vowel sign and the virama as letters, which would cut Hindi
+/// words apart ("क्या" into "क" and "या"). The danda (।) ends a sentence.
+pub fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c as u32, 0x0900..=0x0963 | 0x0966..=0x097F)
+}
+
+/// Traditional characters that common answer and filler words use, read as
+/// their simplified forms: whisper writes Chinese either way.
+const TRADITIONAL: &[(char, char)] = &[
+    ('沒', '没'), ('問', '问'), ('題', '题'), ('別', '别'), ('絕', '绝'), ('繼', '继'), ('續', '续'),
+    ('確', '确'), ('許', '许'), ('當', '当'), ('執', '执'), ('麼', '么'), ('為', '为'), ('會', '会'),
+    ('讓', '让'), ('嗎', '吗'), ('總', '总'), ('後', '后'), ('遠', '远'), ('從', '从'), ('現', '现'),
+    ('開', '开'), ('關', '关'), ('係', '系'), ('錯', '错'), ('擔', '担'), ('裡', '里'), ('對', '对'),
+    ('謝', '谢'), ('這', '这'), ('個', '个'), ('們', '们'), ('說', '说'), ('請', '请'), ('準', '准'),
+    ('啟', '启'), ('動', '动'), ('來', '来'), ('時', '时'), ('樣', '样'),
+    ('應', '应'), ('該', '该'), ('與', '与'), ('還', '还'), ('裏', '里'), ('邊', '边'), ('並', '并'),
+];
+
+/// `s` with the traditional characters in `TRADITIONAL` made simplified,
+/// for comparing words. Not for text that's passed on.
+pub fn simplified(s: &str) -> String {
+    s.chars().map(|c| TRADITIONAL.iter().find(|(t, _)| *t == c).map_or(c, |(_, simple)| *simple)).collect()
+}
+
+/// `s` with a space either side of each Chinese character, so Chinese
+/// splits into words as spaced languages do. Other text is unchanged.
+pub fn spaced(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if is_han(c) {
+            out.push(' ');
+            out.push(c);
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Undo `spaced` for text passed on: no space between two Chinese
+/// characters or Chinese punctuation.
+pub fn unspaced(s: &str) -> String {
+    let cjk = |c: char| is_han(c) || matches!(c as u32, 0x3000..=0x303F | 0xFF00..=0xFFEF);
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    for (i, &c) in chars.iter().enumerate() {
+        if c == ' ' {
+            let before = out.chars().last();
+            let after = chars[i + 1..].iter().find(|c| **c != ' ');
+            if before.is_some_and(cjk) && after.is_some_and(|c| cjk(*c)) {
+                continue;
+            }
+            if before == Some(' ') {
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out.trim().to_string()
+}
+
 pub fn english() -> &'static Language {
     &LANGUAGES[0]
 }
@@ -195,7 +264,7 @@ fn parse_locale(locale: &str) -> (String, String) {
     (lang, region)
 }
 
-pub static LANGUAGES: [Language; 18] = [
+pub static LANGUAGES: [Language; 23] = [
     Language {
         code: "en",
         name: "English",
@@ -1077,6 +1146,267 @@ pub static LANGUAGES: [Language; 18] = [
             sample: "Bună. Așa sună vocea mea.",
             code_on_screen: "Codul este pe ecran.",
             command_on_screen: "(vezi ecranul)",
+        },
+    },
+    Language {
+        code: "zh",
+        name: "Chinese (Mandarin)",
+        native: "中文",
+        voices: &[("", "zh_CN-huayan-medium")],
+        // Matched a character at a time (see `spaced`), so a phrase here
+        // matches wherever its characters appear together.
+        answers: AnswerWords {
+            always: &[
+                "以后不用再问", "以后都不用问", "不用再问", "别再问", "不要再问", "每次都可以", "从现在开始", "一直", "总是",
+                "永远", "以后不用问",
+            ],
+            deny: &["不要", "不", "别", "否", "拒绝", "取消", "停", "算了", "禁止", "没门"],
+            hedges: &[
+                "不知道", "不确定", "不太确定", "也许", "可能", "大概", "等一下", "等等", "让我想想", "我觉得", "吗",
+                "好不好", "行不行", "可不可以", "要不要", "嗯哼",
+            ],
+            question_starts: &["什么", "为什么", "怎么", "谁", "哪", "哪里", "是不是", "能不能", "会不会", "有没有"],
+            consent: &[
+                "好", "好的", "可以", "行", "是", "是的", "对", "嗯", "同意", "允许", "当然", "继续", "确定", "执行", "批准",
+                "没错", "去吧", "来吧", "好啊", "好吧", "ok",
+            ],
+            filler: &[
+                "吧", "啊", "呀", "的", "了", "就", "那", "那么", "这", "这个", "这次", "一下", "一次", "你", "我", "请",
+                "谢谢", "嗯嗯", "哦", "噢", "呃", "然后", "现在", "做", "吧吧",
+            ],
+            agree: &["没问题", "没关系", "不错", "不客气", "不用担心", "无所谓"],
+        },
+        wake_fillers: &["嘿", "喂", "哎", "嗨", "你", "好", "那", "个", "嗯", "呃", "啊", "哦", "请", "ok"],
+        phrases: Phrases {
+            questions: [
+                "我可以运行一条命令吗？",
+                "我可以修改一个文件吗？",
+                "我可以写入一个文件吗？",
+                "我可以删除一个文件吗？",
+                "我可以移动一个文件吗？",
+                "我可以读取一个文件吗？",
+                "我可以上网搜索吗？",
+                "我可以打开一个网页吗？",
+                "我可以搜索你的文件吗？",
+                "我可以思考一下吗？",
+                "我可以使用{}吗？",
+            ],
+            yes_no: "可以，还是不可以？",
+            use_a_tool: "我可以使用一个工具吗？",
+            sorry: "抱歉。",
+            sample: "你好。这是我的声音。",
+            code_on_screen: "代码在屏幕上。",
+            command_on_screen: "屏幕上的命令",
+        },
+    },
+    Language {
+        code: "ko",
+        name: "Korean",
+        native: "한국어",
+        voices: &[("", "ko_KR-kss-medium")],
+        answers: AnswerWords {
+            always: &[
+                "다시 묻지 마세요", "다시 묻지 마", "다시 안 물어봐도 돼", "묻지 마세요", "묻지 마", "앞으로도", "앞으로",
+                "매번", "언제나", "항상",
+            ],
+            deny: &[
+                "아니요", "아니오", "아니", "아뇨", "안", "안돼", "안돼요", "싫어", "싫어요", "하지 마", "하지마", "거절",
+                "취소", "중지", "멈춰", "그만",
+            ],
+            hedges: &[
+                "잘 모르겠어요", "잘 모르겠어", "모르겠어요", "모르겠어", "글쎄요", "글쎄", "아마도", "아마", "잠깐만",
+                "잠깐", "잠시만", "생각해 볼게", "생각해 볼게요",
+            ],
+            question_starts: &["뭐", "무엇", "무슨", "왜", "어떻게", "누가", "누구", "어디", "언제", "어느"],
+            consent: &[
+                "네", "예", "응", "그래", "그래요", "좋아", "좋아요", "좋습니다", "괜찮아", "괜찮아요", "괜찮습니다", "허락",
+                "허락해", "허락할게", "허락합니다", "해", "해요", "하세요", "해도", "돼", "돼요", "됩니다", "물론", "물론이죠",
+                "당연하지", "알았어", "알겠어요", "알겠습니다", "진행", "진행해", "진행하세요", "계속", "오케이", "확인",
+                "승인", "ok",
+            ],
+            filler: &[
+                "그럼", "그냥", "이번", "이번만", "한번", "한", "번", "좀", "제발", "부탁해", "부탁해요", "고마워", "고마워요",
+                "감사합니다", "음", "어", "아", "자", "지금", "바로", "그거", "이거", "요",
+            ],
+            agree: &["문제 없어요", "문제없어요", "문제 없어", "문제없어", "문제 없습니다", "상관없어요", "상관없어"],
+        },
+        wake_fillers: &["야", "저기", "저기요", "어", "음", "아", "자", "헤이", "오케이", "좋아", "네", "그", "ok"],
+        phrases: Phrases {
+            questions: [
+                "명령을 실행해도 될까요?",
+                "파일을 수정해도 될까요?",
+                "파일을 써도 될까요?",
+                "파일을 삭제해도 될까요?",
+                "파일을 옮겨도 될까요?",
+                "파일을 읽어도 될까요?",
+                "웹을 검색해도 될까요?",
+                "웹 페이지를 열어도 될까요?",
+                "파일을 검색해도 될까요?",
+                "생각해 봐도 될까요?",
+                "{} 도구를 사용해도 될까요?",
+            ],
+            yes_no: "네, 아니요로 답해 주세요.",
+            use_a_tool: "도구를 사용해도 될까요?",
+            sorry: "죄송해요.",
+            sample: "안녕하세요. 제 목소리는 이렇습니다.",
+            code_on_screen: "코드는 화면에 있어요.",
+            command_on_screen: "화면의 명령어",
+        },
+    },
+    Language {
+        code: "hi",
+        name: "Hindi",
+        native: "हिन्दी",
+        voices: &[("", "hi_IN-pratham-medium")],
+        answers: AnswerWords {
+            always: &[
+                "दोबारा मत पूछो", "दोबारा मत पूछना", "फिर से मत पूछो", "फिर मत पूछना", "मत पूछो", "हर बार", "अब से",
+                "आगे से", "हमेशा",
+            ],
+            deny: &["नहीं", "नही", "ना", "न", "मत", "रुको", "रोको", "रद्द", "मना"],
+            hedges: &[
+                "पता नहीं", "मालूम नहीं", "पक्का नहीं", "शायद", "मुझे लगता", "सोचने दो", "एक मिनट", "रुकिए", "हम्म",
+            ],
+            question_starts: &["क्या", "क्यों", "कैसे", "कौन", "कहाँ", "कहां", "कब", "कौनसा"],
+            consent: &[
+                "हाँ", "हां", "हा", "जी", "ठीक", "बिल्कुल", "बिलकुल", "ज़रूर", "जरूर", "चलो", "करो", "कीजिए", "करिए",
+                "अनुमति", "इजाज़त", "इजाजत", "सही", "अच्छा", "ओके", "ok", "हाँजी",
+            ],
+            filler: &[
+                "है", "हैं", "तो", "बस", "अभी", "इस", "बार", "एक", "यह", "ये", "वो", "कर", "दो", "लो", "आप", "तुम", "मैं",
+                "धन्यवाद", "शुक्रिया", "प्लीज़", "प्लीज", "कृपया", "अरे", "भाई", "दीजिए",
+            ],
+            agree: &["कोई बात नहीं", "कोई दिक्कत नहीं", "कोई समस्या नहीं", "कोई परेशानी नहीं"],
+        },
+        wake_fillers: &["अरे", "हे", "सुनो", "सुनिए", "हेलो", "हैलो", "ओके", "अच्छा", "तो", "हाँ", "जी", "भाई", "ए", "ok"],
+        phrases: Phrases {
+            questions: [
+                "क्या मैं एक कमांड चला सकता हूँ?",
+                "क्या मैं एक फ़ाइल बदल सकता हूँ?",
+                "क्या मैं एक फ़ाइल लिख सकता हूँ?",
+                "क्या मैं एक फ़ाइल मिटा सकता हूँ?",
+                "क्या मैं एक फ़ाइल दूसरी जगह ले जा सकता हूँ?",
+                "क्या मैं एक फ़ाइल पढ़ सकता हूँ?",
+                "क्या मैं इंटरनेट पर खोज सकता हूँ?",
+                "क्या मैं एक वेब पेज खोल सकता हूँ?",
+                "क्या मैं आपकी फ़ाइलें खोज सकता हूँ?",
+                "क्या मैं इस पर सोच सकता हूँ?",
+                "क्या मैं {} इस्तेमाल कर सकता हूँ?",
+            ],
+            yes_no: "हाँ या नहीं?",
+            use_a_tool: "क्या मैं एक टूल इस्तेमाल कर सकता हूँ?",
+            sorry: "माफ़ कीजिए।",
+            sample: "नमस्ते। मेरी आवाज़ ऐसी है।",
+            code_on_screen: "कोड स्क्रीन पर है।",
+            command_on_screen: "स्क्रीन पर दिया गया कमांड",
+        },
+    },
+    Language {
+        code: "vi",
+        name: "Vietnamese",
+        native: "Tiếng Việt",
+        voices: &[("", "vi_VN-vais1000-medium")],
+        answers: AnswerWords {
+            always: &[
+                "không cần hỏi lại", "đừng hỏi lại", "khỏi hỏi lại", "luôn luôn", "luôn", "mỗi lần", "từ nay", "từ giờ",
+            ],
+            deny: &["không", "ko", "đừng", "chưa", "dừng", "hủy", "huỷ", "từ chối", "cấm", "chẳng"],
+            hedges: &[
+                "không biết", "không chắc", "chưa chắc", "có lẽ", "có thể", "để tôi nghĩ", "chờ đã", "đợi đã", "khoan",
+                "tôi nghĩ", "chắc là", "được không",
+            ],
+            question_starts: &[
+                "gì", "cái gì", "tại sao", "sao", "vì sao", "như thế nào", "làm sao", "ai", "ở đâu", "đâu", "khi nào",
+                "bao giờ", "nào", "có phải",
+            ],
+            consent: &[
+                "vâng", "có", "dạ", "ừ", "ừm", "ờ", "được", "đồng ý", "cho phép", "chắc chắn", "tất nhiên", "dĩ nhiên",
+                "đúng", "làm đi", "tiếp tục", "tiếp", "phải", "chấp nhận", "duyệt", "ok", "oke",
+            ],
+            filler: &[
+                "rồi", "thì", "cứ", "đi", "nhé", "nha", "nhá", "ạ", "à", "lần", "này", "một", "bạn", "tôi", "em", "anh",
+                "chị", "cảm ơn", "cám ơn", "xin", "làm", "vậy", "thế",
+            ],
+            agree: &["không sao", "không vấn đề gì", "không có gì", "không thành vấn đề", "được thôi"],
+        },
+        wake_fillers: &["này", "ê", "chào", "xin", "à", "ừ", "ờ", "ừm", "thì", "vâng", "dạ", "nè", "ok"],
+        phrases: Phrases {
+            questions: [
+                "Tôi có thể chạy một lệnh không?",
+                "Tôi có thể sửa một tệp không?",
+                "Tôi có thể ghi một tệp không?",
+                "Tôi có thể xóa một tệp không?",
+                "Tôi có thể di chuyển một tệp không?",
+                "Tôi có thể đọc một tệp không?",
+                "Tôi có thể tìm trên mạng không?",
+                "Tôi có thể mở một trang web không?",
+                "Tôi có thể tìm trong các tệp của bạn không?",
+                "Tôi có thể suy nghĩ một chút không?",
+                "Tôi có thể dùng {} không?",
+            ],
+            yes_no: "Có hay không?",
+            use_a_tool: "Tôi có thể dùng một công cụ không?",
+            sorry: "Xin lỗi.",
+            sample: "Xin chào. Đây là giọng nói của tôi.",
+            code_on_screen: "Mã nằm trên màn hình.",
+            command_on_screen: "lệnh trên màn hình",
+        },
+    },
+    Language {
+        code: "id",
+        name: "Indonesian",
+        native: "Bahasa Indonesia",
+        voices: &[("", "id_ID-news_tts-medium")],
+        answers: AnswerWords {
+            always: &[
+                "jangan tanya lagi", "tidak usah tanya lagi", "nggak usah tanya lagi", "gak usah tanya lagi",
+                "mulai sekarang", "setiap kali", "seterusnya", "selalu",
+            ],
+            deny: &[
+                "tidak", "tak", "nggak", "ngga", "gak", "ga", "enggak", "engga", "jangan", "bukan", "batal", "batalkan",
+                "berhenti", "tolak", "menolak", "dilarang",
+            ],
+            hedges: &[
+                "tidak tahu", "nggak tahu", "gak tahu", "entah", "mungkin", "kayaknya", "sepertinya", "tidak yakin",
+                "kurang yakin", "belum yakin", "tunggu", "sebentar", "saya rasa",
+            ],
+            question_starts: &[
+                "apa", "apakah", "kenapa", "mengapa", "bagaimana", "gimana", "siapa", "di mana", "dimana", "kapan",
+                "yang mana", "bisakah", "bolehkah",
+            ],
+            consent: &[
+                "ya", "iya", "yap", "yup", "ok", "oke", "okay", "boleh", "silakan", "silahkan", "baik", "baiklah", "setuju",
+                "izinkan", "diizinkan", "tentu", "pasti", "lanjut", "lanjutkan", "jalan", "jalankan", "sip", "gas", "betul",
+                "benar",
+            ],
+            filler: &[
+                "saja", "aja", "deh", "dong", "kok", "sih", "nah", "lah", "terus", "lalu", "ini", "itu", "kali", "sekali",
+                "satu", "kamu", "anda", "saya", "aku", "terima", "kasih", "makasih", "tolong", "untuk", "yang", "sudah",
+                "udah", "sekarang",
+            ],
+            agree: &["tidak masalah", "nggak masalah", "gak masalah", "tidak apa-apa", "nggak apa-apa", "gak apa-apa"],
+        },
+        wake_fillers: &["hai", "halo", "hei", "eh", "oke", "ok", "nah", "ya", "jadi", "em", "eum", "anu", "permisi", "tolong"],
+        phrases: Phrases {
+            questions: [
+                "Bolehkah saya menjalankan perintah?",
+                "Bolehkah saya mengubah sebuah berkas?",
+                "Bolehkah saya menulis sebuah berkas?",
+                "Bolehkah saya menghapus sebuah berkas?",
+                "Bolehkah saya memindahkan sebuah berkas?",
+                "Bolehkah saya membaca sebuah berkas?",
+                "Bolehkah saya mencari di internet?",
+                "Bolehkah saya membuka halaman web?",
+                "Bolehkah saya mencari di berkas Anda?",
+                "Bolehkah saya memikirkannya dulu?",
+                "Bolehkah saya memakai {}?",
+            ],
+            yes_no: "Ya atau tidak?",
+            use_a_tool: "Bolehkah saya memakai sebuah alat?",
+            sorry: "Maaf.",
+            sample: "Halo. Beginilah suara saya.",
+            code_on_screen: "Kodenya ada di layar.",
+            command_on_screen: "perintah di layar",
         },
     },
 ];

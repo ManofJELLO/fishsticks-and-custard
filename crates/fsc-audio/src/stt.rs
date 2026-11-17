@@ -1,4 +1,5 @@
-//! Speech to text with whisper.cpp (Vulkan on AMD).
+//! Speech to text with whisper.cpp, on the GPU through Vulkan (AMD, Intel and
+//! NVIDIA alike), else on the CPU.
 
 use anyhow::{Context, Result, anyhow};
 use std::path::Path;
@@ -42,6 +43,37 @@ fn prompt_for(language: &str, phrase: &str) -> String {
     }
 }
 
+/// Where whisper.cpp runs: the first GPU it lists (its default device), for
+/// the log, since "it's slow" is usually "it's on the CPU".
+fn device(gpu: bool) -> String {
+    use std::ffi::CStr;
+    use whisper_rs::whisper_rs_sys as sys;
+    if !gpu {
+        return "the CPU (voice.gpu is off)".into();
+    }
+    let mut gpus = Vec::new();
+    // SAFETY: ggml's device registry is static once whisper.cpp is loaded;
+    // these only read it, and the names live as long as the registry.
+    unsafe {
+        for i in 0..sys::ggml_backend_dev_count() {
+            let dev = sys::ggml_backend_dev_get(i);
+            let kind = sys::ggml_backend_dev_type(dev);
+            if kind == sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU
+                || kind == sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU
+            {
+                let desc = sys::ggml_backend_dev_description(dev);
+                let name = if desc.is_null() { sys::ggml_backend_dev_name(dev) } else { desc };
+                gpus.push(if name.is_null() { "?".into() } else { CStr::from_ptr(name).to_string_lossy().into_owned() });
+            }
+        }
+    }
+    match gpus.split_first() {
+        None => "the CPU: no Vulkan GPU found (is your graphics driver's Vulkan package installed?)".into(),
+        Some((first, [])) => format!("the GPU: {first}"),
+        Some((first, rest)) => format!("the GPU: {first} (also found: {})", rest.join(", ")),
+    }
+}
+
 impl Stt {
     pub fn load(path: &Path, language: &str, gpu: bool, wake_phrase: &str) -> Result<Self> {
         // Without a log backend feature this routes whisper.cpp/ggml logs to nowhere.
@@ -52,6 +84,7 @@ impl Stt {
             .map_err(|e| anyhow!("{e}"))
             .with_context(|| format!("loading {}", path.display()))?;
         let state = ctx.create_state().map_err(|e| anyhow!("{e}"))?;
+        eprintln!("fsc: speech recognition runs on {}", device(gpu));
         Ok(Self {
             _ctx: ctx,
             state: Mutex::new(state),
@@ -135,7 +168,35 @@ impl Stt {
 }
 
 /// Drop whisper's non-speech annotations like "[BLANK_AUDIO]" or "(wind blowing)".
+/// Lines whisper invents on short or quiet clips, learned from video
+/// subtitles: outros and subtitle credits. A sentence with one in it is
+/// dropped, so it's never sent as a question.
+const INVENTED: &[&str] = &[
+    "thanks for watching",
+    "thank you for watching",
+    "please subscribe",
+    "amara.org",
+    "untertitel im auftrag",
+    "untertitel von",
+    "sous-titres réalisés",
+    "sous-titrage",
+    "subscribe cho kênh",
+    "ghiền mì gõ",
+    "cảm ơn các bạn đã theo dõi",
+    "hẹn gặp lại các bạn",
+    "시청해주셔서 감사합니다",
+    "구독과 좋아요",
+    "mbc 뉴스",
+    "请不吝点赞",
+    "字幕由",
+    "明镜与点点",
+    "谢谢观看",
+    "terima kasih telah menonton",
+    "jangan lupa subscribe",
+];
+
 fn clean(s: &str) -> String {
+    let s = &drop_invented(s);
     let mut out = String::with_capacity(s.len());
     let mut depth = 0usize;
     for c in s.chars() {
@@ -149,6 +210,31 @@ fn clean(s: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// `s` without the sentences that hold an `INVENTED` line.
+fn drop_invented(s: &str) -> String {
+    let lower = s.to_lowercase();
+    if !INVENTED.iter().any(|p| lower.contains(p)) {
+        return s.to_string();
+    }
+    let mut kept = String::new();
+    let mut sentence = String::new();
+    for c in s.chars() {
+        sentence.push(c);
+        if matches!(c, '.' | '!' | '?' | '。' | '！' | '？' | '।') {
+            let l = sentence.to_lowercase();
+            if !INVENTED.iter().any(|p| l.contains(p)) {
+                kept.push_str(&sentence);
+            }
+            sentence.clear();
+        }
+    }
+    let l = sentence.to_lowercase();
+    if !INVENTED.iter().any(|p| l.contains(p)) {
+        kept.push_str(&sentence);
+    }
+    kept
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -156,6 +242,15 @@ mod tests {
         assert_eq!(super::wake_language("Fishsticks  and custard", "de"), "en");
         assert_eq!(super::wake_language("hallo computer", "de"), "de");
         assert_eq!(super::wake_language("hey computer", "en"), "en");
+    }
+
+    #[test]
+    fn drops_invented_lines() {
+        assert_eq!(super::clean("Thanks for watching!"), "");
+        assert_eq!(super::clean("Turn the music down. Thank you for watching."), "Turn the music down.");
+        assert_eq!(super::clean("Hãy subscribe cho kênh Ghiền Mì Gõ Để không bỏ lỡ những video hấp dẫn"), "");
+        assert_eq!(super::clean("你好。请不吝点赞 订阅 转发"), "你好。");
+        assert_eq!(super::clean("Thanks, that's all."), "Thanks, that's all.");
     }
 
     #[test]
