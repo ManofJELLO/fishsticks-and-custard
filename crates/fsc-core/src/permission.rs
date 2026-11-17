@@ -249,6 +249,8 @@ mod tests {
             ("ko", "아니요.", Some(Answer::Deny)),
             ("ko", "안 돼요.", Some(Answer::Deny)),
             ("ko", "잘 모르겠어요.", None),
+            ("ko", "괜찮아요.", None),
+            ("hi", "बस करो।", Some(Answer::Deny)),
             ("hi", "हाँ।", Some(Answer::Once)),
             ("hi", "हां, ठीक है।", Some(Answer::Once)),
             ("hi", "हाँ, हमेशा।", Some(Answer::Always)),

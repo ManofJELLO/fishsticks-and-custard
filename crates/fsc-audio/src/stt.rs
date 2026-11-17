@@ -43,6 +43,30 @@ fn prompt_for(language: &str, phrase: &str) -> String {
     }
 }
 
+/// whisper.cpp found a GPU but couldn't start it, so it runs on the CPU.
+static GPU_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// whisper.cpp's and ggml's log: errors go to ours, the rest is dropped,
+/// and a GPU that fails to start is noted for `device`.
+unsafe extern "C" fn whisper_log(
+    level: whisper_rs::whisper_rs_sys::ggml_log_level,
+    text: *const std::os::raw::c_char,
+    _: *mut std::os::raw::c_void,
+) {
+    use std::io::Write;
+    if text.is_null() {
+        return;
+    }
+    // SAFETY: ggml passes a NUL-terminated message, valid for this call.
+    let text = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy();
+    if text.contains("whisper_backend_init_gpu: failed to initialize") {
+        GPU_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if level == whisper_rs::whisper_rs_sys::ggml_log_level_GGML_LOG_LEVEL_ERROR {
+        let _ = write!(std::io::stderr(), "whisper: {}", if text.ends_with('\n') { text.to_string() } else { format!("{text}\n") });
+    }
+}
+
 /// Where whisper.cpp runs: the first GPU it lists (its default device), for
 /// the log, since "it's slow" is usually "it's on the CPU".
 fn device(gpu: bool) -> String {
@@ -67,6 +91,10 @@ fn device(gpu: bool) -> String {
             }
         }
     }
+    if GPU_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        let name = gpus.first().map_or("the GPU", String::as_str);
+        return format!("the CPU: {name} didn't start (whisper's error is above)");
+    }
     match gpus.split_first() {
         None => "the CPU: no Vulkan GPU found (is your graphics driver's Vulkan package installed?)".into(),
         Some((first, [])) => format!("the GPU: {first}"),
@@ -76,8 +104,9 @@ fn device(gpu: bool) -> String {
 
 impl Stt {
     pub fn load(path: &Path, language: &str, gpu: bool, wake_phrase: &str) -> Result<Self> {
-        // Without a log backend feature this routes whisper.cpp/ggml logs to nowhere.
-        whisper_rs::install_logging_hooks();
+        // SAFETY: `whisper_log` is a plain function that never unwinds.
+        unsafe { whisper_rs::whisper_rs_sys::whisper_log_set(Some(whisper_log), std::ptr::null_mut()) };
+        GPU_FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
         let mut params = WhisperContextParameters::default();
         params.use_gpu(gpu).flash_attn(gpu);
         let ctx = WhisperContext::new_with_params(path, params)
@@ -167,34 +196,31 @@ impl Stt {
     }
 }
 
-/// Drop whisper's non-speech annotations like "[BLANK_AUDIO]" or "(wind blowing)".
-/// Lines whisper invents on short or quiet clips, learned from video
-/// subtitles: outros and subtitle credits. A sentence with one in it is
-/// dropped, so it's never sent as a question.
+/// Whole lines whisper invents on short or quiet clips, learned from video
+/// subtitles: outros and subtitle credits. A sentence that is one of these
+/// (mostly: see `invented`) is dropped, so it's never sent as a question.
 const INVENTED: &[&str] = &[
     "thanks for watching",
     "thank you for watching",
+    "thank you so much for watching",
     "please subscribe",
-    "amara.org",
-    "untertitel im auftrag",
-    "untertitel von",
-    "sous-titres réalisés",
-    "sous-titrage",
-    "subscribe cho kênh",
-    "ghiền mì gõ",
+    "subtitles by the amara.org community",
+    "untertitel im auftrag des zdf",
+    "untertitel der amara.org-community",
+    "sous-titres réalisés par la communauté d'amara.org",
+    "hãy subscribe cho kênh ghiền mì gõ để không bỏ lỡ những video hấp dẫn",
     "cảm ơn các bạn đã theo dõi",
-    "hẹn gặp lại các bạn",
     "시청해주셔서 감사합니다",
-    "구독과 좋아요",
-    "mbc 뉴스",
-    "请不吝点赞",
-    "字幕由",
-    "明镜与点点",
+    "구독과 좋아요 부탁드립니다",
+    "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目",
+    "字幕由amara.org社区提供",
     "谢谢观看",
     "terima kasih telah menonton",
     "jangan lupa subscribe",
 ];
 
+/// Drop whisper's non-speech annotations like "[BLANK_AUDIO]" or "(wind
+/// blowing)", and the lines it invents.
 fn clean(s: &str) -> String {
     let s = &drop_invented(s);
     let mut out = String::with_capacity(s.len());
@@ -210,26 +236,42 @@ fn clean(s: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// `s` without the sentences that hold an `INVENTED` line.
+/// Letters and digits only, lower case, no spaces: how lines are compared.
+fn squashed(s: &str) -> String {
+    s.to_lowercase().chars().filter(|c| fsc_core::lang::is_word_char(*c)).collect()
+}
+
+/// `sentence` is an `INVENTED` line: it starts with one that makes up most
+/// of it, or is the start of one, long enough not to be a few real words.
+/// "Thank you for watching the kids, remind me at five" is kept.
+fn invented(sentence: &str) -> bool {
+    let s = squashed(sentence);
+    let n = fsc_core::lang::weight(&s);
+    INVENTED.iter().any(|line| {
+        let line = squashed(line);
+        let m = fsc_core::lang::weight(&line);
+        (s.starts_with(&line) && m * 10 >= n * 7) || (line.starts_with(&s) && n >= 12 && n * 10 >= m * 4)
+    })
+}
+
+/// `s` without its invented sentences. A sentence ends at ".", "!", "?" or
+/// "।" followed by a space or the end (so "Amara.org" stays whole), or at
+/// Chinese "。！？".
 fn drop_invented(s: &str) -> String {
-    let lower = s.to_lowercase();
-    if !INVENTED.iter().any(|p| lower.contains(p)) {
-        return s.to_string();
-    }
+    let chars: Vec<char> = s.chars().collect();
     let mut kept = String::new();
     let mut sentence = String::new();
-    for c in s.chars() {
+    for (i, &c) in chars.iter().enumerate() {
         sentence.push(c);
-        if matches!(c, '.' | '!' | '?' | '。' | '！' | '？' | '।') {
-            let l = sentence.to_lowercase();
-            if !INVENTED.iter().any(|p| l.contains(p)) {
+        let next_blank = chars.get(i + 1).is_none_or(|n| n.is_whitespace());
+        if matches!(c, '。' | '！' | '？') || (matches!(c, '.' | '!' | '?' | '।') && next_blank) {
+            if !invented(&sentence) {
                 kept.push_str(&sentence);
             }
             sentence.clear();
         }
     }
-    let l = sentence.to_lowercase();
-    if !INVENTED.iter().any(|p| l.contains(p)) {
+    if !invented(&sentence) {
         kept.push_str(&sentence);
     }
     kept
@@ -251,6 +293,11 @@ mod tests {
         assert_eq!(super::clean("Hãy subscribe cho kênh Ghiền Mì Gõ Để không bỏ lỡ những video hấp dẫn"), "");
         assert_eq!(super::clean("你好。请不吝点赞 订阅 转发"), "你好。");
         assert_eq!(super::clean("Thanks, that's all."), "Thanks, that's all.");
+        assert_eq!(super::clean("Subtitles by the Amara.org community"), "");
+        assert_eq!(super::clean("Thank you for watching the kids, remind me at five."), "Thank you for watching the kids, remind me at five.");
+        assert_eq!(super::clean("Zeig mir die Untertitel von diesem Film."), "Zeig mir die Untertitel von diesem Film.");
+        assert_eq!(super::clean("MBC 뉴스 틀어줘"), "MBC 뉴스 틀어줘");
+        assert_eq!(super::clean("Thanks for."), "Thanks for.");
     }
 
     #[test]

@@ -36,16 +36,24 @@ fn is_filler(word: &str, language: &str) -> bool {
 
 /// Letters a wake phrase needs: shorter ones match ordinary speech.
 const MIN_LETTERS: usize = 5;
-/// Words a wake phrase may have (the matcher joins up to six).
+/// Words a wake phrase may have.
 const MAX_WORDS: usize = 5;
+/// Chinese characters a wake phrase may have.
+const MAX_CHARS: usize = 8;
 
 /// `phrase` tidied (trimmed, single spaces), or why it can't be a wake phrase.
 pub fn check_phrase(phrase: &str) -> Result<String, String> {
     let tidy = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
     let norm = normalize(&tidy);
-    // A Chinese character says as much as a couple of letters.
-    let letters: usize = norm.chars().filter(|c| fsc_core::lang::is_word_char(*c)).map(|c| if fsc_core::lang::is_han(c) { 2 } else { 1 }).sum();
-    let words = norm.split_whitespace().count();
+    // A Chinese character or Korean syllable says as much as two letters.
+    let letters = fsc_core::lang::weight(&norm);
+    // Words as written: Chinese has no spaces, and is matched a character
+    // at a time, up to `MAX_CHARS` of them.
+    let words = tidy.split_whitespace().count();
+    let han = norm.chars().filter(|c| fsc_core::lang::is_han(*c)).count();
+    if han > MAX_CHARS {
+        return Err(format!("{tidy:?} is too long for a wake phrase (at most {MAX_CHARS} characters)"));
+    }
     if letters < MIN_LETTERS {
         return Err(format!("{tidy:?} is too short for a wake phrase (at least {MIN_LETTERS} letters)"));
     }
@@ -68,10 +76,25 @@ pub fn spelling(phrase: &str) -> String {
         .join(" ")
 }
 
-/// Character edits allowed when matching a phrase this long (spaces
-/// removed). A short name gets one, or "travis" would wake "jarvis".
-fn max_edits(len: usize) -> usize {
+/// Character edits allowed when matching `target` (spaces removed). A
+/// short name gets one, or "travis" would wake "jarvis". A Chinese
+/// character or Korean syllable is a whole syllable, so one wrong is a
+/// different word: none for up to three, then one per four.
+fn max_edits(target: &str) -> usize {
+    let dense = target.chars().filter(|c| fsc_core::lang::is_han(*c) || fsc_core::lang::is_hangul(*c)).count();
+    if dense > 0 {
+        return dense / 4;
+    }
+    let len = target.chars().count();
     if len < 8 { 1 } else { (len / 5).max(2) }
+}
+
+/// Korean calls a name with "-야" or "-아" on the end ("자비스야"): the
+/// joined words without it, if the phrase doesn't end that way itself.
+fn without_vocative<'a>(joined: &'a str, target: &str) -> Option<&'a str> {
+    let stripped = joined.strip_suffix('야').or_else(|| joined.strip_suffix('아'))?;
+    let last = stripped.chars().last()?;
+    (fsc_core::lang::is_hangul(last) && !target.ends_with(['야', '아'])).then_some(stripped)
 }
 
 /// If `text` starts with the wake phrase (after a few fillers at most),
@@ -126,7 +149,8 @@ fn match_after(text: &str, phrase: &str, lead: Lead, language: &str) -> Option<S
     if target.is_empty() {
         return None;
     }
-    let max_edits = max_edits(target.chars().count());
+    let max_edits = max_edits(&target);
+    let target_words = normalize(phrase).split_whitespace().count();
 
     // Normalized words, each remembering which original word it came from.
     let original: Vec<&str> = text.split_whitespace().collect();
@@ -138,6 +162,8 @@ fn match_after(text: &str, phrase: &str, lead: Lead, language: &str) -> Option<S
 
     let max_leading = match lead {
         Lead::Fillers => MAX_LEADING_WORDS,
+        // A Chinese "word" here is one character, so look further back.
+        Lead::Any(n) if text.chars().any(fsc_core::lang::is_han) => n.saturating_mul(3),
         Lead::Any(n) => n,
     };
     for start in 0..=max_leading.min(words.len()) {
@@ -164,9 +190,10 @@ fn match_after(text: &str, phrase: &str, lead: Lead, language: &str) -> Option<S
         }
         let mut best: Option<(usize, usize)> = None; // (edits, end)
         let mut joined = String::new();
-        for (end, (w, _)) in words.iter().enumerate().skip(start).take(6) {
+        for (end, (w, _)) in words.iter().enumerate().skip(start).take(target_words + 2) {
             joined.push_str(&sound(w));
-            let d = levenshtein(&joined, &target);
+            let d = levenshtein(&joined, &target)
+                .min(without_vocative(&joined, &target).map_or(usize::MAX, |j| levenshtein(j, &target)));
             if d <= max_edits && best.is_none_or(|(bd, _)| d < bd) {
                 best = Some((d, end + 1));
             }
@@ -236,9 +263,26 @@ mod tests {
         // Mentioned mid-sentence: no.
         assert_eq!(match_wake_after("我昨天跟小助手说过了", &p, Lead::Fillers, "zh"), None);
         assert!(check_phrase("小助").is_err());
+        // Two of the three characters isn't the name.
+        for other in ["小手很冷。", "好小手", "助手今天说了什么", "小助理在哪里？"] {
+            assert_eq!(match_wake_after(other, &p, Lead::Fillers, "zh"), None, "{other}");
+        }
+        assert!(check_phrase("你好小助手呀").is_ok());
+        assert!(check_phrase("一二三四五六七八九").is_err());
+        // Mid-speech, the phrase may come several words in.
+        assert!(match_wake_after("我们刚才在说的那件事情其实小助手你记一下", &p, Lead::Any(6), "zh").is_some());
         assert!(check_phrase("助").is_err());
         // The usual phrase, then Chinese.
         assert_eq!(match_wake_after("Fishsticks and custard, 现在几点？", P, Lead::Fillers, "zh").as_deref(), Some("现在几点？"));
+    }
+
+    #[test]
+    fn korean_names() {
+        let p = check_phrase("자비스").unwrap();
+        assert_eq!(match_wake_after("자비스야, 날씨 어때?", &p, Lead::Fillers, "ko").as_deref(), Some("날씨 어때?"));
+        assert_eq!(match_wake_after("자비스 불 꺼 줘", &p, Lead::Fillers, "ko").as_deref(), Some("불 꺼 줘"));
+        assert_eq!(match_wake_after("자비로 불 꺼 줘", &p, Lead::Fillers, "ko"), None);
+        assert!(check_phrase("빅스비야").is_ok());
     }
 
     #[test]

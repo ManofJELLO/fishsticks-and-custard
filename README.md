@@ -245,7 +245,8 @@ were tested with synthetic voices only, and Vietnamese answers often weren't rec
 that way. If you speak one of them, a report of how it does for you would help. Japanese
 and Thai aren't available yet: their voices need a different speech engine.
 
-For Chinese and Korean text in the popup, install `noto-fonts-cjk`.
+For Chinese and Korean text in the popup, install `noto-fonts-cjk`; for Hindi,
+`noto-fonts`.
 
 Pick another language from the tray's **Language** menu, or with `fsc language de`. It
 then listens for that language, speaks it, and tells the agent to reply in it.

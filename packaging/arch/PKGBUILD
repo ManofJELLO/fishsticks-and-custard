@@ -21,6 +21,7 @@ optdepends=(
   'vulkan-driver: speech recognition on the GPU (vulkan-radeon, vulkan-intel, nvidia-utils or vulkan-nouveau); without it, the CPU'
   'hyprland: the compositor this is designed for (any wlroots-style layer-shell compositor works)'
   'noto-fonts-cjk: Chinese and Korean text in the popup'
+  'noto-fonts: Hindi (Devanagari) text in the popup'
   'libnotify: desktop notifications when a reply finishes while the popup is hidden'
   'codex-acp: Codex (ChatGPT) as the agent (AUR; needs nodejs)'
   'antigravity-cli: Antigravity (Google) as the agent (AUR)'

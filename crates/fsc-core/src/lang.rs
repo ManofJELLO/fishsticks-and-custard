@@ -117,6 +117,18 @@ pub fn is_han(c: char) -> bool {
     matches!(c as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2A6DF)
 }
 
+/// A Korean syllable block, which carries about as much as a Chinese
+/// character.
+pub fn is_hangul(c: char) -> bool {
+    matches!(c as u32, 0xAC00..=0xD7A3)
+}
+
+/// How much text this is, in letters: a Chinese character or Korean
+/// syllable counts as two.
+pub fn weight(s: &str) -> usize {
+    s.chars().filter(|c| is_word_char(*c)).map(|c| if is_han(c) || is_hangul(c) { 2 } else { 1 }).sum()
+}
+
 /// Part of a word: a letter or digit, or a Devanagari mark. Unicode doesn't
 /// count every vowel sign and the virama as letters, which would cut Hindi
 /// words apart ("क्या" into "क" and "या"). The danda (।) ends a sentence.
@@ -1216,10 +1228,12 @@ pub static LANGUAGES: [Language; 23] = [
             hedges: &[
                 "잘 모르겠어요", "잘 모르겠어", "모르겠어요", "모르겠어", "글쎄요", "글쎄", "아마도", "아마", "잠깐만",
                 "잠깐", "잠시만", "생각해 볼게", "생각해 볼게요",
+                // "Fine" or "no thanks, I'm fine": ask again.
+                "괜찮아", "괜찮아요", "괜찮습니다",
             ],
             question_starts: &["뭐", "무엇", "무슨", "왜", "어떻게", "누가", "누구", "어디", "언제", "어느"],
             consent: &[
-                "네", "예", "응", "그래", "그래요", "좋아", "좋아요", "좋습니다", "괜찮아", "괜찮아요", "괜찮습니다", "허락",
+                "네", "예", "응", "그래", "그래요", "좋아", "좋아요", "좋습니다", "허락",
                 "허락해", "허락할게", "허락합니다", "해", "해요", "하세요", "해도", "돼", "돼요", "됩니다", "물론", "물론이죠",
                 "당연하지", "알았어", "알겠어요", "알겠습니다", "진행", "진행해", "진행하세요", "계속", "오케이", "확인",
                 "승인", "ok",
@@ -1263,7 +1277,8 @@ pub static LANGUAGES: [Language; 23] = [
                 "दोबारा मत पूछो", "दोबारा मत पूछना", "फिर से मत पूछो", "फिर मत पूछना", "मत पूछो", "हर बार", "अब से",
                 "आगे से", "हमेशा",
             ],
-            deny: &["नहीं", "नही", "ना", "न", "मत", "रुको", "रोको", "रद्द", "मना"],
+            // "बस" is "enough": "बस करो" is "stop it".
+            deny: &["नहीं", "नही", "ना", "न", "मत", "रुको", "रोको", "रद्द", "मना", "बस"],
             hedges: &[
                 "पता नहीं", "मालूम नहीं", "पक्का नहीं", "शायद", "मुझे लगता", "सोचने दो", "एक मिनट", "रुकिए", "हम्म",
             ],
@@ -1273,7 +1288,7 @@ pub static LANGUAGES: [Language; 23] = [
                 "अनुमति", "इजाज़त", "इजाजत", "सही", "अच्छा", "ओके", "ok", "हाँजी",
             ],
             filler: &[
-                "है", "हैं", "तो", "बस", "अभी", "इस", "बार", "एक", "यह", "ये", "वो", "कर", "दो", "लो", "आप", "तुम", "मैं",
+                "है", "हैं", "तो", "अभी", "इस", "बार", "एक", "यह", "ये", "वो", "कर", "दो", "लो", "आप", "तुम", "मैं",
                 "धन्यवाद", "शुक्रिया", "प्लीज़", "प्लीज", "कृपया", "अरे", "भाई", "दीजिए",
             ],
             agree: &["कोई बात नहीं", "कोई दिक्कत नहीं", "कोई समस्या नहीं", "कोई परेशानी नहीं"],
