@@ -33,7 +33,8 @@ const SETTINGS: &str = include_str!("../../../../voice-home/.claude/settings.loc
 /// when an existing home's `settings.local.json` needs changing.
 /// 1: Edit/Write/NotebookEdit denied. 2: they're asked about instead.
 /// 3: also in the `settings.json` seeded before 0.5.0, whose denials won.
-const SETTINGS_VERSION: u32 = 3;
+/// 4: opening a web page asks; reading `permission::SECRET_PATHS` is denied.
+const SETTINGS_VERSION: u32 = 4;
 const SETTINGS_VERSION_FILE: &str = ".claude/fsc-settings-version";
 
 pub(crate) struct ClaudeCli {
@@ -135,9 +136,10 @@ fn seed_settings(home: &Path) -> std::io::Result<()> {
             // and later versions never touched it. Claude Code still reads it,
             // and a denial anywhere beats an ask, so its file-edit denials
             // kept refusing Write outright.
+            // Its allow list also let web pages be opened unasked.
             let legacy = home.join(".claude/settings.json");
-            if from < 3 && legacy.exists() {
-                current &= migrate_file(&legacy, 1)?;
+            if legacy.exists() {
+                current &= migrate_file(&legacy, if from < 3 { 1 } else { from })?;
             }
         }
     } else {
@@ -174,6 +176,22 @@ fn migrate_settings(text: &str, from: u32) -> Option<String> {
         // File edits are asked about now rather than refused.
         if let Some(deny) = v.pointer_mut("/permissions/deny").and_then(Value::as_array_mut) {
             deny.retain(|r| !matches!(r.as_str(), Some("Edit" | "Write" | "NotebookEdit")));
+        }
+    }
+    if from < 4 {
+        // A page can carry instructions, so opening one asks; "always"
+        // answers for one site (`WebFetch(domain:...)`) stay.
+        if let Some(allow) = v.pointer_mut("/permissions/allow").and_then(Value::as_array_mut) {
+            allow.retain(|r| r != "WebFetch");
+        }
+        // ...and whatever it says, keys and passwords stay out of reach.
+        let perms = v.as_object_mut()?.entry("permissions").or_insert_with(|| json!({}));
+        let deny = perms.as_object_mut()?.entry("deny").or_insert_with(|| json!([])).as_array_mut()?;
+        for path in crate::permission::SECRET_PATHS {
+            let rule = Value::from(format!("Read({path})"));
+            if !deny.contains(&rule) {
+                deny.push(rule);
+            }
         }
     }
     let mut out = serde_json::to_string_pretty(&v).ok()?;
@@ -486,12 +504,17 @@ pub fn pretty_tool(name: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A deny list without the `Read(...)` rules for secrets.
+    fn non_secret(deny: &Value) -> Value {
+        deny.as_array().unwrap().iter().filter(|r| !r.as_str().unwrap().starts_with("Read(~/")).cloned().collect()
+    }
+
     #[test]
     fn migration_lets_file_edits_ask_and_keeps_user_rules() {
         let old = r#"{"permissions":{"allow":["Read","Bash(git status:*)"],
             "deny":["Bash(sudo:*)","Edit","Write","NotebookEdit"]},"model":"x"}"#;
         let v: Value = serde_json::from_str(&migrate_settings(old, 1).unwrap()).unwrap();
-        assert_eq!(v["permissions"]["deny"], json!(["Bash(sudo:*)"]));
+        assert_eq!(non_secret(&v["permissions"]["deny"]), json!(["Bash(sudo:*)"]));
         assert_eq!(v["permissions"]["allow"], json!(["Read", "Bash(git status:*)"]));
         assert_eq!(v["model"], "x");
         assert!(migrate_settings("not json", 1).is_none());
@@ -503,6 +526,13 @@ mod tests {
         let v: Value = serde_json::from_str(SETTINGS).unwrap();
         let deny = v["permissions"]["deny"].as_array().unwrap();
         assert!(!deny.iter().any(|r| r == "Edit" || r == "Write"));
+        assert!(!v["permissions"]["allow"].as_array().unwrap().iter().any(|r| r == "WebFetch"));
+        for path in crate::permission::SECRET_PATHS {
+            assert!(deny.contains(&Value::from(format!("Read({path})"))), "seed doesn't deny reading {path}");
+        }
+        // A fresh seed migrates to itself.
+        let again: Value = serde_json::from_str(&migrate_settings(SETTINGS, 1).unwrap()).unwrap();
+        assert_eq!(again, v);
     }
 
     #[test]
@@ -514,11 +544,11 @@ mod tests {
         std::fs::write(&settings, r#"{"permissions":{"deny":["Edit","Write"]}}"#).unwrap();
         seed_settings(&home).unwrap();
         let read = || serde_json::from_str::<Value>(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(read()["permissions"]["deny"], json!([]));
+        assert_eq!(non_secret(&read()["permissions"]["deny"]), json!([]));
         // A rule the user adds back afterwards stays.
         std::fs::write(&settings, r#"{"permissions":{"deny":["Write"]}}"#).unwrap();
         seed_settings(&home).unwrap();
-        assert_eq!(read()["permissions"]["deny"], json!(["Write"]));
+        assert_eq!(non_secret(&read()["permissions"]["deny"]), json!(["Write"]));
         super::super::ensure_home(&home).unwrap();
         assert!(home.join("persona.md").exists());
         std::fs::remove_dir_all(&home).unwrap();
@@ -533,14 +563,41 @@ mod tests {
         let legacy = home.join(".claude/settings.json");
         std::fs::write(&local, r#"{"permissions":{"deny":["Bash(rm:*)"]}}"#).unwrap();
         std::fs::write(home.join(SETTINGS_VERSION_FILE), "2\n").unwrap();
-        std::fs::write(&legacy, r#"{"permissions":{"allow":["Read"],"deny":["Bash(sudo:*)","Edit","Write","NotebookEdit"]}}"#)
-            .unwrap();
+        std::fs::write(
+            &legacy,
+            r#"{"permissions":{"allow":["Read","WebFetch"],"deny":["Bash(sudo:*)","Edit","Write","NotebookEdit"]}}"#,
+        )
+        .unwrap();
         seed_settings(&home).unwrap();
         let read = |p: &Path| serde_json::from_str::<Value>(&std::fs::read_to_string(p).unwrap()).unwrap();
-        assert_eq!(read(&legacy)["permissions"]["deny"], json!(["Bash(sudo:*)"]));
+        let deny = |p: &Path| read(p)["permissions"]["deny"].as_array().unwrap().clone();
+        assert!(!deny(&legacy).iter().any(|r| r == "Edit" || r == "Write" || r == "NotebookEdit"));
+        assert!(deny(&legacy).contains(&json!("Bash(sudo:*)")));
         assert_eq!(read(&legacy)["permissions"]["allow"], json!(["Read"]));
-        assert_eq!(read(&local)["permissions"]["deny"], json!(["Bash(rm:*)"]));
-        assert_eq!(std::fs::read_to_string(home.join(SETTINGS_VERSION_FILE)).unwrap().trim(), "3");
+        assert!(deny(&local).contains(&json!("Bash(rm:*)")));
+        assert!(deny(&local).contains(&json!("Read(~/.ssh/**)")));
+        assert_eq!(std::fs::read_to_string(home.join(SETTINGS_VERSION_FILE)).unwrap().trim(), "4");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn web_pages_ask_and_secrets_are_denied_once() {
+        let home = std::env::temp_dir().join(format!("fsc-home-test-v4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let local = home.join(".claude/settings.local.json");
+        std::fs::write(home.join(SETTINGS_VERSION_FILE), "3\n").unwrap();
+        std::fs::write(&local, r#"{"permissions":{"allow":["Read","WebFetch","WebFetch(domain:weather.gov)"]}}"#).unwrap();
+        seed_settings(&home).unwrap();
+        let read = || serde_json::from_str::<Value>(&std::fs::read_to_string(&local).unwrap()).unwrap();
+        assert_eq!(read()["permissions"]["allow"], json!(["Read", "WebFetch(domain:weather.gov)"]));
+        assert_eq!(read()["permissions"]["deny"].as_array().unwrap().len(), crate::permission::SECRET_PATHS.len());
+        // The user takes one back out: it isn't re-added.
+        let mut v = read();
+        v["permissions"]["deny"].as_array_mut().unwrap().retain(|r| r != "Read(~/.aws/**)");
+        std::fs::write(&local, v.to_string()).unwrap();
+        seed_settings(&home).unwrap();
+        assert!(!read()["permissions"]["deny"].as_array().unwrap().contains(&json!("Read(~/.aws/**)")));
         std::fs::remove_dir_all(&home).unwrap();
     }
 
@@ -558,7 +615,7 @@ mod tests {
         std::fs::write(&settings, r#"{"permissions":{"deny":["Edit"]}}"#).unwrap();
         seed_settings(&home).unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(v["permissions"]["deny"], json!([]));
+        assert_eq!(non_secret(&v["permissions"]["deny"]), json!([]));
         std::fs::remove_dir_all(&home).unwrap();
     }
 

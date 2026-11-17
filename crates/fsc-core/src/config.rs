@@ -247,7 +247,9 @@ impl AgentKind {
 pub struct AgentConfig {
     pub backend: AgentKind,
     /// ACP agents only: tool kinds that run without asking. The rest (edit, delete, move,
-    /// execute, other) are asked about, when the agent asks at all.
+    /// execute, fetch, other) are asked about, when the agent asks at all. Opening a web
+    /// page (fetch) isn't here by default: a page can carry instructions for the agent.
+    /// Anything touching `permission::SECRET_PATHS` is always asked about.
     pub auto_allow: Vec<String>,
     /// The assistant's home: persona, memory, and the agent's own settings
     /// (ACP agents work in its `workspace` folder). Defaults to
@@ -265,7 +267,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             backend: AgentKind::Claude,
-            auto_allow: ["read", "search", "fetch", "think"].map(String::from).to_vec(),
+            auto_allow: ["read", "search", "think"].map(String::from).to_vec(),
             home: None,
             session_idle_minutes: None,
             memory: None,

@@ -421,8 +421,9 @@ impl AcpConn {
         let rpc = v["id"].as_str().map(str::to_string).unwrap_or_else(|| v["id"].to_string());
         let pending = Pending { id: format!("acp-{rpc}"), rpc_id: v["id"].clone(), options };
         // The session decides: a hidden turn refuses even these.
-        let auto =
-            self.settings.auto_allow.iter().any(|k| k == kind) && pick(&pending.options, &["allow_once"]).is_some();
+        let auto = self.settings.auto_allow.iter().any(|k| k == kind)
+            && pick(&pending.options, &["allow_once"]).is_some()
+            && !touches_secret(call);
         let ask = describe_tool(&pending.id, call, pending.options.iter().any(|(_, k)| k == "allow_always"));
         self.pending.push(pending);
         vec![Event::Permission { ask, auto }]
@@ -707,6 +708,18 @@ fn tool_kind(call: &Value) -> &str {
     }
 }
 
+/// The tool call names a path among `permission::SECRET_PATHS`, so it's
+/// asked about whatever its kind.
+fn touches_secret(call: &Value) -> bool {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return false };
+    let input = &call["rawInput"];
+    let located = call["locations"].as_array().into_iter().flatten().map(|l| &l["path"]);
+    let named = ["path", "file_path", "filePath", "abs_path", "AbsolutePath", "SearchPath", "DirectoryPath"]
+        .into_iter()
+        .map(|k| &input[k]);
+    located.chain(named).filter_map(Value::as_str).any(|p| crate::permission::is_secret(Path::new(p), &home))
+}
+
 /// Where ACP agents work: see the module docs.
 fn workspace(home: &Path) -> PathBuf {
     home.join("workspace")
@@ -785,6 +798,16 @@ fn describe_tool(id: &str, call: &Value, can_always: bool) -> PermissionAsk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_reads_are_never_auto_allowed() {
+        let home = std::env::var("HOME").unwrap();
+        let read = |path: &str| json!({ "kind": "read", "locations": [{ "path": path }] });
+        assert!(touches_secret(&read(&format!("{home}/.ssh/id_ed25519"))));
+        assert!(touches_secret(&json!({ "kind": "read", "rawInput": { "file_path": format!("{home}/.aws/credentials") } })));
+        assert!(!touches_secret(&read(&format!("{home}/notes.txt"))));
+        assert!(!touches_secret(&json!({ "kind": "read", "title": "Read notes.txt" })));
+    }
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     /// The agent's end of the pipe: read what the client sent, reply.

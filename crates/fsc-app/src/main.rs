@@ -6,6 +6,7 @@
 //! over one async channel.
 
 mod icon;
+mod log;
 mod server;
 mod style;
 mod theme;
@@ -68,6 +69,8 @@ fn main() -> Result<()> {
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
         anyhow::bail!("fscd needs a Wayland session (WAYLAND_DISPLAY is not set)");
     }
+    // Only the instance that stays: a second launch mustn't rotate its log.
+    log::start();
 
     let cfg = Config::load()?;
     // A hex colour in the config pins the accent; otherwise follow the desktop.

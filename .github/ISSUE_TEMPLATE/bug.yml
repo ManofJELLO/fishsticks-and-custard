@@ -1,0 +1,54 @@
+name: Something's wrong
+description: A bug, a crash, a freeze, or something that doesn't work as the README says.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what it did instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen again
+      description: Steps, if you know them. "It happened once" is fine too.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `pacman -Q fishsticks-and-custard hyprland`
+    validations:
+      required: true
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Agent
+      options: [Claude, Codex, Antigravity, OpenCode, Custom ACP agent, Doesn't matter]
+    validations:
+      required: true
+  - type: input
+    id: agent-version
+    attributes:
+      label: Agent version
+      description: e.g. `claude --version`, `codex-acp --version`, `agy --version`, `opencode --version`
+  - type: dropdown
+    id: input
+    attributes:
+      label: How you asked
+      options: [Typed, Talk key, Wake phrase, Doesn't matter]
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        Paste `~/.local/state/fsc/fscd.log`. After a crash or freeze, paste `fscd.log.old` instead (that's the run that went wrong).
+        It notes what it heard around the wake phrase, so look it over first.
+      render: text
+  - type: textarea
+    id: self-test
+    attributes:
+      label: Self-test (for voice problems)
+      description: Output of `fscd --self-test`
+      render: text

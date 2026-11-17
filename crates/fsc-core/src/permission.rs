@@ -31,6 +31,68 @@ pub struct PermissionAsk {
     pub can_always: bool,
 }
 
+/// Places that hold keys, passwords and logins, as Claude Code permission
+/// patterns. A web page the agent reads can carry instructions, so the agent
+/// must never read these unasked: Claude's seeded settings deny
+/// `Read(<pattern>)` for each (a test keeps them in step), and an ACP agent
+/// reading one is asked about even when reads are otherwise allowed.
+pub const SECRET_PATHS: &[&str] = &[
+    "~/.ssh/**",
+    "~/.gnupg/**",
+    "~/.password-store/**",
+    "~/.local/share/keyrings/**",
+    "~/.mozilla/**",
+    "~/.config/mozilla/**",
+    "~/.librewolf/**",
+    "~/.zen/**",
+    "~/.config/google-chrome/**",
+    "~/.config/chromium/**",
+    "~/.config/BraveSoftware/**",
+    "~/.config/vivaldi/**",
+    "~/.config/microsoft-edge/**",
+    "~/.aws/**",
+    "~/.kube/**",
+    "~/.docker/**",
+    "~/.config/gh/**",
+    "~/.config/rclone/**",
+    "~/.netrc",
+    "~/.git-credentials",
+    "~/.pgpass",
+    "~/.claude/.credentials.json",
+    "~/.codex/auth.json",
+    "~/.gemini/oauth_creds.json",
+    "~/.gemini/antigravity-cli/antigravity-oauth-token",
+    "~/.local/share/opencode/auth.json",
+];
+
+/// `path` is, or is inside, one of the [`SECRET_PATHS`] under `home`.
+/// `..` is resolved first, and symlinks too when the path exists, so
+/// `~/notes/../.ssh/id_ed25519` and links into `~/.ssh` are caught.
+pub fn is_secret(path: &std::path::Path, home: &std::path::Path) -> bool {
+    use std::path::{Component, PathBuf};
+    let path = if path.is_absolute() { path.to_path_buf() } else { home.join(path) };
+    let mut lexical = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                lexical.pop();
+            }
+            Component::CurDir => {}
+            c => lexical.push(c),
+        }
+    }
+    let real = std::fs::canonicalize(&lexical).ok();
+    SECRET_PATHS.iter().any(|pattern| {
+        let rest = pattern.trim_start_matches("~/").trim_end_matches("/**");
+        let secret = home.join(rest);
+        let real_secret = std::fs::canonicalize(&secret).ok();
+        let inside = |p: &std::path::Path| {
+            p.starts_with(&secret) || real_secret.as_deref().is_some_and(|s| p.starts_with(s))
+        };
+        inside(&lexical) || real.as_deref().is_some_and(inside)
+    })
+}
+
 /// Turn a reply ("yes", "yeah go ahead", "always", "no thanks") into an answer.
 ///
 /// Errs towards safety: anything negative denies (even with "always" in it,
@@ -146,6 +208,19 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_paths_are_recognised() {
+        let home = std::path::Path::new("/home/u");
+        assert!(is_secret(std::path::Path::new("/home/u/.ssh/id_ed25519"), home));
+        assert!(is_secret(std::path::Path::new("/home/u/.ssh"), home));
+        assert!(is_secret(std::path::Path::new("/home/u/notes/../.ssh/config"), home));
+        assert!(is_secret(std::path::Path::new(".netrc"), home));
+        assert!(is_secret(std::path::Path::new("/home/u/.config/BraveSoftware/Brave-Browser/Default/Login Data"), home));
+        assert!(!is_secret(std::path::Path::new("/home/u/.sshrc"), home));
+        assert!(!is_secret(std::path::Path::new("/home/u/notes/ssh.txt"), home));
+        assert!(!is_secret(std::path::Path::new("/home/u/.claude/settings.json"), home));
+    }
 
     #[test]
     fn answers() {

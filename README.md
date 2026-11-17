@@ -10,8 +10,9 @@ if you spoke, reads the reply aloud.
 - **Uses the AI subscription you already have.** It works with Claude (through Claude
   Code), ChatGPT (through Codex), Google (through Antigravity), or OpenCode's free models.
   Nothing extra to pay for.
-- **Asks before it acts.** Before running a command, writing a file or fetching a page, it
-  shows you exactly what it wants to do and waits for you to answer.
+- **Asks before it acts.** Before running a command, writing a file or opening a web page,
+  it shows you exactly what it wants to do and waits for you to answer. Your keys and
+  passwords are off limits.
 - **Your voice stays on your computer.** Speech recognition and the spoken voice run
   locally. Only the text of what you ask goes to the agent.
 - **Remembers what matters.** It keeps a short list of facts about you between
@@ -131,10 +132,17 @@ wants to do and the exact command, address or file. You can answer in four ways:
 - **ALWAYS** lets it do this kind of thing from now on without asking. It only appears
   when the agent offers it.
 - **DENY** refuses. Closing the popup also counts as no.
-- **By voice:** if you asked out loud, it also asks out loud (*"May I search the web
-  for…? Yes, always, or no?"*). Answer *yes*, *always* or *no*.
+- **By voice:** if you asked out loud, it also asks out loud (*"May I open a web page?
+  Yes, always, or no?"*). Answer *yes*, *always* or *no*.
 
-Reading, searching and thinking don't need your permission.
+Reading files, searching the web and thinking don't need your permission. Places that
+hold keys, passwords and logins are the exception: SSH and GPG keys, password stores,
+keyrings, browser profiles, and the sign-ins of cloud tools and of the agents themselves.
+Claude can't read them at all, and when another agent's file tool reaches for them, you're
+asked first.
+
+Opening a page asks because a page can contain instructions aimed at the agent. Answer
+**ALWAYS** for a site you trust, and it won't ask about that site again.
 
 ## The tray icon
 
@@ -288,8 +296,8 @@ mic) for listening: choose it in the tray's **Microphone** menu.
 - **What is sent:** the text of your questions goes to the agent you chose, and through
   it to that company, just as if you typed it into that agent yourself.
 - **Your memory file:** kept on your computer. You can read, edit or delete it.
-- **Actions:** anything that changes your computer or reaches the web is asked about
-  first, unless you've answered **ALWAYS** for it.
+- **Actions:** anything that changes your computer or opens a web page is asked about
+  first, unless you've answered **ALWAYS** for it. Web searches aren't asked about.
 
 ## Settings
 
@@ -337,8 +345,12 @@ list to be asked again, or add one to `deny` to refuse it every time.
 - **It wakes up by accident:** choose a longer or more unusual phrase with `fsc wake`.
 - **Nothing happens when you press Super+A:** check that the Hyprland lines are in your
   config, and that the assistant is running (`fsc status`).
-- **To see what it's doing:** quit it (`fsc quit`) and start it in a terminal with
-  `fscd`. Its messages appear there.
+- **To see what it's doing:** read its log, `~/.local/state/fsc/fscd.log`. The log from
+  the run before is kept as `fscd.log.old`, which is the one to look at after a crash or
+  freeze.
+- **Reporting a problem:** [open an issue](https://github.com/ManofJELLO/fishsticks-and-custard/issues/new/choose)
+  and attach the log. It doesn't hold the conversation, but it does note what it heard
+  around the wake phrase, so look it over before you post it.
 
 ## Updating and uninstalling
 

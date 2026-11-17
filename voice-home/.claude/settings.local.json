@@ -5,7 +5,6 @@
       "Glob",
       "Grep",
       "WebSearch",
-      "WebFetch",
       "Bash(date:*)",
       "Bash(cal:*)",
       "Bash(uptime:*)",
@@ -32,7 +31,33 @@
     "deny": [
       "Bash(sudo:*)",
       "Bash(rm:*)",
-      "Bash(hyprctl dispatch exit:*)"
+      "Bash(hyprctl dispatch exit:*)",
+      "Read(~/.ssh/**)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.password-store/**)",
+      "Read(~/.local/share/keyrings/**)",
+      "Read(~/.mozilla/**)",
+      "Read(~/.config/mozilla/**)",
+      "Read(~/.librewolf/**)",
+      "Read(~/.zen/**)",
+      "Read(~/.config/google-chrome/**)",
+      "Read(~/.config/chromium/**)",
+      "Read(~/.config/BraveSoftware/**)",
+      "Read(~/.config/vivaldi/**)",
+      "Read(~/.config/microsoft-edge/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.kube/**)",
+      "Read(~/.docker/**)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.config/rclone/**)",
+      "Read(~/.netrc)",
+      "Read(~/.git-credentials)",
+      "Read(~/.pgpass)",
+      "Read(~/.claude/.credentials.json)",
+      "Read(~/.codex/auth.json)",
+      "Read(~/.gemini/oauth_creds.json)",
+      "Read(~/.gemini/antigravity-cli/antigravity-oauth-token)",
+      "Read(~/.local/share/opencode/auth.json)"
     ]
   }
 }
