@@ -14,6 +14,13 @@ Window {
     visible: false
     width: Backend.popupWidth
     height: popup.implicitHeight
+    // A fixed size, as GTK's non-resizable window had: Hyprland floats a
+    // window whose minimum and maximum sizes match, with no rule needed.
+    // It still grows and shrinks with the conversation.
+    minimumWidth: Backend.popupWidth
+    maximumWidth: Backend.popupWidth
+    minimumHeight: popup.implicitHeight
+    maximumHeight: popup.implicitHeight
 
     Popup {
         id: popup
