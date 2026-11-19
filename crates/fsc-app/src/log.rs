@@ -1,4 +1,4 @@
-//! fscd's log: everything written to stderr (our messages, GTK's, the
+//! fscd's log: everything written to stderr (our messages, Qt's, the
 //! speech libraries', panics) goes to `~/.local/state/fsc/fscd.log` with a
 //! time on each line, so a bug report has something to show even when fscd
 //! was started by Hyprland with its output thrown away. When stderr is a
@@ -8,13 +8,42 @@
 //! is only reported after the restart that would otherwise wipe it. Lines are
 //! synced to disk as they come, so a hard freeze loses as little as
 //! possible. The log restarts if it grows past `MAX_BYTES`.
+//!
+//! The capture is Unix-only (it swaps stderr for a pipe). Elsewhere `start`
+//! leaves stderr alone and fscd's messages go wherever its stderr does.
 
+use std::path::PathBuf;
+
+/// Where the log goes: `<state dir>/fscd.log` (`fsc_core::paths::state_dir`).
+pub fn path() -> Option<PathBuf> {
+    Some(fsc_core::paths::state_dir()?.join("fscd.log"))
+}
+
+/// The local time as `fmt` (strftime) has it.
+pub fn now(fmt: &str) -> String {
+    chrono::Local::now().format(fmt).to_string()
+}
+
+#[cfg(unix)]
+pub use imp::{drain, start};
+
+#[cfg(not(unix))]
+pub fn drain() {}
+
+#[cfg(not(unix))]
+pub fn start() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+mod imp {
+use super::{now, path};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 const MAX_BYTES: u64 = 8 << 20;
 
@@ -43,15 +72,6 @@ pub fn drain() {
     }
     // The thread may have just taken the last bytes off the pipe.
     std::thread::sleep(std::time::Duration::from_millis(20));
-}
-
-/// Where the log goes: `$XDG_STATE_HOME/fsc/fscd.log`.
-pub fn path() -> Option<PathBuf> {
-    let state = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    Some(state.join("fsc/fscd.log"))
 }
 
 /// Send stderr to the log from now on. Call it once, early, from the
@@ -107,11 +127,7 @@ fn open() -> std::io::Result<PathBuf> {
         report(info);
         drain();
     }));
-    eprintln!(
-        "fscd {} started {}",
-        env!("CARGO_PKG_VERSION"),
-        gtk::glib::DateTime::now_local().ok().and_then(|t| t.format("%Y-%m-%d %H:%M:%S %Z").ok()).unwrap_or_default()
-    );
+    eprintln!("fscd {} started {}", env!("CARGO_PKG_VERSION"), now("%Y-%m-%d %H:%M:%S %:z"));
     Ok(path)
 }
 
@@ -136,11 +152,7 @@ fn copy(read: File, mut file: File, mut terminal: Option<File>) {
             written = 0;
             let _ = file.write_all(b"(log restarted: it passed 8 MB)\n");
         }
-        let time = gtk::glib::DateTime::now_local()
-            .ok()
-            .and_then(|t| t.format("%H:%M:%S").ok())
-            .map(|t| format!("{t} "))
-            .unwrap_or_default();
+        let time = format!("{} ", now("%H:%M:%S"));
         if file.write_all(time.as_bytes()).and_then(|()| file.write_all(&line)).is_ok() {
             written += (time.len() + line.len()) as u64;
         }
@@ -150,4 +162,5 @@ fn copy(read: File, mut file: File, mut terminal: Option<File>) {
         }
         PENDING.store(!reader.buffer().is_empty(), Ordering::Release);
     }
+}
 }

@@ -7,6 +7,7 @@
 
 mod icon;
 mod log;
+mod platform;
 mod server;
 mod style;
 mod theme;
@@ -187,13 +188,11 @@ fn run() -> Result<()> {
     {
         let tx = ev_tx.clone();
         rt.spawn(async move {
-            use tokio::signal::unix::{SignalKind, signal};
-            let (Ok(mut int), Ok(mut term)) = (signal(SignalKind::interrupt()), signal(SignalKind::terminate())) else {
+            if !platform::quit_signal().await {
                 return;
-            };
-            tokio::select! { _ = int.recv() => {}, _ = term.recv() => {} }
+            }
             let _ = tx.send(AppEvent::Command(Command::Quit, None)).await;
-            tokio::select! { _ = int.recv() => {}, _ = term.recv() => {} }
+            platform::quit_signal().await;
             eprintln!("fsc: second signal, exiting now");
             server::cleanup();
             log::drain();

@@ -653,14 +653,36 @@ fn commented_out(text: &str) -> String {
 }
 
 /// Look `prog` up like a shell would: a path as given, a name on `$PATH`.
+/// On Windows a bare name also matches with each of `%PATHEXT%`'s endings
+/// (`codex` finds `codex.cmd`).
 pub fn find_program(prog: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    let runnable = |p: &std::path::Path| p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
-    if prog.contains('/') {
+    if prog.contains('/') || (cfg!(windows) && prog.contains('\\')) {
         let p = PathBuf::from(prog);
         return runnable(&p).then_some(p);
     }
-    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(prog)).find(|p| runnable(p))
+    let dirs: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH")?).collect();
+    dirs.iter().find_map(|d| with_exe_suffixes(&d.join(prog)).into_iter().find(|p| runnable(p)))
+}
+
+#[cfg(unix)]
+fn runnable(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn runnable(p: &std::path::Path) -> bool {
+    p.is_file()
+}
+
+/// `p`, and on Windows `p` with each executable ending.
+fn with_exe_suffixes(p: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = vec![p.to_path_buf()];
+    if cfg!(windows) && p.extension().is_none() {
+        let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+        out.extend(exts.split(';').filter(|e| !e.is_empty()).map(|e| p.with_extension(e.trim_start_matches('.'))));
+    }
+    out
 }
 
 /// "~" or "~/x" -> under the home directory, as a shell would. TOML has no

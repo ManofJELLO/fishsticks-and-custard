@@ -1,37 +1,24 @@
-//! Unix-socket control server used by the `fsc` CLI (and Hyprland binds).
+//! Control server used by the `fsc` CLI (and Hyprland binds), over the
+//! platform's local IPC (`fsc_core::ipc::Listener`).
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
 
-use fsc_core::ipc::{Command, Reply, socket_path};
+use fsc_core::ipc::{Command, Conn, Listener, Reply};
 
 use crate::AppEvent;
 
-/// Bind the socket, refusing to start if another fscd is already listening.
-pub async fn bind() -> Result<UnixListener> {
-    let path = socket_path();
-    if let Some(dir) = path.parent()
-        && !dir.exists()
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    }
-    if path.exists() {
-        if UnixStream::connect(&path).await.is_ok() {
-            bail!("fscd is already running ({})", path.display());
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-    Ok(UnixListener::bind(&path)?)
+/// Bind the control socket, refusing to start if another fscd is listening.
+pub async fn bind() -> Result<Listener> {
+    Listener::bind().await
 }
 
-pub async fn serve(listener: UnixListener, tx: async_channel::Sender<AppEvent>) {
+pub async fn serve(mut listener: Listener, tx: async_channel::Sender<AppEvent>) {
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => {
+            Ok(stream) => {
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle(stream, tx).await {
@@ -47,8 +34,8 @@ pub async fn serve(listener: UnixListener, tx: async_channel::Sender<AppEvent>) 
     }
 }
 
-async fn handle(stream: UnixStream, tx: async_channel::Sender<AppEvent>) -> Result<()> {
-    let (r, mut w) = stream.into_split();
+async fn handle(stream: Conn, tx: async_channel::Sender<AppEvent>) -> Result<()> {
+    let (r, mut w) = tokio::io::split(stream);
     let mut lines = BufReader::new(r).lines();
     while let Some(line) = lines.next_line().await? {
         let reply = match serde_json::from_str::<Command>(&line) {
@@ -78,5 +65,5 @@ async fn handle(stream: UnixStream, tx: async_channel::Sender<AppEvent>) -> Resu
 }
 
 pub fn cleanup() {
-    let _ = std::fs::remove_file(socket_path());
+    fsc_core::ipc::cleanup();
 }

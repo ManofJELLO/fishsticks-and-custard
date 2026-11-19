@@ -1147,24 +1147,15 @@ impl Ui {
             ("hyprcustard", vec![], "HyprCustard".to_string())
         } else {
             match Config::ensure_file() {
-                Ok(path) => ("xdg-open", vec![path.display().to_string()], path.display().to_string()),
+                Ok(path) => {
+                    let (prog, args) = crate::platform::opener(&path);
+                    (prog, args, path.display().to_string())
+                }
                 Err(e) => return Reply::err(format!("no config file: {e:#}")),
             }
         };
-        use std::os::unix::process::CommandExt;
-        // Its own process group, so it outlives fscd and isn't sent fscd's
-        // signals; reaped in the background.
-        let child = std::process::Command::new(prog)
-            .args(&args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .process_group(0)
-            .spawn();
-        match child {
-            Ok(mut c) => {
-                std::thread::spawn(move || c.wait());
-                Reply::state(format!("opened {what}"))
-            }
+        match crate::platform::spawn_detached(prog, &args) {
+            Ok(()) => Reply::state(format!("opened {what}")),
             Err(e) => {
                 let msg = format!("could not run {prog}: {e}");
                 notify(&format!("{msg}. Settings are in {}", Config::path().map(|p| p.display().to_string()).unwrap_or_default()));
@@ -1524,7 +1515,7 @@ impl Ui {
         if self.history.first_child().is_none() {
             return;
         }
-        let time = glib::DateTime::now_local().ok().and_then(|t| t.format("%H:%M").ok()).unwrap_or_default();
+        let time = crate::log::now("%H:%M");
         self.history.append(&label(&format!("— {text} · {time} —"), "note"));
         self.trim_history();
     }
@@ -2284,19 +2275,7 @@ fn sentence(s: &str) -> String {
 }
 
 fn notify(text: &str) {
-    let mut body: String = text.trim().chars().take(280).collect();
-    if text.trim().chars().count() > 280 {
-        body.push('…');
-    }
-    if body.is_empty() {
-        return;
-    }
-    tokio::spawn(async move {
-        let _ = tokio::process::Command::new("notify-send")
-            .args(["--app-name=Fishsticks & Custard", "Fishsticks & Custard", &body])
-            .status()
-            .await;
-    });
+    crate::platform::notify(text);
 }
 
 /// How to ask for an answer: (spoken, status line). "Always" is never

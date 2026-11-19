@@ -10,10 +10,23 @@ fsc-core.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-cpal = { version = "0.18", features = ["pipewire"] }
+cpal = "0.18"
 ort = "=2.0.0-rc.15"
-whisper-rs = { version = "0.16", features = ["vulkan", "raw-api"] }
+whisper-rs = { version = "0.16", features = ["raw-api"] }
 # No default features: skip compiling espeak's phoneme data (we use the
 # system espeak-ng-data), which also fails in clean release builds.
 espeak-rs = { version = "0.2", default-features = false }
 rustfft = "6"
+
+# The audio host and the GPU backend for whisper, per platform. Linux talks
+# to PipeWire natively; whisper runs on Vulkan there and on Windows (any GPU
+# vendor), on Metal on macOS.
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18", features = ["pipewire"] }
+whisper-rs = { version = "0.16", features = ["vulkan"] }
+
+[target.'cfg(windows)'.dependencies]
+whisper-rs = { version = "0.16", features = ["vulkan"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", features = ["metal"] }

@@ -23,3 +23,4 @@ async-channel = "2"
 libc = "0.2"
 futures-util = "0.3"
 tiny-skia = "0.12"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

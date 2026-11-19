@@ -34,9 +34,20 @@ impl std::error::Error for MicMissing {}
 /// mic is never taken to mean another whose name contains it. An id
 /// without a dot ("easyeffects_source") is saved as "pipewire:<id>"
 /// (`device_setting`), as it can't be told from a name typed in part.
+///
+/// Elsewhere a mic is saved by cpal's id, "<host>:<device>" ("wasapi:…",
+/// "coreaudio:…"), and matched exactly too.
 pub fn is_device_id(name: &str) -> bool {
     let name = name.trim();
-    name.starts_with("pipewire:") || (!name.is_empty() && !name.contains(char::is_whitespace) && name.contains('.'))
+    host_prefixed(name) || (!name.is_empty() && !name.contains(char::is_whitespace) && name.contains('.'))
+}
+
+/// cpal's hosts whose ids a setting can carry.
+const HOSTS: [&str; 5] = ["pipewire:", "wasapi:", "coreaudio:", "asio:", "jack:"];
+
+fn host_prefixed(name: &str) -> bool {
+    let low = name.to_lowercase();
+    HOSTS.iter().any(|h| low.starts_with(h))
 }
 
 /// What to save for the mic with PipeWire id `id`, so it's matched exactly.
@@ -44,9 +55,15 @@ pub fn device_setting(id: &str) -> String {
     if is_device_id(id) { id.to_string() } else { format!("pipewire:{id}") }
 }
 
-/// The PipeWire id a device setting names.
+/// The PipeWire id a device setting names (other hosts' ids as they are).
 fn node_name(setting: &str) -> &str {
     setting.trim().strip_prefix("pipewire:").unwrap_or(setting.trim())
+}
+
+/// The full cpal id (lowercase) a device setting names.
+fn cpal_id(setting: &str) -> String {
+    let low = setting.trim().to_lowercase();
+    if host_prefixed(&low) { low } else { format!("pipewire:{low}") }
 }
 
 /// The mic `name` names isn't there. Not when `name` means the default,
@@ -80,7 +97,7 @@ fn find_input(host: &cpal::Host, name: &str) -> Result<Device> {
             .unwrap_or_default();
         let needle = name.to_lowercase();
         let found = if is_device_id(name) {
-            let id = format!("pipewire:{}", node_name(&needle));
+            let id = cpal_id(&needle);
             inputs.iter().position(|(_, _, i)| *i == id)
         } else {
             let exact = inputs.iter().position(|(_, n, _)| *n == needle);
@@ -122,6 +139,7 @@ pub fn which_mic<'a>(setting: &str, mics: &'a [Microphone]) -> Option<&'a Microp
 /// The microphones PipeWire knows, as the tray lists them. Asks `pw-dump`
 /// (part of PipeWire), which says what each node is: cpal's list also has
 /// speakers and other programs' recordings.
+#[cfg(target_os = "linux")]
 pub fn microphones() -> Vec<Microphone> {
     let out = match std::process::Command::new("pw-dump").stderr(std::process::Stdio::null()).output() {
         Ok(o) if o.status.success() => o.stdout,
@@ -137,6 +155,27 @@ pub fn microphones() -> Vec<Microphone> {
     parse_microphones(&out)
 }
 
+/// The system's microphones, as cpal lists them: on Windows and macOS its
+/// input devices are inputs only. Each is saved by its cpal id.
+#[cfg(not(target_os = "linux"))]
+pub fn microphones() -> Vec<Microphone> {
+    let host = cpal::default_host();
+    let Ok(devs) = host.input_devices() else { return Vec::new() };
+    let mut mics: Vec<Microphone> = Vec::new();
+    for d in devs {
+        let Ok(desc) = d.description() else { continue };
+        if desc.direction() != DeviceDirection::Input {
+            continue;
+        }
+        let Ok(id) = d.id().map(|i| i.to_string()) else { continue };
+        if !mics.iter().any(|m| m.id == id) {
+            mics.push(Microphone { id, name: desc.name().to_string() });
+        }
+    }
+    mics
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_microphones(json: &[u8]) -> Vec<Microphone> {
     let Ok(serde_json::Value::Array(objects)) = serde_json::from_slice(json) else { return Vec::new() };
     let mut mics: Vec<Microphone> = Vec::new();
@@ -596,6 +635,19 @@ mod tests {
         ];
         assert_eq!(which_mic("pipewire:easyeffects_source", &mics).map(|m| m.name.as_str()), Some("Easy Effects"));
         assert!(which_mic("pipewire:easyeffects_source", &mics[..1]).is_none());
+    }
+
+    #[test]
+    fn other_hosts_device_ids() {
+        // Windows and macOS mics are saved by cpal's "<host>:<device>" id.
+        let wasapi = "wasapi:{0.0.1.00000000}.{6a1c9c0e-0000-4b36-9d3e-1f0c2a7b9e11}";
+        assert!(is_device_id(wasapi));
+        assert!(is_device_id("CoreAudio:BuiltInMicrophoneDevice"));
+        assert_eq!(device_setting(wasapi), wasapi);
+        assert_eq!(cpal_id("CoreAudio:BuiltIn"), "coreaudio:builtin");
+        assert_eq!(cpal_id("alsa_input.x"), "pipewire:alsa_input.x");
+        let mics = vec![Microphone { id: wasapi.into(), name: "Microphone (USB)".into() }];
+        assert_eq!(which_mic(wasapi, &mics).map(|m| m.name.as_str()), Some("Microphone (USB)"));
     }
 }
 
