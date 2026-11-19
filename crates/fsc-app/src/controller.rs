@@ -1,21 +1,12 @@
-//! The popup: a layer-shell surface with a translucent panel, dot-matrix
-//! status and visualiser, the conversation, and a text field.
+//! What the popup does, without any toolkit: the assistant's state, the
+//! commands, and the agent's and audio engine's events. The Qt side
+//! (`qt::bridge`) shows the result: it mirrors `history` through its ops,
+//! carries out the `Effect`s, and draws the parts in `draw`.
 //!
 //! What the popup shows comes from three independent activities, combined by
-//! `State::phase()`: voice capture (listening, then transcribing), the
-//! Claude turn (thinking, working, responding), and speech playback
-//! (speaking).
+//! `State::phase()`: voice capture (listening, then transcribing), the agent's
+//! turn (thinking, working, responding), and speech playback (speaking).
 
-mod dotfont;
-mod panel;
-mod speech_text;
-mod viz;
-
-use gtk::prelude::*;
-use gtk::{gdk, glib, pango};
-use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -23,20 +14,21 @@ use fsc_audio::{AudioEvent, AudioHandle};
 use fsc_core::Phase;
 use fsc_core::agent::{AgentEvent, AgentHandle, Choices, Setting, pretty_model, pretty_tool};
 use fsc_core::config::{self as config, AgentKind, Config, SpeakMode, Surface};
-use fsc_core::lang::{self, Language, Spoken};
 use fsc_core::ipc::{Command, Reply};
+use fsc_core::lang::{self, Language, Spoken};
 use fsc_core::permission::{self, Answer, PermissionAsk};
 
 use crate::AppEvent;
+use crate::draw::{Canvas, Frame, dotfont, panel, viz::Viz};
+use crate::history::{Card, History, Kind};
 use crate::icon::IconState;
+use crate::platform::notify;
+use crate::speech_text::SentenceBuffer;
+use crate::style::{self, Palette, Rgb, SystemColors, ThemeMode};
 use crate::tray::{self, TrayUpdate};
-use crate::style::{self, Palette, Rgb, ThemeMode};
-use speech_text::SentenceBuffer;
-use viz::Viz;
 
 const MAX_EXCHANGES: usize = 20;
-const PAD_X: i32 = 24;
-const STATUS_PITCH: f64 = 3.0;
+pub const STATUS_PITCH: f64 = 3.0;
 const STATUS_DOT: f64 = 1.15;
 /// A push-to-talk release sooner than this after the press counts as a
 /// tap: keep listening and let the VAD decide when you've finished.
@@ -48,38 +40,64 @@ const MAX_EMPTY_FOLLOW_UPS: u32 = 3;
 const MAX_ANSWER_TRIES: u32 = 3;
 /// How long "CONVERSATION ENDED" shows before the popup closes itself.
 const HANG_UP_CLOSE: Duration = Duration::from_secs(3);
+/// The longest a quit waits for the memory save.
+const QUIT_WAIT: Duration = Duration::from_secs(30);
+
+/// The status line's height: the dot font's rows, plus a pixel each side.
+pub fn status_height() -> f64 {
+    ((dotfont::ROWS as f64 * STATUS_PITCH).ceil() + 2.0).round()
+}
+
+/// Something for the view to do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Effect {
+    /// Put the popup up; `focus`: and type in its text field.
+    Show { focus: bool },
+    Hide,
+    Quit,
+    /// The status line's text.
+    Meta(String),
+    /// The colours changed.
+    Palette,
+    /// Whether the conversation area shows (it doesn't until there's one).
+    HistoryShown(bool),
+    /// Show the newest text. `force`: even if you've scrolled up to read.
+    Scroll { force: bool },
+    /// Drop the highlight in the line last clicked.
+    ClearPick,
+    Copy(String),
+}
+
+/// A timer the controller set, come due (`AppEvent::Timer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Timer {
+    /// A flashed status message's time is up (unless a newer one replaced it).
+    Meta(u64),
+    /// "CONVERSATION ENDED" has shown long enough.
+    HangUp,
+    /// Quit even though the memory save hasn't reported back.
+    QuitAnyway,
+}
 
 /// A permission question on screen.
 struct OpenAsk {
     ask: PermissionAsk,
-    card: gtk::Box,
-    buttons: gtk::Box,
+    /// Its card in the history.
+    card: u64,
 }
 
 struct Exchange {
-    reply: gtk::Label,
+    /// Its group in the history, and its reply line.
+    group: u64,
+    reply: u64,
     text: String,
     /// The most recent "⚙ TOOL" line, so a permission card for the same
     /// tool can replace it instead of repeating it.
-    last_tool: Option<(String, gtk::Label)>,
-    /// `text` has grown since it was last put in `reply`. Streamed text is
-    /// shown at most once per main-loop pass rather than on every chunk,
-    /// since each `set_text` lays out the whole reply again.
+    last_tool: Option<(String, u64)>,
+    /// `text` has grown since it was last put in the reply line. Streamed
+    /// text is shown at most once per pass of the event loop rather than on
+    /// every chunk, since each change lays out the whole reply again.
     stale: bool,
-}
-
-impl Exchange {
-    fn new(reply: gtk::Label) -> Self {
-        Self { reply, text: String::new(), last_tool: None, stale: false }
-    }
-
-    /// Bring the label up to date with `text`.
-    fn show(&mut self) {
-        if std::mem::take(&mut self.stale) {
-            self.reply.set_text(self.text.trim_start());
-            self.reply.set_visible(true);
-        }
-    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -90,7 +108,7 @@ struct Voice {
 }
 
 struct State {
-    /// The Claude side: Idle / Thinking / Working / Responding / Error.
+    /// The agent side: Idle / Thinking / Working / Responding / Error.
     claude: Phase,
     listening: Option<Instant>,
     transcribing: bool,
@@ -101,6 +119,8 @@ struct State {
     theme: ThemeMode,
     /// The desktop's accent colour, when it sets one.
     desktop_accent: Option<Rgb>,
+    /// The toolkit palette's colours.
+    system: SystemColors,
     muted: bool,
     /// `voice.wake_phrase`, as changed by `fsc wake`.
     wake_phrase: String,
@@ -143,7 +163,8 @@ struct State {
     menu_sent: Option<tray::MenuState>,
     voice: Voice,
     viz: Viz,
-    last_frame: Option<i64>,
+    /// Seconds of animation shown (the status line's blink keeps time by it).
+    clock: f64,
     current: Option<Exchange>,
     /// The current prompt was spoken, so the reply should be too.
     voice_turn: bool,
@@ -158,15 +179,15 @@ struct State {
     follow_up: bool,
     /// Consecutive follow-ups that heard nothing (stops runaway re-listening).
     empty_follow_ups: u32,
-    /// The Claude session has exchanges since it started (worth saving).
+    /// The agent session has exchanges since it started (worth saving).
     session_dirty: bool,
     last_activity: Option<Instant>,
     /// A session's memory update was requested and hasn't reported back.
     memory_saving: bool,
     /// Quit requested; waiting for the memory save to finish.
     quitting: bool,
-    /// A prompt that arrived while Claude was still busy (e.g. you spoke over
-    /// a reply that hadn't finished stopping). Sent when the turn ends.
+    /// A prompt that arrived while the agent was still busy (e.g. you spoke
+    /// over a reply that hadn't finished stopping). Sent when the turn ends.
     pending_prompt: Option<(String, bool)>,
     /// Permission questions waiting for an answer, oldest first.
     asks: Vec<OpenAsk>,
@@ -174,7 +195,9 @@ struct State {
     answer_tries: u32,
     /// Last state sent to the tray, to skip redundant re-renders.
     tray_sent: Option<IconState>,
-    meta_timer: Option<glib::SourceId>,
+    /// A flashed message is showing; its timer is the latest `meta_gen`.
+    meta_flashing: bool,
+    meta_gen: u64,
 }
 
 impl State {
@@ -191,145 +214,40 @@ impl State {
     }
 }
 
-pub struct Ui {
-    cfg: Config,
+pub struct Controller {
+    pub cfg: Config,
     claude: AgentHandle,
     audio: AudioHandle,
     tray_tx: mpsc::UnboundedSender<TrayUpdate>,
-    /// For work done off the main thread (voice downloads) to report back.
-    events: async_channel::Sender<crate::AppEvent>,
-    app: gtk::Application,
-    window: gtk::ApplicationWindow,
-    panel: gtk::DrawingArea,
-    status: gtk::DrawingArea,
-    viz_area: gtk::DrawingArea,
-    meta: gtk::Label,
-    scroller: gtk::ScrolledWindow,
-    history: gtk::Box,
-    entry: gtk::Entry,
-    css: gtk::CssProvider,
-    st: RefCell<State>,
-    scroll_pending: Cell<bool>,
+    /// For work done off the UI thread (timers, downloads) to report back.
+    events: async_channel::Sender<AppEvent>,
+    st: State,
+    pub history: History,
+    effects: Vec<Effect>,
     /// The accent pinned in the config (hex), overriding the desktop's.
     accent_pin: Option<Rgb>,
-    /// Headless: a voice session is "open" though nothing is shown.
-    open: Cell<bool>,
-    /// The text line last clicked in the history, whose highlight Ctrl+C copies.
-    picked: RefCell<glib::WeakRef<gtk::Label>>,
+    /// The popup is up, or, headless, a voice session is running.
+    open: bool,
+    /// The text field is empty (the view says when that changes).
+    entry_empty: bool,
+    /// A flush of streamed text is on its way; `scroll_force`: and it should
+    /// scroll even if you've scrolled up.
+    flush_pending: bool,
+    scroll_force: bool,
+    /// The status line's text, to say again when a flash is over.
+    meta: String,
 }
 
-impl Ui {
-    #[allow(clippy::too_many_arguments)] // each is a separate handle it needs
+impl Controller {
     pub fn new(
-        app: &gtk::Application,
         cfg: Config,
         palette: Palette,
         accent_pin: Option<Rgb>,
         claude: AgentHandle,
         audio: AudioHandle,
         tray_tx: mpsc::UnboundedSender<TrayUpdate>,
-        events: async_channel::Sender<crate::AppEvent>,
-    ) -> Rc<Self> {
-        let window = gtk::ApplicationWindow::builder()
-            .application(app)
-            .title("Fishsticks & Custard")
-            .decorated(false)
-            .resizable(false)
-            .build();
-        window.add_css_class("fsc");
-
-        if cfg.ui.surface == Surface::Layer {
-            window.init_layer_shell();
-            window.set_namespace(Some("fsc"));
-            window.set_layer(Layer::Overlay);
-            // On demand, not exclusive: other windows stay usable while it's up.
-            window.set_keyboard_mode(KeyboardMode::OnDemand);
-            let (top, bottom, left, right) = cfg.ui.anchor.edges();
-            for (edge, on, margin) in [
-                (Edge::Top, top, cfg.ui.margin),
-                (Edge::Bottom, bottom, cfg.ui.margin),
-                (Edge::Left, left, cfg.ui.margin_x),
-                (Edge::Right, right, cfg.ui.margin_x),
-            ] {
-                window.set_anchor(edge, on);
-                window.set_margin(edge, if on { margin } else { 0 });
-            }
-            if !cfg.ui.monitor.is_empty() {
-                let display = gdk::Display::default().expect("a display");
-                let monitors = display.monitors();
-                let found = (0..monitors.n_items())
-                    .filter_map(|i| monitors.item(i).and_downcast::<gdk::Monitor>())
-                    .find(|m| m.connector().is_some_and(|c| c == cfg.ui.monitor));
-                match found {
-                    Some(m) => window.set_monitor(Some(&m)),
-                    None => eprintln!("fsc: monitor {:?} not found; using the focused one", cfg.ui.monitor),
-                }
-            }
-        } else {
-            // A normal toplevel: Hyprland matches it by class
-            // (dev.fsc.FishsticksAndCustard) for float, size, opacity, etc.
-            window.set_default_size(cfg.ui.width, -1);
-        }
-
-        // --- widgets ------------------------------------------------------
-        let panel = gtk::DrawingArea::new();
-
-        let status = gtk::DrawingArea::new();
-        status.set_content_height((dotfont::ROWS as f64 * STATUS_PITCH).ceil() as i32 + 2);
-        status.set_hexpand(true);
-
-        let meta = gtk::Label::new(None);
-        meta.add_css_class("meta");
-        meta.set_valign(gtk::Align::Center);
-
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        header.append(&status);
-        header.append(&meta);
-
-        let viz_area = gtk::DrawingArea::new();
-        viz_area.set_content_height(viz::HEIGHT);
-        viz_area.set_hexpand(true);
-
-        let history = gtk::Box::new(gtk::Orientation::Vertical, 16);
-        let scroller = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .propagate_natural_height(true)
-            .max_content_height(cfg.ui.max_height)
-            .child(&history)
-            .visible(false)
-            .build();
-
-        let entry = gtk::Entry::builder().placeholder_text("Ask anything…").hexpand(true).build();
-
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 16);
-        content.set_margin_top(20);
-        content.set_margin_bottom(20);
-        content.set_margin_start(PAD_X);
-        content.set_margin_end(PAD_X);
-        content.append(&header);
-        content.append(&viz_area);
-        content.append(&scroller);
-        content.append(&entry);
-
-        let overlay = gtk::Overlay::new();
-        overlay.set_size_request(cfg.ui.width, -1);
-        overlay.set_child(Some(&panel));
-        overlay.add_overlay(&content);
-        overlay.set_measure_overlay(&content, true);
-        window.set_child(Some(&overlay));
-
-        // --- style ------------------------------------------------------------
-        let css = gtk::CssProvider::new();
-        css.load_from_string(&palette.css(&cfg.ui.font));
-        gtk::style_context_add_provider_for_display(
-            &gdk::Display::default().expect("a display"),
-            &css,
-            // Above USER: ~/.config/gtk-4.0/gtk.css is often the full desktop
-            // theme (focus rings etc.). Every rule is scoped to `.fsc`, so this
-            // only affects the popup.
-            gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
-        );
-
+        events: async_channel::Sender<AppEvent>,
+    ) -> Self {
         let model = pretty_model(&cfg.model_hint());
         let (agent, agents) = (cfg.agent.backend, AgentKind::ALL.map(|k| cfg.available(k)));
         let memory_on = cfg.memory();
@@ -340,23 +258,13 @@ impl Ui {
         let mut sentences = SentenceBuffer::default();
         sentences.set_language(spoken.language());
         let viz = Viz::new(&cfg.ui);
-        let ui = Rc::new(Ui {
+        let mut c = Controller {
             cfg,
             claude,
             audio,
             tray_tx,
             events,
-            app: app.clone(),
-            window,
-            panel,
-            status,
-            viz_area,
-            meta,
-            scroller,
-            history,
-            entry,
-            css,
-            st: RefCell::new(State {
+            st: State {
                 claude: Phase::Idle,
                 listening: None,
                 transcribing: false,
@@ -364,6 +272,7 @@ impl Ui {
                 theme: palette.mode,
                 palette,
                 desktop_accent: None,
+                system: SystemColors::default(),
                 muted: false,
                 wake_phrase,
                 mic,
@@ -387,7 +296,7 @@ impl Ui {
                 menu_sent: None,
                 voice: Voice::default(),
                 viz,
-                last_frame: None,
+                clock: 0.0,
                 current: None,
                 voice_turn: false,
                 sentences,
@@ -403,156 +312,55 @@ impl Ui {
                 asks: Vec::new(),
                 answer_tries: 0,
                 tray_sent: None,
-                meta_timer: None,
-            }),
-            scroll_pending: Cell::new(false),
+                meta_flashing: false,
+                meta_gen: 0,
+            },
+            history: History::default(),
+            effects: Vec::new(),
             accent_pin,
-            open: Cell::new(false),
-            picked: RefCell::default(),
-        });
-        ui.wire();
-        ui.restore_meta();
-        ui
+            open: false,
+            entry_empty: true,
+            flush_pending: false,
+            scroll_force: false,
+            meta: String::new(),
+        };
+        c.restore_meta();
+        c
     }
 
-    fn wire(self: &Rc<Self>) {
-        let weak = Rc::downgrade(self);
-        self.panel.set_draw_func(move |_, cr, w, h| {
-            if let Some(ui) = weak.upgrade() {
-                let regions = ui.panel_regions(h as f64);
-                panel::draw(cr, w as f64, h as f64, &ui.st.borrow().palette, regions, ui.panel_look());
-            }
-        });
+    /// What the view has to do since it last asked.
+    pub fn take_effects(&mut self) -> Vec<Effect> {
+        std::mem::take(&mut self.effects)
+    }
 
-        let weak = Rc::downgrade(self);
-        self.viz_area.set_draw_func(move |_, cr, w, h| {
-            if let Some(ui) = weak.upgrade() {
-                let st = ui.st.borrow();
-                st.viz.draw(cr, w as f64, h as f64, &st.palette);
-            }
-        });
+    pub fn palette(&self) -> Palette {
+        self.st.palette
+    }
 
-        let weak = Rc::downgrade(self);
-        self.status.set_draw_func(move |_, cr, _w, h| {
-            let Some(ui) = weak.upgrade() else { return };
-            let st = ui.st.borrow();
-            let p = &st.palette;
-            let phase = st.phase();
-            let y = (h as f64 - (dotfont::ROWS - 1) as f64 * STATUS_PITCH) / 2.0;
-            let mut x = STATUS_DOT;
-            if phase == Phase::Listening {
-                // Blinking record dot.
-                let t = st.last_frame.map(|t| t as f64 / 1e6).unwrap_or(0.0);
-                let a = 0.55 + 0.45 * (t * 4.0).sin().abs();
-                cr.set_source_rgba(p.accent.0, p.accent.1, p.accent.2, a);
-                cr.arc(4.0, h as f64 / 2.0, 4.0, 0.0, std::f64::consts::TAU);
-                cr.fill().ok();
-                x += 14.0;
-            }
-            let on = if matches!(phase, Phase::Error | Phase::Asking) { p.accent } else { p.fg };
-            dotfont::draw(cr, phase.label(), x, y, STATUS_PITCH, STATUS_DOT, (on, 1.0), (p.fg, 0.10), Some((p.bg, 0.5)));
-        });
+    pub fn meta(&self) -> &str {
+        &self.meta
+    }
 
-        // Animation: only runs while the popup is mapped.
-        let weak = Rc::downgrade(self);
-        self.viz_area.add_tick_callback(move |area, clock| {
-            let Some(ui) = weak.upgrade() else { return glib::ControlFlow::Break };
-            let now = clock.frame_time();
-            {
-                let mut st = ui.st.borrow_mut();
-                let dt = st.last_frame.map(|t| ((now - t) as f32 / 1e6).clamp(0.0, 0.1)).unwrap_or(0.016);
-                st.last_frame = Some(now);
-                st.viz.tick(dt, area.width() as f64);
-            }
-            area.queue_draw();
-            ui.status.queue_draw();
-            glib::ControlFlow::Continue
-        });
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
 
-        let weak = Rc::downgrade(self);
-        self.entry.connect_activate(move |e| {
-            if let Some(ui) = weak.upgrade() {
-                let text = e.text().to_string();
-                // "y" / "yes" / "always" / "no" answers an open permission question.
-                let open = ui.st.borrow().asks.first().map(|a| a.ask.id.clone());
-                let lang = ui.st.borrow().spoken.language();
-                if let (Some(id), Some(answer)) = (open, permission::parse_answer(&text, lang)) {
-                    e.set_text("");
-                    ui.answer_ask(&id, answer);
-                    return;
-                }
-                if ui.ask(&text, false) {
-                    e.set_text("");
-                }
-            }
-        });
+    fn headless(&self) -> bool {
+        self.cfg.ui.surface == Surface::Headless
+    }
 
-        let keys = gtk::EventControllerKey::new();
-        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let weak = Rc::downgrade(self);
-        keys.connect_key_pressed(move |_, key, _, mods| {
-            let Some(ui) = weak.upgrade() else { return glib::Propagation::Proceed };
-            let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
-            match key {
-                gdk::Key::Escape => {
-                    ui.hide();
-                    glib::Propagation::Stop
-                }
-                // Ctrl+Shift+C copies the whole conversation shown. Not Caps
-                // Lock's "C": that's still Ctrl+C.
-                gdk::Key::C | gdk::Key::c if ctrl && mods.contains(gdk::ModifierType::SHIFT_MASK) => {
-                    ui.copy_history();
-                    glib::Propagation::Stop
-                }
-                // Ctrl+C copies highlighted text in the history. With nothing
-                // highlighted anywhere it stops everything, like a terminal.
-                gdk::Key::c | gdk::Key::C if ctrl && ui.entry.selection_bounds().is_none() => {
-                    if !ui.copy_picked() {
-                        ui.cancel_listen();
-                        ui.interrupt();
-                    }
-                    glib::Propagation::Stop
-                }
-                gdk::Key::n if ctrl => {
-                    ui.new_conversation();
-                    glib::Propagation::Stop
-                }
-                _ => glib::Propagation::Proceed,
-            }
+    /// Wait `after`, then come back with `t` (as `AppEvent::Timer`).
+    fn timer(&self, after: Duration, t: Timer) {
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            let _ = tx.send(AppEvent::Timer(t)).await;
         });
-        self.window.add_controller(keys);
-
-        // Closing the window (e.g. Hyprland's killactive) hides it; the
-        // assistant keeps running in the tray.
-        let weak = Rc::downgrade(self);
-        self.window.connect_close_request(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                ui.hide();
-            }
-            glib::Propagation::Stop
-        });
-
-        // Follow the GTK theme: re-read its colours once styled, and again
-        // whenever GTK's theme settings change.
-        let weak = Rc::downgrade(self);
-        self.window.connect_realize(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                ui.refresh_palette();
-            }
-        });
-        if let Some(settings) = gtk::Settings::default() {
-            let weak = Rc::downgrade(self);
-            settings.connect_notify_local(None, move |_, _| {
-                if let Some(ui) = weak.upgrade() {
-                    ui.refresh_palette_soon();
-                }
-            });
-        }
     }
 
     // --- events -----------------------------------------------------------
 
-    pub fn handle(self: &Rc<Self>, ev: AppEvent) {
+    pub fn handle(&mut self, ev: AppEvent) {
         match ev {
             AppEvent::Command(cmd, reply) => {
                 let r = self.command(cmd);
@@ -565,13 +373,41 @@ impl Ui {
             AppEvent::VoiceFetch { voice, progress } => self.voice_fetch(voice, progress),
             AppEvent::Theme(mode) => self.set_theme(mode),
             AppEvent::Accent(c) => {
-                self.st.borrow_mut().desktop_accent = c;
+                self.st.desktop_accent = c;
                 self.refresh_palette();
             }
+            AppEvent::Timer(t) => self.timer_due(t),
+            AppEvent::IdleTick => self.tick_idle(),
+            AppEvent::MicName(name) => self.flash_meta(&short_meta(&format!("MIC: {}", name.to_uppercase()))),
+            AppEvent::Flush => self.flush(),
         }
     }
 
-    pub fn command(self: &Rc<Self>, cmd: Command) -> Reply {
+    fn timer_due(&mut self, t: Timer) {
+        match t {
+            Timer::Meta(n) => {
+                if n == self.st.meta_gen {
+                    self.st.meta_flashing = false;
+                    self.restore_meta();
+                }
+            }
+            Timer::HangUp => {
+                let st = &self.st;
+                let idle = !st.conversation
+                    && st.listening.is_none()
+                    && !st.transcribing
+                    && !st.claude.busy()
+                    && !st.speaking
+                    && !st.speech_pending;
+                if idle && self.entry_empty && self.is_open() {
+                    self.hide();
+                }
+            }
+            Timer::QuitAnyway => self.effects.push(Effect::Quit),
+        }
+    }
+
+    pub fn command(&mut self, cmd: Command) -> Reply {
         match cmd {
             // Headless has nothing to show: the tray click talks or hangs up.
             Command::Toggle if self.headless() => {
@@ -595,7 +431,7 @@ impl Ui {
                 }
             }
             Command::Allow { .. } | Command::Deny => {
-                let Some(id) = self.st.borrow().asks.first().map(|a| a.ask.id.clone()) else {
+                let Some(id) = self.st.asks.first().map(|a| a.ask.id.clone()) else {
                     return Reply::err("nothing is waiting for permission");
                 };
                 let answer = match cmd {
@@ -607,21 +443,17 @@ impl Ui {
             }
             Command::New => self.new_conversation(),
             Command::Mute { on } => {
-                let muted = {
-                    let mut st = self.st.borrow_mut();
-                    st.muted = on.unwrap_or(!st.muted);
-                    st.muted
-                };
+                self.st.muted = on.unwrap_or(!self.st.muted);
+                let muted = self.st.muted;
                 self.audio.set_wake_enabled(!muted);
                 self.flash_meta(if muted { "WAKE WORD MUTED" } else { "WAKE WORD ON" });
                 self.push_tray();
             }
-            Command::Wake { phrase: None } => return Reply::state(self.st.borrow().wake_phrase.clone()),
+            Command::Wake { phrase: None } => return Reply::state(self.st.wake_phrase.clone()),
             Command::Wake { phrase: Some(phrase) } => return self.set_wake_phrase(&phrase),
             Command::Status => {
-                let st = self.st.borrow();
-                let mut s = st.phase().label().to_lowercase();
-                if st.muted {
+                let mut s = self.st.phase().label().to_lowercase();
+                if self.st.muted {
                     s.push_str(" (muted)");
                 }
                 return Reply::state(s);
@@ -639,13 +471,13 @@ impl Ui {
             Command::Forget => {
                 self.claude.forget();
                 self.add_divider("MEMORY CLEARED");
-                let mut st = self.st.borrow_mut();
+                let st = &mut self.st;
                 st.session_dirty = false;
                 st.last_activity = None;
                 // Forgetting cancels any save in flight; it won't report back.
                 st.memory_saving = false;
             }
-            Command::Agent { backend: None } => return Reply::state(self.st.borrow().agent.key()),
+            Command::Agent { backend: None } => return Reply::state(self.st.agent.key()),
             Command::Agent { backend: Some(name) } => {
                 let Some(kind) = AgentKind::from_key(&name) else {
                     return Reply::err(format!("no agent called {name:?}: try {}", AgentKind::all_keys()));
@@ -664,62 +496,56 @@ impl Ui {
         Reply::ok()
     }
 
-    fn agent_event(self: &Rc<Self>, e: AgentEvent) {
+    fn agent_event(&mut self, e: AgentEvent) {
         match e {
             AgentEvent::Ready { model, .. } => {
                 if !model.is_empty() {
-                    self.st.borrow_mut().model = pretty_model(&model);
+                    self.st.model = pretty_model(&model);
                     self.restore_meta();
                 }
             }
             AgentEvent::TextDelta(t) => {
-                if self.st.borrow().claude != Phase::Responding {
+                if self.st.claude != Phase::Responding {
                     self.set_claude(Phase::Responding);
                 }
                 let speak = self.should_speak();
-                let mut st = self.st.borrow_mut();
+                let st = &mut self.st;
                 st.viz.kick(0.25 + t.len() as f32 * 0.03);
                 if let Some(cur) = st.current.as_mut() {
                     cur.text.push_str(&t);
                     cur.stale = true;
                 }
                 let ready = if speak { st.sentences.push(&t) } else { Vec::new() };
-                drop(st);
                 for s in ready {
                     self.speak(s);
                 }
-                self.scroll_to_end();
+                self.scroll_to_end(false);
             }
             AgentEvent::ToolUse { name } => {
-                if self.st.borrow().asks.is_empty() {
+                if self.st.asks.is_empty() {
                     self.set_claude(Phase::Working);
                 }
-                if let Some(cur) = self.st.borrow_mut().current.as_mut() {
+                if let Some(reply) = self.st.current.as_ref().map(|c| c.reply) {
                     let tool = pretty_tool(&name);
-                    let l = label(&format!("󰒓  {}", tool.to_uppercase()), "tool");
-                    if let Some(parent) = cur.reply.parent() {
-                        l.insert_before(&parent, Some(&cur.reply));
+                    let id = self.history.insert_before(reply, Kind::Tool, &format!("󰒓  {}", tool.to_uppercase()));
+                    if let (Some(cur), Some(id)) = (self.st.current.as_mut(), id) {
+                        cur.last_tool = Some((tool, id));
                     }
-                    cur.last_tool = Some((tool, l));
                 }
-                self.scroll_to_end();
+                self.scroll_to_end(false);
             }
             AgentEvent::Permission(ask) => self.on_permission(ask),
             AgentEvent::PermissionClosed { id } => self.close_ask(&id, "— WITHDRAWN"),
             AgentEvent::TurnDone { ok, interrupted, error } => {
                 // Questions still open when the turn ends were never answered.
-                let open: Vec<String> = self.st.borrow().asks.iter().map(|a| a.ask.id.clone()).collect();
+                let open: Vec<String> = self.st.asks.iter().map(|a| a.ask.id.clone()).collect();
                 for id in open {
                     self.close_ask(&id, "— NOT ANSWERED");
                 }
-                let (cur, rest) = {
-                    let mut st = self.st.borrow_mut();
-                    let rest = if ok && !interrupted { st.sentences.flush() } else { None };
-                    st.sentences.clear();
-                    let mut cur = st.current.take();
-                    cur.iter_mut().for_each(Exchange::show);
-                    (cur, rest)
-                };
+                let rest = if ok && !interrupted { self.st.sentences.flush() } else { None };
+                self.st.sentences.clear();
+                self.show_current();
+                let cur = self.st.current.take();
                 if let Some(rest) = rest
                     && self.should_speak()
                 {
@@ -727,32 +553,29 @@ impl Ui {
                 }
                 if let Some(cur) = &cur {
                     if cur.text.trim().is_empty() {
-                        cur.reply.set_visible(false);
+                        self.history.set_visible(cur.reply, false);
                     }
-                    if let Some(parent) = cur.reply.parent().and_downcast::<gtk::Box>() {
-                        if interrupted {
-                            parent.append(&label("— STOPPED", "note"));
-                        } else if ok && cur.text.trim().is_empty() {
-                            // Some agents end a turn silently, e.g. after a refusal.
-                            parent.append(&label("— NO REPLY", "note"));
-                        }
-                        if let Some(err) = &error {
-                            parent.append(&label(&format!("! {err}"), "error"));
-                        }
+                    if interrupted {
+                        self.history.append_to_group(cur.group, Kind::Note, "— STOPPED");
+                    } else if ok && cur.text.trim().is_empty() {
+                        // Some agents end a turn silently, e.g. after a refusal.
+                        self.history.append_to_group(cur.group, Kind::Note, "— NO REPLY");
+                    }
+                    if let Some(err) = &error {
+                        self.history.append_to_group(cur.group, Kind::Error, &format!("! {err}"));
                     }
                 }
                 self.set_claude(if ok { Phase::Idle } else { Phase::Error });
                 // Not `session_dirty`: that's set when a prompt is sent, since
                 // a rotation also ends (interrupts) the turn it cuts short.
-                self.st.borrow_mut().last_activity = Some(Instant::now());
-                self.scroll_to_end();
+                self.st.last_activity = Some(Instant::now());
+                self.scroll_to_end(false);
 
-                let pending = self.st.borrow_mut().pending_prompt.take();
-                if let Some((text, voice)) = pending {
+                if let Some((text, voice)) = self.st.pending_prompt.take() {
                     self.ask(&text, voice);
                     return;
                 }
-                let spoken = self.st.borrow().voice_turn && self.should_speak();
+                let spoken = self.st.voice_turn && self.should_speak();
                 self.maybe_release_mic();
                 if ok
                     && !interrupted
@@ -769,15 +592,15 @@ impl Ui {
                 eprintln!("fsc: {reason}");
             }
             AgentEvent::MemorySaved { ok, facts, error } => {
-                self.st.borrow_mut().memory_saving = false;
+                self.st.memory_saving = false;
                 if ok {
                     self.flash_meta(&format!("MEMORY UPDATED · {facts} FACTS"));
                 } else {
                     eprintln!("fsc: memory not updated: {}", error.unwrap_or_default());
                     self.flash_meta("MEMORY NOT UPDATED");
                 }
-                if self.st.borrow().quitting {
-                    self.app.quit();
+                if self.st.quitting {
+                    self.effects.push(Effect::Quit);
                 }
             }
             AgentEvent::Forgotten => self.flash_meta("MEMORY CLEARED"),
@@ -786,17 +609,14 @@ impl Ui {
                 self.flash_meta_for(&text.to_uppercase(), Duration::from_secs(6));
             }
             AgentEvent::Choices(c) => {
+                if let Some(m) = &c.model
+                    && !m.current.is_empty()
                 {
-                    let mut st = self.st.borrow_mut();
-                    if let Some(m) = &c.model
-                        && !m.current.is_empty()
-                    {
-                        let name = m.current_name();
-                        st.model = if name == m.current { pretty_model(name) } else { name.to_uppercase() };
-                    }
-                    st.choices = c;
+                    let name = m.current_name();
+                    self.st.model = if name == m.current { pretty_model(name) } else { name.to_uppercase() };
                 }
-                if self.st.borrow().meta_timer.is_none() {
+                self.st.choices = c;
+                if !self.st.meta_flashing {
                     self.restore_meta();
                 }
                 self.push_tray();
@@ -804,11 +624,11 @@ impl Ui {
         }
     }
 
-    fn audio_event(self: &Rc<Self>, e: AudioEvent) {
+    fn audio_event(&mut self, e: AudioEvent) {
         match e {
             AudioEvent::Ready { stt, tts, missing_models } => {
-                self.st.borrow_mut().voice = Voice { stt, tts, loaded: true };
-                let voice = self.st.borrow().voice_name.clone();
+                self.st.voice = Voice { stt, tts, loaded: true };
+                let voice = self.st.voice_name.clone();
                 if missing_models && !fsc_core::models::has_voice(&voice) && stt {
                     // Only the voice is missing (a new language, or the
                     // locale's after an update): fetch it now.
@@ -818,33 +638,31 @@ impl Ui {
                 }
             }
             AudioEvent::Voice { voice, ok } => {
-                let sample = {
-                    let mut st = self.st.borrow_mut();
-                    if voice != st.voice_name {
-                        return; // superseded by another choice
-                    }
-                    st.voice.tts = ok;
-                    (ok && st.sample_for.as_deref() == Some(voice.as_str())).then(|| {
-                        st.sample_for = None;
-                        st.spoken.language().phrases.sample
-                    })
-                };
+                let st = &mut self.st;
+                if voice != st.voice_name {
+                    return; // superseded by another choice
+                }
+                st.voice.tts = ok;
+                let sample = (ok && st.sample_for.as_deref() == Some(voice.as_str())).then(|| {
+                    st.sample_for = None;
+                    st.spoken.language().phrases.sample
+                });
                 if let Some(sample) = sample {
                     // Just chosen: let it say hello, whatever `speak` is set to.
                     self.audio.speak(sample);
-                } else if !ok && self.st.borrow().fetching.is_none() {
+                } else if !ok && self.st.fetching.is_none() {
                     self.flash_meta_for(&format!("VOICE {} UNAVAILABLE", voice.to_uppercase()), Duration::from_secs(6));
                 }
                 self.push_tray();
             }
             AudioEvent::Spectrum(bands) => {
-                self.st.borrow_mut().viz.set_spectrum(Some(bands));
+                self.st.viz.set_spectrum(Some(bands));
             }
             AudioEvent::MicWaiting => self.flash_meta_for("WAITING FOR MIC…", Duration::from_secs(15)),
             AudioEvent::MicLive => {
-                if !self.st.borrow().asks.is_empty() {
+                if !self.st.asks.is_empty() {
                     self.flash_meta_for(choices(lang::english()).1, Duration::from_secs(8));
-                } else if self.st.borrow().follow_up {
+                } else if self.st.follow_up {
                     self.flash_meta_for("GO AHEAD · ESC ENDS CONVERSATION", Duration::from_secs(5));
                 } else {
                     self.flash_meta("SPEAK NOW");
@@ -852,38 +670,29 @@ impl Ui {
             }
             AudioEvent::SpeechStarted => {}
             AudioEvent::Transcribing => {
-                {
-                    let mut st = self.st.borrow_mut();
-                    st.listening = None;
-                    st.transcribing = true;
-                    st.viz.set_spectrum(None);
-                }
+                let st = &mut self.st;
+                st.listening = None;
+                st.transcribing = true;
+                st.viz.set_spectrum(None);
                 self.refresh();
             }
             AudioEvent::Transcript(text) => {
-                let was_capturing = {
-                    let mut st = self.st.borrow_mut();
-                    let was = st.listening.is_some() || st.transcribing;
-                    st.listening = None;
-                    st.transcribing = false;
-                    st.viz.set_spectrum(None);
-                    was
-                };
+                let st = &mut self.st;
+                let was_capturing = st.listening.is_some() || st.transcribing;
+                st.listening = None;
+                st.transcribing = false;
+                st.viz.set_spectrum(None);
                 self.refresh();
                 if !was_capturing {
                     return; // cancelled meanwhile
                 }
-                let open = self.st.borrow().asks.first().map(|a| a.ask.id.clone());
-                if let Some(id) = open {
+                if let Some(id) = self.st.asks.first().map(|a| a.ask.id.clone()) {
                     self.spoken_answer(&id, &text);
                     return;
                 }
                 if text.trim().is_empty() {
-                    let gave_up = {
-                        let mut st = self.st.borrow_mut();
-                        st.empty_follow_ups += 1;
-                        st.conversation && st.empty_follow_ups >= MAX_EMPTY_FOLLOW_UPS
-                    };
+                    self.st.empty_follow_ups += 1;
+                    let gave_up = self.st.conversation && self.st.empty_follow_ups >= MAX_EMPTY_FOLLOW_UPS;
                     if gave_up {
                         // Nobody's talking: hang up so the wake word works again.
                         self.hang_up();
@@ -892,38 +701,34 @@ impl Ui {
                         self.maybe_follow_up();
                     }
                 } else {
-                    self.st.borrow_mut().empty_follow_ups = 0;
+                    self.st.empty_follow_ups = 0;
                     self.ask_or_queue(text, true);
                 }
             }
             AudioEvent::NobodySpoke => {
-                {
-                    let mut st = self.st.borrow_mut();
-                    st.listening = None;
-                    st.transcribing = false;
-                    st.viz.set_spectrum(None);
-                }
+                let st = &mut self.st;
+                st.listening = None;
+                st.transcribing = false;
+                st.viz.set_spectrum(None);
                 self.refresh();
                 self.hang_up();
             }
             AudioEvent::SpeakingStarted => {
-                self.st.borrow_mut().speaking = true;
+                self.st.speaking = true;
                 self.refresh();
             }
             AudioEvent::SpeakingDone => {
-                {
-                    let mut st = self.st.borrow_mut();
-                    st.speaking = false;
-                    st.speech_pending = false;
-                    st.viz.set_spectrum(None);
-                }
+                let st = &mut self.st;
+                st.speaking = false;
+                st.speech_pending = false;
+                st.viz.set_spectrum(None);
                 self.refresh();
                 self.maybe_release_mic();
                 self.maybe_follow_up();
             }
             AudioEvent::Wake { command } => self.on_wake(command),
             AudioEvent::MicMissing(name) => {
-                let was = std::mem::replace(&mut self.st.borrow_mut().mic_missing, name.is_some());
+                let was = std::mem::replace(&mut self.st.mic_missing, name.is_some());
                 match name {
                     Some(n) => {
                         // By the name it's listed under, if it's an id.
@@ -942,63 +747,114 @@ impl Ui {
         }
     }
 
+    // --- from the view ------------------------------------------------------
+
+    /// Enter in the text field. Returns whether to clear it.
+    pub fn submit(&mut self, text: &str) -> bool {
+        // "y" / "yes" / "always" / "no" answers an open permission question.
+        let open = self.st.asks.first().map(|a| a.ask.id.clone());
+        let lang = self.st.spoken.language();
+        if let (Some(id), Some(answer)) = (open, permission::parse_answer(text, lang)) {
+            self.answer_ask(&id, answer);
+            return true;
+        }
+        self.ask(text, false)
+    }
+
+    /// A card's button.
+    pub fn answer_button(&mut self, ask_id: &str, label: &str) {
+        let answer = match label {
+            "ALLOW" => Answer::Once,
+            "ALWAYS" => Answer::Always,
+            _ => Answer::Deny,
+        };
+        self.answer_ask(ask_id, answer);
+    }
+
+    /// Ctrl+C with nothing highlighted: stop everything, like a terminal.
+    pub fn stop_all(&mut self) {
+        self.cancel_listen();
+        self.interrupt();
+    }
+
+    pub fn set_entry_empty(&mut self, empty: bool) {
+        self.entry_empty = empty;
+    }
+
+    /// Ctrl+Shift+C: every question and reply shown, as plain text.
+    pub fn copy_history(&mut self) {
+        self.show_current();
+        let text = self.history.text();
+        if text.is_empty() {
+            self.flash_meta("NOTHING TO COPY");
+            return;
+        }
+        self.effects.push(Effect::Copy(text));
+        self.flash_meta("CONVERSATION COPIED");
+    }
+
+    pub fn set_system_colors(&mut self, sys: SystemColors) {
+        self.st.system = sys;
+        self.refresh_palette();
+    }
+
     // --- actions ----------------------------------------------------------
 
     /// Send a prompt. `voice`: it came from speech, so speak the reply.
-    fn ask(self: &Rc<Self>, text: &str, voice: bool) -> bool {
+    fn ask(&mut self, text: &str, voice: bool) -> bool {
         let text = text.trim();
         if text.is_empty() {
             return true;
         }
-        if self.st.borrow().claude.busy() {
+        if self.st.claude.busy() {
             self.flash_meta("BUSY · CTRL+C TO STOP");
             return false;
         }
         self.audio.stop_speaking();
         // A highlight from before is done with: Ctrl+C during this reply stops it.
-        if let Some(l) = self.picked.take().upgrade() {
-            l.select_region(0, 0);
-        }
+        self.effects.push(Effect::ClearPick);
         // Been a while? Start a fresh session (saving memory) before this
         // prompt; the session actor holds the prompt until it's ready.
         if self.session_idle() {
             self.rotate_session();
         }
-        self.st.borrow_mut().session_dirty = true;
+        self.st.session_dirty = true;
 
-        let ex = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        self.show_current();
+        let group = self.history.new_group();
         let prefix = if voice { "󰍬" } else { "›" };
-        let prompt = label(&format!("{prefix} {text}"), "prompt");
-        self.selectable(&prompt);
-        ex.append(&prompt);
-        let reply = label("", "reply");
-        self.selectable(&reply);
-        reply.set_visible(false);
-        ex.append(&reply);
-        self.history.append(&ex);
-        self.trim_history();
-        self.scroller.set_visible(true);
+        self.history.push(group, Kind::Prompt, &format!("{prefix} {text}"));
+        let reply = self.history.push(group, Kind::Reply, "");
+        self.history.set_visible(reply, false);
+        self.history.trim(MAX_EXCHANGES);
+        self.effects.push(Effect::HistoryShown(true));
 
-        {
-            let mut st = self.st.borrow_mut();
-            if let Some(old) = st.current.as_mut() {
-                old.show();
-            }
-            st.current = Some(Exchange::new(reply));
-            st.voice_turn = voice;
-            st.sentences.clear();
-        }
+        let st = &mut self.st;
+        st.current = Some(Exchange { group, reply, text: String::new(), last_tool: None, stale: false });
+        st.voice_turn = voice;
+        st.sentences.clear();
         self.set_claude(Phase::Thinking);
-        match self.st.borrow_mut().language_note.take() {
+        match self.st.language_note.take() {
             Some(note) => self.claude.ask(format!("({note})\n\n{text}")),
             None => self.claude.ask(text),
         }
-        self.scroll_to_end();
+        self.scroll_to_end(true);
         true
     }
 
+    /// Bring the current reply line up to date with its text.
+    fn show_current(&mut self) {
+        if let Some(cur) = self.st.current.as_mut()
+            && std::mem::take(&mut cur.stale)
+        {
+            let (id, text) = (cur.reply, cur.text.trim_start().to_string());
+            self.history.set_text(id, &text);
+            self.history.set_visible(id, true);
+        }
+    }
+
     fn should_speak(&self) -> bool {
-        let st = self.st.borrow();
+        let st = &self.st;
         st.voice.tts
             && match st.speak {
                 SpeakMode::Voice => st.voice_turn,
@@ -1009,23 +865,23 @@ impl Ui {
 
     fn session_idle(&self) -> bool {
         let mins = self.cfg.session_idle_minutes();
-        let st = self.st.borrow();
+        let st = &self.st;
         mins > 0
             && st.session_dirty
             && st.last_activity.is_some_and(|t| t.elapsed() >= Duration::from_secs(mins as u64 * 60))
     }
 
-    /// End the Claude session (saving memory) and mark it in the history.
-    fn rotate_session(&self) {
+    /// End the agent session (saving memory) and mark it in the history.
+    fn rotate_session(&mut self) {
         eprintln!("fsc: session idle, rotating");
         self.end_session(false);
         self.add_divider("NEW SESSION");
     }
 
-    /// End the Claude session, saving memory from it if it had any
+    /// End the agent session, saving memory from it if it had any
     /// exchanges. A fresh session is started unless `quitting`.
-    fn end_session(&self, quitting: bool) {
-        let mut st = self.st.borrow_mut();
+    fn end_session(&mut self, quitting: bool) {
+        let st = &mut self.st;
         let save = st.session_dirty;
         if quitting {
             self.claude.end(save);
@@ -1037,16 +893,14 @@ impl Ui {
         st.last_activity = None;
     }
 
-    /// Hand the conversation to another agent: this session ends (saving
-    /// memory) and the next prompt goes to `kind`. Remembered in the config.
     /// Listen for `phrase` from now on, and save it as `voice.wake_phrase`.
-    fn set_wake_phrase(self: &Rc<Self>, phrase: &str) -> Reply {
+    fn set_wake_phrase(&mut self, phrase: &str) -> Reply {
         let phrase = match fsc_audio::check_wake_phrase(phrase) {
             Ok(p) => p,
             Err(e) => return Reply::err(e),
         };
         self.audio.set_wake_phrase(phrase.clone());
-        self.st.borrow_mut().wake_phrase = phrase.clone();
+        self.st.wake_phrase = phrase.clone();
         self.flash_meta(&format!("WAKE PHRASE: {}", phrase.to_uppercase()));
         match Config::save_value("voice", "wake_phrase", &phrase) {
             Ok(()) => Reply::state(format!("listening for {phrase:?}")),
@@ -1056,11 +910,12 @@ impl Ui {
 
     /// `fsc mic` and the tray's Microphone menu: list the mics, or listen
     /// with another (saved as `voice.input_device`).
-    fn set_mic(self: &Rc<Self>, name: Option<String>) -> Reply {
-        let current = self.st.borrow().mic.clone();
+    fn set_mic(&mut self, name: Option<String>) -> Reply {
+        let current = self.st.mic.clone();
         let is_default = |s: &str| s.trim().is_empty() || s.trim().eq_ignore_ascii_case("default");
-        // A device id (what the tray sends) needs no lookup, so pw-dump isn't
-        // run here on the UI thread: a stuck PipeWire would freeze the popup.
+        // A device id (what the tray sends) needs no lookup, so the mic list
+        // isn't asked for here on the UI thread: a stuck PipeWire would
+        // freeze the popup.
         if let Some(id) = name.as_deref().map(str::trim).filter(|n| fsc_audio::is_device_id(n)) {
             return self.use_mic(id.to_string(), id.to_string());
         }
@@ -1094,24 +949,21 @@ impl Ui {
 
     /// Listen with `setting` (saved as `voice.input_device`). `shown`: its
     /// name; a device id is looked up off the UI thread for the flash.
-    fn use_mic(self: &Rc<Self>, setting: String, shown: String) -> Reply {
+    fn use_mic(&mut self, setting: String, shown: String) -> Reply {
         if fsc_audio::is_device_id(&setting) {
-            let weak = Rc::downgrade(self);
+            let tx = self.events.clone();
             let id = setting.clone();
-            glib::spawn_future_local(async move {
+            tokio::spawn(async move {
                 let mics = tokio::task::spawn_blocking(fsc_audio::microphones).await.unwrap_or_default();
-                if let (Some(ui), Some(m)) = (weak.upgrade(), fsc_audio::which_mic(&id, &mics)) {
-                    ui.flash_meta(&short_meta(&format!("MIC: {}", m.name.to_uppercase())));
+                if let Some(m) = fsc_audio::which_mic(&id, &mics) {
+                    let _ = tx.send(AppEvent::MicName(m.name.clone())).await;
                 }
             });
         }
         self.audio.set_input_device(setting.clone());
-        {
-            let mut st = self.st.borrow_mut();
-            st.mic = setting.clone();
-            // The audio thread says if the new one is missing.
-            st.mic_missing = false;
-        }
+        self.st.mic = setting.clone();
+        // The audio thread says if the new one is missing.
+        self.st.mic_missing = false;
         self.push_tray();
         let flash = if setting.is_empty() { "SYSTEM DEFAULT".to_string() } else { shown.to_uppercase() };
         self.flash_meta(&short_meta(&format!("MIC: {flash}")));
@@ -1122,12 +974,12 @@ impl Ui {
     }
 
     /// `fsc speak` and the tray's Speak replies menu (saved as `voice.speak`).
-    fn set_speak(self: &Rc<Self>, mode: Option<String>) -> Reply {
-        let Some(mode) = mode else { return Reply::state(self.st.borrow().speak.key()) };
+    fn set_speak(&mut self, mode: Option<String>) -> Reply {
+        let Some(mode) = mode else { return Reply::state(self.st.speak.key()) };
         let Some(mode) = SpeakMode::from_key(&mode) else {
             return Reply::err(format!("speak {mode:?}? Use voice (replies to spoken prompts), always or never"));
         };
-        self.st.borrow_mut().speak = mode;
+        self.st.speak = mode;
         self.push_tray();
         if mode == SpeakMode::Never {
             // Quiet now, not after the reply being read.
@@ -1167,9 +1019,9 @@ impl Ui {
     /// `fsc language` and the tray's Language menu: list the languages, or
     /// speak and listen in another (saved as `voice.language`). Its usual
     /// voice comes with it unless the chosen one is already for it.
-    fn set_language(self: &Rc<Self>, code: Option<String>) -> Reply {
+    fn set_language(&mut self, code: Option<String>) -> Reply {
         let Some(code) = code else {
-            let st = self.st.borrow();
+            let st = &self.st;
             let mut lines: Vec<String> = lang::LANGUAGES
                 .iter()
                 .map(|l| {
@@ -1199,18 +1051,15 @@ impl Ui {
         // A voice chosen for the old language doesn't carry over. Saved by
         // name (not left empty) so tools reading the config, like
         // HyprCustard, see which files it needs.
-        let piper_voice = config::voice_for(&spoken, &self.st.borrow().piper_voice);
+        let piper_voice = config::voice_for(&spoken, &self.st.piper_voice);
         let saved = Config::save_value("voice", "language", &setting)
             .and_then(|()| Config::save_value("voice", "piper_voice", &piper_voice));
-        let changed = {
-            let mut st = self.st.borrow_mut();
-            let changed = st.spoken != spoken;
-            st.language = setting;
-            st.spoken = spoken.clone();
-            st.piper_voice = piper_voice;
-            st.sentences.set_language(lang);
-            changed
-        };
+        let st = &mut self.st;
+        let changed = st.spoken != spoken;
+        st.language = setting;
+        st.spoken = spoken.clone();
+        st.piper_voice = piper_voice;
+        st.sentences.set_language(lang);
         if changed {
             let instruction = spoken.instruction();
             let note = instruction.clone().unwrap_or_else(|| "The user now speaks English. Reply in English.".into());
@@ -1218,7 +1067,7 @@ impl Ui {
             // running started with the old language, so it's told with the
             // next prompt.
             self.claude.set_language(instruction);
-            self.st.borrow_mut().language_note = Some(note);
+            self.st.language_note = Some(note);
         }
         let what = if spoken.whisper == spoken.code {
             format!("speaking {}", lang.name)
@@ -1236,11 +1085,8 @@ impl Ui {
     /// `fsc voice` and the tray's Voice menu: list the language's voices, or
     /// speak with another (saved as `voice.piper_voice`; downloaded first
     /// if need be).
-    fn set_voice(self: &Rc<Self>, name: Option<String>) -> Reply {
-        let (code, current) = {
-            let st = self.st.borrow();
-            (st.spoken.code, st.voice_name.clone())
-        };
+    fn set_voice(&mut self, name: Option<String>) -> Reply {
+        let (code, current) = (self.st.spoken.code, self.st.voice_name.clone());
         let Some(name) = name else {
             let mut lines: Vec<String> = fsc_core::voices::for_language(code)
                 .map(|v| {
@@ -1256,7 +1102,7 @@ impl Ui {
         };
         let name = name.trim().to_string();
         let setting = if name.is_empty() || name == "default" {
-            let st = self.st.borrow();
+            let st = &self.st;
             st.spoken.language().voice(&st.spoken.region).to_string()
         } else {
             name
@@ -1265,7 +1111,7 @@ impl Ui {
             if setting.split('-').count() != 3 {
                 return Reply::err(format!("{setting:?} isn't a Piper voice name (like de_DE-thorsten-medium; `fsc voice` lists them)"));
             }
-            if config::voice_language(&setting) != code && self.st.borrow().spoken.whisper == code {
+            if config::voice_language(&setting) != code && self.st.spoken.whisper == code {
                 return Reply::err(format!(
                     "{setting} speaks another language; change the language first (`fsc language {}`)",
                     config::voice_language(&setting)
@@ -1276,7 +1122,7 @@ impl Ui {
         // download shows it does, so a misspelt name isn't kept.
         let known = fsc_core::voices::find(&setting).is_some() || fsc_core::models::has_voice(&setting);
         let saved = {
-            let mut st = self.st.borrow_mut();
+            let st = &mut self.st;
             let previous = std::mem::replace(&mut st.piper_voice, setting.clone());
             if known {
                 st.unsaved = None;
@@ -1288,7 +1134,7 @@ impl Ui {
         };
         let voice = self.apply_voice(true);
         let label = fsc_core::voices::find(&voice).map(|v| v.label).unwrap_or(&voice);
-        let coming = self.st.borrow().wanted.is_some();
+        let coming = self.st.wanted.is_some();
         match saved {
             None => Reply::state(format!("downloading {label}; it's saved as your voice once it's here")),
             Some(Ok(())) if coming => Reply::state(format!("downloading {label}; the current voice speaks until then")),
@@ -1300,10 +1146,10 @@ impl Ui {
     /// Point the audio engine at the language and voice now set, fetching
     /// the voice first if it isn't here. `sample`: say hello in it once
     /// it's loaded. Returns the voice.
-    fn apply_voice(self: &Rc<Self>, sample: bool) -> String {
+    fn apply_voice(&mut self, sample: bool) -> String {
         let here = |v: &str| fsc_core::models::has_voice(v);
         let (whisper, voice, speak_with) = {
-            let mut st = self.st.borrow_mut();
+            let st = &mut self.st;
             let voice = config::voice_for(&st.spoken, &st.piper_voice);
             if sample && voice != st.voice_name {
                 st.sample_for = Some(voice.clone());
@@ -1334,9 +1180,9 @@ impl Ui {
     }
 
     /// Download `voice` in the background (once at a time per voice).
-    fn fetch_voice(self: &Rc<Self>, voice: &str) {
+    fn fetch_voice(&mut self, voice: &str) {
         {
-            let mut st = self.st.borrow_mut();
+            let st = &mut self.st;
             if st.downloads.iter().any(|v| v == voice) {
                 // Already coming: just show its progress again.
                 if st.fetching.as_ref().is_none_or(|(v, _)| v != voice) {
@@ -1367,7 +1213,7 @@ impl Ui {
                     };
                     if pct != last && pct % 5 == 0 {
                         last = pct;
-                        let _ = tx.send_blocking(crate::AppEvent::VoiceFetch { voice: voice.clone(), progress: Ok(Some(pct)) });
+                        let _ = tx.send_blocking(AppEvent::VoiceFetch { voice: voice.clone(), progress: Ok(Some(pct)) });
                     }
                 });
                 if let Err(e) = r {
@@ -1375,25 +1221,20 @@ impl Ui {
                     break;
                 }
             }
-            let _ = tx.send_blocking(crate::AppEvent::VoiceFetch { voice, progress: result });
+            let _ = tx.send_blocking(AppEvent::VoiceFetch { voice, progress: result });
         });
     }
 
-    fn voice_fetch(self: &Rc<Self>, voice: String, progress: Result<Option<u32>, String>) {
-        let current = {
-            let st = self.st.borrow();
-            st.wanted.as_deref() == Some(voice.as_str()) || st.voice_name == voice
-        };
+    fn voice_fetch(&mut self, voice: String, progress: Result<Option<u32>, String>) {
+        let current = self.st.wanted.as_deref() == Some(voice.as_str()) || self.st.voice_name == voice;
         match progress {
             Ok(Some(pct)) => {
-                {
-                    let mut st = self.st.borrow_mut();
-                    if current && st.fetching.is_none() {
-                        st.fetching = Some((voice.clone(), pct));
-                    }
-                    if let Some(f) = st.fetching.as_mut().filter(|(v, _)| *v == voice) {
-                        f.1 = pct;
-                    }
+                let st = &mut self.st;
+                if current && st.fetching.is_none() {
+                    st.fetching = Some((voice.clone(), pct));
+                }
+                if let Some(f) = st.fetching.as_mut().filter(|(v, _)| *v == voice) {
+                    f.1 = pct;
                 }
                 if current {
                     self.flash_meta_for(&format!("DOWNLOADING VOICE · {pct}%"), Duration::from_secs(60));
@@ -1403,18 +1244,16 @@ impl Ui {
                 eprintln!("fsc: downloaded voice {voice}");
                 self.end_fetch(&voice);
                 if current {
-                    let unsaved = {
-                        let mut st = self.st.borrow_mut();
-                        st.wanted = None;
-                        st.voice_name = voice.clone();
-                        st.unsaved.take_if(|(v, _)| *v == voice)
-                    };
+                    let st = &mut self.st;
+                    st.wanted = None;
+                    st.voice_name = voice.clone();
+                    let unsaved = st.unsaved.take_if(|(v, _)| *v == voice);
                     if unsaved.is_some()
                         && let Err(e) = Config::save_value("voice", "piper_voice", &voice)
                     {
                         eprintln!("fsc: could not save the voice: {e:#}");
                     }
-                    let whisper = self.st.borrow().spoken.whisper.clone();
+                    let whisper = self.st.spoken.whisper.clone();
                     self.audio.set_language(whisper, voice);
                     self.restore_meta();
                 }
@@ -1422,15 +1261,13 @@ impl Ui {
             Err(e) => {
                 eprintln!("fsc: could not download voice {voice}: {e}");
                 self.end_fetch(&voice);
-                {
-                    // Back to what was there: the voice in use speaks on.
-                    let mut st = self.st.borrow_mut();
-                    if st.wanted.as_deref() == Some(voice.as_str()) {
-                        st.wanted = None;
-                    }
-                    if let Some((_, previous)) = st.unsaved.take_if(|(v, _)| *v == voice) {
-                        st.piper_voice = previous;
-                    }
+                // Back to what was there: the voice in use speaks on.
+                let st = &mut self.st;
+                if st.wanted.as_deref() == Some(voice.as_str()) {
+                    st.wanted = None;
+                }
+                if let Some((_, previous)) = st.unsaved.take_if(|(v, _)| *v == voice) {
+                    st.piper_voice = previous;
                 }
                 if current {
                     self.flash_meta_for("VOICE DOWNLOAD FAILED", Duration::from_secs(8));
@@ -1442,23 +1279,24 @@ impl Ui {
     }
 
     /// `voice`'s download is over (another may have started since).
-    fn end_fetch(&self, voice: &str) {
-        let mut st = self.st.borrow_mut();
+    fn end_fetch(&mut self, voice: &str) {
+        let st = &mut self.st;
         st.downloads.retain(|v| v != voice);
         if st.fetching.as_ref().is_some_and(|(v, _)| v == voice) {
             st.fetching = None;
         }
     }
 
-    fn switch_agent(self: &Rc<Self>, kind: AgentKind) -> Reply {
+    /// Hand the conversation to another agent: this session ends (saving
+    /// memory) and the next prompt goes to `kind`. Remembered in the config.
+    fn switch_agent(&mut self, kind: AgentKind) -> Reply {
         // Reread the config so edits to the agent's own table count.
         let mut cfg = Config::load().unwrap_or_else(|e| {
             eprintln!("fsc: {e:#}; using the settings fscd started with");
             self.cfg.clone()
         });
-        let agents = AgentKind::ALL.map(|k| cfg.available(k));
-        self.st.borrow_mut().agents = agents;
-        if kind == self.st.borrow().agent {
+        self.st.agents = AgentKind::ALL.map(|k| cfg.available(k));
+        if kind == self.st.agent {
             self.push_tray();
             return Reply::state(format!("already using {}", kind.name()));
         }
@@ -1477,7 +1315,7 @@ impl Ui {
             eprintln!("fsc: could not save the agent choice: {e:#}");
         }
         {
-            let mut st = self.st.borrow_mut();
+            let st = &mut self.st;
             self.claude.switch(&cfg, st.session_dirty);
             // Whether this session saves follows the setting it started
             // with; the next one goes by the config as it is now.
@@ -1501,59 +1339,48 @@ impl Ui {
 
     /// Called every minute: rotate an idle session in the background so the
     /// next question doesn't wait for the memory save.
-    pub fn tick_idle(&self) {
-        let quiet = {
-            let st = self.st.borrow();
-            !st.claude.busy() && !st.conversation && st.listening.is_none() && !st.speaking && !st.transcribing
-        };
+    pub fn tick_idle(&mut self) {
+        let st = &self.st;
+        let quiet = !st.claude.busy() && !st.conversation && st.listening.is_none() && !st.speaking && !st.transcribing;
         if quiet && self.session_idle() {
             self.rotate_session();
         }
     }
 
-    fn add_divider(&self, text: &str) {
-        if self.history.first_child().is_none() {
+    fn add_divider(&mut self, text: &str) {
+        if self.history.is_empty() {
             return;
         }
         let time = crate::log::now("%H:%M");
-        self.history.append(&label(&format!("— {text} · {time} —"), "note"));
-        self.trim_history();
+        self.history.push_item(Kind::Note, &format!("— {text} · {time} —"));
+        self.history.trim(MAX_EXCHANGES);
     }
 
     /// Quit, saving memory first if this session had any exchanges (or
     /// waiting for a save already under way).
-    fn quit(self: &Rc<Self>) {
-        let wait = {
-            let mut st = self.st.borrow_mut();
-            let wait = (st.memory_on && st.session_dirty || st.memory_saving) && !st.quitting;
-            st.quitting = true;
-            wait
-        };
+    fn quit(&mut self) {
+        let st = &mut self.st;
+        let wait = (st.memory_on && st.session_dirty || st.memory_saving) && !st.quitting;
+        st.quitting = true;
         if !wait {
-            self.app.quit();
+            self.effects.push(Effect::Quit);
             return;
         }
         // Also when a save is already running (from an idle rotation), so
         // no new session is started after it.
         self.end_session(true);
-        self.flash_meta_for("SAVING MEMORY…", Duration::from_secs(30));
+        self.flash_meta_for("SAVING MEMORY…", QUIT_WAIT);
         // Don't hang forever if the save stalls.
-        let app = self.app.clone();
-        glib::timeout_add_local_once(Duration::from_secs(30), move || app.quit());
+        self.timer(QUIT_WAIT, Timer::QuitAnyway);
     }
 
     /// The wake phrase was heard ("fishsticks[, <command>]").
-    fn on_wake(self: &Rc<Self>, command: Option<String>) {
+    fn on_wake(&mut self, command: Option<String>) {
         self.show(false);
-        let start_conversation = self.cfg.voice.conversation && !self.st.borrow().conversation;
-        {
-            let mut st = self.st.borrow_mut();
-            st.empty_follow_ups = 0;
-            if start_conversation {
-                st.conversation = true;
-            }
-        }
+        let start_conversation = self.cfg.voice.conversation && !self.st.conversation;
+        self.st.empty_follow_ups = 0;
         if start_conversation {
+            self.st.conversation = true;
             self.audio.set_conversation(true);
         }
         match command {
@@ -1566,9 +1393,9 @@ impl Ui {
 
     /// Send now, or, if a turn is still winding down, interrupt it and send
     /// when it ends. Spoken prompts are never thrown away as "busy".
-    fn ask_or_queue(self: &Rc<Self>, text: String, voice: bool) {
-        if self.st.borrow().claude.busy() {
-            self.st.borrow_mut().pending_prompt = Some((text, voice));
+    fn ask_or_queue(&mut self, text: String, voice: bool) {
+        if self.st.claude.busy() {
+            self.st.pending_prompt = Some((text, voice));
             self.interrupt();
             self.flash_meta("STOPPING · THEN ASKING");
         } else {
@@ -1582,47 +1409,42 @@ impl Ui {
     /// Without a conversation, the mic was only held for this reply: let it
     /// go once the turn and its speech are both finished.
     fn maybe_release_mic(&self) {
-        let done = {
-            let st = self.st.borrow();
-            !st.conversation && !st.claude.busy() && !st.speaking && !st.speech_pending && st.listening.is_none()
-        };
-        if done {
+        let st = &self.st;
+        if !st.conversation && !st.claude.busy() && !st.speaking && !st.speech_pending && st.listening.is_none() {
             self.audio.release_mic();
         }
     }
 
-    fn speak(&self, text: String) {
-        self.st.borrow_mut().speech_pending = true;
+    fn speak(&mut self, text: String) {
+        self.st.speech_pending = true;
         self.audio.speak(text);
     }
 
     /// In a conversation, start listening again once the reply is fully
-    /// done: Claude's turn finished and nothing left to say.
-    fn maybe_follow_up(self: &Rc<Self>) {
-        let ready = {
-            let st = self.st.borrow();
-            // A permission question asked by voice: listen for the answer.
-            let answering = !st.asks.is_empty() && st.voice_turn && st.answer_tries < MAX_ANSWER_TRIES;
-            let next_question = st.conversation && !st.claude.busy() && st.empty_follow_ups < MAX_EMPTY_FOLLOW_UPS;
-            (answering || next_question)
-                && !st.speaking
-                && !st.speech_pending
-                && st.listening.is_none()
-                && !st.transcribing
-        };
+    /// done: the agent's turn finished and nothing left to say.
+    fn maybe_follow_up(&mut self) {
+        let st = &self.st;
+        // A permission question asked by voice: listen for the answer.
+        let answering = !st.asks.is_empty() && st.voice_turn && st.answer_tries < MAX_ANSWER_TRIES;
+        let next_question = st.conversation && !st.claude.busy() && st.empty_follow_ups < MAX_EMPTY_FOLLOW_UPS;
+        let ready = (answering || next_question)
+            && !st.speaking
+            && !st.speech_pending
+            && st.listening.is_none()
+            && !st.transcribing;
         if ready && self.is_open() {
             self.listen_inner(true);
         }
     }
 
     /// User-initiated listening (hotkey, tray, `fsc listen`).
-    fn listen(self: &Rc<Self>) {
-        self.st.borrow_mut().empty_follow_ups = 0;
+    fn listen(&mut self) {
+        self.st.empty_follow_ups = 0;
         self.listen_inner(false);
     }
 
-    fn listen_inner(self: &Rc<Self>, follow_up: bool) {
-        let voice = self.st.borrow().voice;
+    fn listen_inner(&mut self, follow_up: bool) {
+        let voice = self.st.voice;
         self.show(false);
         if !voice.loaded {
             self.flash_meta("VOICE MODELS STILL LOADING");
@@ -1632,25 +1454,21 @@ impl Ui {
             self.flash_meta("NO SPEECH MODEL · FSC FETCH-MODELS");
             return;
         }
-        if self.st.borrow().listening.is_some() {
+        if self.st.listening.is_some() {
             return;
         }
         // Barge-in: talking over a reply stops it.
         if !follow_up {
             self.interrupt();
         }
-        let start_conversation = self.cfg.voice.conversation && !self.st.borrow().conversation;
-        {
-            let mut st = self.st.borrow_mut();
-            st.listening = Some(Instant::now());
-            st.transcribing = false;
-            st.follow_up = follow_up;
-            st.viz.set_spectrum(None);
-            if start_conversation {
-                st.conversation = true;
-            }
-        }
+        let start_conversation = self.cfg.voice.conversation && !self.st.conversation;
+        let st = &mut self.st;
+        st.listening = Some(Instant::now());
+        st.transcribing = false;
+        st.follow_up = follow_up;
+        st.viz.set_spectrum(None);
         if start_conversation {
+            st.conversation = true;
             self.audio.set_conversation(true);
         }
         if follow_up {
@@ -1662,9 +1480,8 @@ impl Ui {
     }
 
     /// `fsc stop` / push-to-talk release.
-    fn stop(self: &Rc<Self>) {
-        let listening = self.st.borrow().listening;
-        match listening {
+    fn stop(&mut self) {
+        match self.st.listening {
             // A quick tap: keep listening, the VAD ends the utterance.
             Some(t) if t.elapsed() < TAP => {}
             Some(_) => self.audio.finish(),
@@ -1675,19 +1492,18 @@ impl Ui {
     /// Push-to-talk released. Only ends a recording: if the VAD already ended
     /// it (you paused before letting go), the question is on its way and must
     /// not be interrupted.
-    fn release(self: &Rc<Self>) {
-        let listening = self.st.borrow().listening;
-        if let Some(t) = listening
+    fn release(&mut self) {
+        if let Some(t) = self.st.listening
             && t.elapsed() >= TAP
         {
             self.audio.finish();
         }
     }
 
-    /// Stop the reply: Claude's turn and any speech.
-    fn interrupt(&self) {
+    /// Stop the reply: the agent's turn and any speech.
+    fn interrupt(&mut self) {
         self.audio.stop_speaking();
-        let mut st = self.st.borrow_mut();
+        let st = &mut self.st;
         st.sentences.clear();
         st.speech_pending = false;
         if st.claude.busy() {
@@ -1695,145 +1511,101 @@ impl Ui {
         }
     }
 
-    fn cancel_listen(&self) {
-        let was = {
-            let mut st = self.st.borrow_mut();
-            // Also abandon a transcription in progress: its transcript is then
-            // dropped when it arrives instead of being sent.
-            let was = st.listening.take().is_some() | std::mem::take(&mut st.transcribing);
-            if was {
-                st.viz.set_spectrum(None);
-            }
-            was
-        };
+    fn cancel_listen(&mut self) {
+        let st = &mut self.st;
+        // Also abandon a transcription in progress: its transcript is then
+        // dropped when it arrives instead of being sent.
+        let was = st.listening.take().is_some() | std::mem::take(&mut st.transcribing);
         if was {
+            st.viz.set_spectrum(None);
             self.audio.cancel();
             self.refresh();
         }
     }
 
-    fn new_conversation(self: &Rc<Self>) {
+    pub fn new_conversation(&mut self) {
         self.cancel_listen();
         self.audio.stop_speaking();
         self.end_session(false);
-        while let Some(child) = self.history.first_child() {
-            self.history.remove(&child);
-        }
-        self.scroller.set_visible(false);
+        self.history.clear();
+        self.effects.push(Effect::HistoryShown(false));
         self.flash_meta("NEW CONVERSATION");
     }
 
-    fn headless(&self) -> bool {
-        self.cfg.ui.surface == Surface::Headless
-    }
-
-    /// The popup is up, or, headless, a voice session is running.
-    fn is_open(&self) -> bool {
-        if self.headless() { self.open.get() } else { self.window.is_visible() }
-    }
-
-    fn show(&self, focus: bool) {
-        self.open.set(true);
+    fn show(&mut self, focus: bool) {
+        self.open = true;
         if self.headless() {
             self.push_tray();
             return;
         }
-        self.refresh_palette();
-        self.window.set_visible(true);
-        self.window.present();
-        if focus {
-            self.entry.grab_focus();
-        }
+        self.effects.push(Effect::Show { focus });
     }
 
-    fn hide(&self) {
+    pub fn hide(&mut self) {
         // Closing the popup is a "no" to anything still waiting for permission.
-        let open: Vec<String> = self.st.borrow().asks.iter().map(|a| a.ask.id.clone()).collect();
+        let open: Vec<String> = self.st.asks.iter().map(|a| a.ask.id.clone()).collect();
         for id in open {
             self.claude.answer(&id, Answer::Deny);
             self.close_ask(&id, "✕ DENIED (CLOSED)");
         }
         self.cancel_listen();
         self.end_conversation();
-        self.open.set(false);
-        self.window.set_visible(false);
-        self.st.borrow_mut().last_frame = None;
+        self.open = false;
+        if !self.headless() {
+            self.effects.push(Effect::Hide);
+        }
     }
 
-    /// Claude wants to use a tool that needs your OK: show a card with
+    /// The agent wants to use a tool that needs your OK: show a card with
     /// buttons and, in a voice turn, ask out loud and listen for the answer.
-    fn on_permission(self: &Rc<Self>, ask: PermissionAsk) {
+    fn on_permission(&mut self, ask: PermissionAsk) {
         if !self.is_open() || self.headless() {
             self.show(false);
             let how = if self.headless() { " (fsc allow / fsc deny)" } else { "" };
-            notify(&format!("{} wants to {}.{how}", self.st.borrow().agent.name(), ask.action));
+            notify(&format!("{} wants to {}.{how}", self.st.agent.name(), ask.action));
         }
-        let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        card.add_css_class("ask");
-        card.append(&label(&format!("󰒓  {} · ALLOW?", ask.tool.to_uppercase()), "tool"));
-        card.append(&label(&sentence(&ask.action), "ask-action"));
-        if let Some(d) = &ask.detail {
-            let l = label(d, "ask-detail");
-            self.selectable(&l);
-            card.append(&l);
-        }
-        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        for (text, answer) in [("ALLOW", Answer::Once), ("ALWAYS", Answer::Always), ("DENY", Answer::Deny)] {
-            if answer == Answer::Always && !ask.can_always {
-                continue;
-            }
-            let b = gtk::Button::with_label(text);
-            b.add_css_class("ask-button");
-            if answer == Answer::Once {
-                b.add_css_class("allow");
-            }
-            b.set_focus_on_click(false);
-            let weak = Rc::downgrade(self);
-            let id = ask.id.clone();
-            b.connect_clicked(move |_| {
-                if let Some(ui) = weak.upgrade() {
-                    ui.answer_ask(&id, answer);
-                }
-            });
-            buttons.append(&b);
-        }
-        card.append(&buttons);
-
-        let first = {
-            let mut st = self.st.borrow_mut();
-            // The card names the tool itself; drop the plain line just shown for it.
-            if let Some(cur) = st.current.as_mut()
-                && cur.last_tool.as_ref().is_some_and(|(t, _)| *t == ask.tool)
-                && let Some((_, l)) = cur.last_tool.take()
-                && let Some(parent) = l.parent().and_downcast::<gtk::Box>()
-            {
-                parent.remove(&l);
-            }
-            match st.current.as_ref().and_then(|c| c.reply.parent().map(|p| (p, c.reply.clone()))) {
-                // Like tool labels: above the reply text.
-                Some((parent, reply)) => card.insert_before(&parent, Some(&reply)),
-                None => self.history.append(&card),
-            }
-            st.asks.push(OpenAsk { ask: ask.clone(), card, buttons });
-            st.asks.len() == 1
+        let buttons: Vec<&str> = [("ALLOW", Answer::Once), ("ALWAYS", Answer::Always), ("DENY", Answer::Deny)]
+            .into_iter()
+            .filter(|(_, a)| *a != Answer::Always || ask.can_always)
+            .map(|(t, _)| t)
+            .collect();
+        let card = Card {
+            ask_id: ask.id.clone(),
+            action: sentence(&ask.action),
+            detail: ask.detail.clone().unwrap_or_default(),
+            buttons: buttons.join(","),
+            answered: false,
+            note: String::new(),
         };
+        // The card names the tool itself; drop the plain line just shown for it.
+        if let Some(cur) = self.st.current.as_mut()
+            && cur.last_tool.as_ref().is_some_and(|(t, _)| *t == ask.tool)
+            && let Some((_, line)) = cur.last_tool.take()
+        {
+            self.history.remove(line);
+        }
+        // Like tool lines: above the reply text.
+        let reply = self.st.current.as_ref().map(|c| c.reply);
+        let id = self.history.insert_card(reply, &format!("󰒓  {} · ALLOW?", ask.tool.to_uppercase()), card);
+        self.effects.push(Effect::HistoryShown(true));
+        self.st.asks.push(OpenAsk { ask: ask.clone(), card: id });
+        let first = self.st.asks.len() == 1;
         self.set_claude(Phase::Asking);
-        self.scroll_to_end();
+        self.scroll_to_end(false);
         if first {
             self.put_question(&ask);
         }
     }
 
     /// Read the question aloud (when replies are spoken) and listen for the answer.
-    fn put_question(self: &Rc<Self>, ask: &PermissionAsk) {
-        self.st.borrow_mut().answer_tries = 0;
+    fn put_question(&mut self, ask: &PermissionAsk) {
+        self.st.answer_tries = 0;
         if self.should_speak() {
             // Finish the sentence in progress first.
-            let rest = self.st.borrow_mut().sentences.flush();
-            if let Some(rest) = rest {
+            if let Some(rest) = self.st.sentences.flush() {
                 self.speak(rest);
             }
-            let lang = self.st.borrow().spoken.language();
+            let lang = self.st.spoken.language();
             let question = if lang.is_english() {
                 ask.spoken.clone()
             } else {
@@ -1848,8 +1620,8 @@ impl Ui {
     /// An answer heard on the mic. "Always" counts as a plain yes: anything
     /// within earshot (a video, a call on speaker) can say it, and a saved
     /// rule outlives the moment. ALWAYS takes a click, or typing it.
-    fn spoken_answer(self: &Rc<Self>, id: &str, text: &str) {
-        let lang = self.st.borrow().spoken.language();
+    fn spoken_answer(&mut self, id: &str, text: &str) {
+        let lang = self.st.spoken.language();
         if let Some(answer) = permission::parse_answer(text, lang) {
             if answer == Answer::Always {
                 self.answer_ask_noted(id, Answer::Once, "✓ ALLOWED ONCE · ALWAYS NEEDS A CLICK");
@@ -1858,12 +1630,8 @@ impl Ui {
             }
             return;
         }
-        let tries = {
-            let mut st = self.st.borrow_mut();
-            st.answer_tries += 1;
-            st.answer_tries
-        };
-        if tries < MAX_ANSWER_TRIES {
+        self.st.answer_tries += 1;
+        if self.st.answer_tries < MAX_ANSWER_TRIES {
             let (spoken, meta) = choices(lang);
             self.flash_meta(meta);
             if !text.trim().is_empty() && self.should_speak() {
@@ -1875,9 +1643,9 @@ impl Ui {
         }
     }
 
-    fn answer_ask(self: &Rc<Self>, id: &str, answer: Answer) {
+    fn answer_ask(&mut self, id: &str, answer: Answer) {
         // Nothing can be saved for this request: an "always" is a plain allow.
-        let can_always = self.st.borrow().asks.iter().find(|a| a.ask.id == id).is_some_and(|a| a.ask.can_always);
+        let can_always = self.st.asks.iter().find(|a| a.ask.id == id).is_some_and(|a| a.ask.can_always);
         let answer = if answer == Answer::Always && !can_always { Answer::Once } else { answer };
         let note = match answer {
             Answer::Once => "✓ ALLOWED",
@@ -1888,14 +1656,13 @@ impl Ui {
     }
 
     /// Send `answer`, mark the card with `note`, and move on to the next question.
-    fn answer_ask_noted(self: &Rc<Self>, id: &str, answer: Answer, note: &str) {
+    fn answer_ask_noted(&mut self, id: &str, answer: Answer, note: &str) {
         self.claude.answer(id, answer);
         self.close_ask(id, note);
-        let next = self.st.borrow().asks.first().map(|a| a.ask.clone());
-        match next {
+        match self.st.asks.first().map(|a| a.ask.clone()) {
             Some(ask) => self.put_question(&ask),
             None => {
-                if self.st.borrow().claude == Phase::Asking {
+                if self.st.claude == Phase::Asking {
                     self.set_claude(Phase::Working);
                 }
             }
@@ -1903,102 +1670,84 @@ impl Ui {
     }
 
     /// Replace a question's buttons with what became of it.
-    fn close_ask(&self, id: &str, note: &str) {
-        let (open, none_left) = {
-            let mut st = self.st.borrow_mut();
-            let Some(i) = st.asks.iter().position(|a| a.ask.id == id) else { return };
-            let open = st.asks.remove(i);
-            st.answer_tries = 0;
-            (open, st.asks.is_empty())
-        };
-        open.card.remove(&open.buttons);
-        open.card.add_css_class("answered");
-        open.card.append(&label(note, "note"));
+    fn close_ask(&mut self, id: &str, note: &str) {
+        let Some(i) = self.st.asks.iter().position(|a| a.ask.id == id) else { return };
+        let open = self.st.asks.remove(i);
+        self.st.answer_tries = 0;
+        let none_left = self.st.asks.is_empty();
+        self.history.update(open.card, |b| {
+            b.card.buttons.clear();
+            b.card.answered = true;
+            b.card.note = note.to_string();
+        });
         // Was listening for the answer: don't let that turn into a new prompt.
-        if none_left && self.st.borrow().listening.is_some() && self.st.borrow().claude.busy() {
+        if none_left && self.st.listening.is_some() && self.st.claude.busy() {
             self.cancel_listen();
         }
     }
 
     /// Nobody spoke: end the conversation and, like ending a call, put the
     /// popup away shortly after, unless you've started something meanwhile.
-    fn hang_up(self: &Rc<Self>) {
+    fn hang_up(&mut self) {
         self.end_conversation();
         self.flash_meta_for("CONVERSATION ENDED", HANG_UP_CLOSE);
-        let weak = Rc::downgrade(self);
-        glib::timeout_add_local_once(HANG_UP_CLOSE, move || {
-            let Some(ui) = weak.upgrade() else { return };
-            let idle = {
-                let st = ui.st.borrow();
-                !st.conversation
-                    && st.listening.is_none()
-                    && !st.transcribing
-                    && !st.claude.busy()
-                    && !st.speaking
-                    && !st.speech_pending
-            };
-            if idle && ui.entry.text().is_empty() && ui.is_open() {
-                ui.hide();
-            }
-        });
+        self.timer(HANG_UP_CLOSE, Timer::HangUp);
     }
 
     /// "Hang up": stop speaking and release the mic so the headset can go
     /// back to its high-quality playback profile. A reply still streaming
     /// finishes as text (with a notification, since the popup is hidden).
-    fn end_conversation(&self) {
-        let was = {
-            let mut st = self.st.borrow_mut();
-            let was = st.conversation;
-            st.conversation = false;
-            st.follow_up = false;
-            if was {
-                st.voice_turn = false;
-                st.speech_pending = false;
-                st.sentences.clear();
-            }
-            was
-        };
+    fn end_conversation(&mut self) {
+        let st = &mut self.st;
+        let was = st.conversation;
+        st.conversation = false;
+        st.follow_up = false;
         if was {
+            st.voice_turn = false;
+            st.speech_pending = false;
+            st.sentences.clear();
             self.audio.stop_speaking();
             self.audio.set_conversation(false);
         }
     }
 
-    // --- state helpers --------------------------------------------------------
+    // --- drawing --------------------------------------------------------------
 
-    /// Where the header, visualiser and text sit, in panel coordinates.
-    fn panel_regions(&self, h: f64) -> panel::Regions {
-        let bounds = |w: &gtk::Widget| w.compute_bounds(&self.panel).map(|b| (b.y() as f64, (b.y() + b.height()) as f64));
-        let (_, header_bottom) = bounds(self.status.upcast_ref()).unwrap_or((0.0, 40.0));
-        let (graphic_top, graphic_bottom) =
-            bounds(self.viz_area.upcast_ref()).unwrap_or((header_bottom + 16.0, header_bottom + 104.0));
-        let text_widget: &gtk::Widget =
-            if self.scroller.is_visible() { self.scroller.upcast_ref() } else { self.entry.upcast_ref() };
-        let (text_top, _) = bounds(text_widget).unwrap_or((graphic_bottom + 16.0, h));
-        panel::Regions { header_bottom, graphic_top, graphic_bottom, text_top }
+    /// One animation frame: `dt` seconds since the last, the visualiser `w` wide.
+    pub fn frame(&mut self, dt: f64, viz_w: f64) {
+        let dt = if dt.is_finite() { dt.clamp(0.0, 0.1) } else { 0.016 };
+        self.st.clock += dt;
+        self.st.viz.tick(dt as f32, viz_w);
     }
 
-    fn set_claude(&self, p: Phase) {
-        self.st.borrow_mut().claude = p;
-        self.refresh();
+    pub fn draw_viz(&self, w: f64, h: f64, scale: f64) -> Option<Frame> {
+        let mut c = Canvas::new(w, h, scale)?;
+        self.st.viz.draw(&mut c, w, h, &self.st.palette);
+        Some(c.frame())
     }
 
-    /// Re-derive the displayed phase and push it everywhere.
-    fn refresh(&self) {
-        {
-            let mut st = self.st.borrow_mut();
-            st.viz.phase = st.phase();
+    /// The dot-matrix status line, with a blinking record dot while listening.
+    pub fn draw_status(&self, w: f64, h: f64, scale: f64) -> Option<Frame> {
+        let mut c = Canvas::new(w, h, scale)?;
+        let st = &self.st;
+        let p = &st.palette;
+        let phase = st.phase();
+        let y = (h - (dotfont::ROWS - 1) as f64 * STATUS_PITCH) / 2.0;
+        let mut x = STATUS_DOT;
+        if phase == Phase::Listening {
+            let a = 0.55 + 0.45 * (st.clock * 4.0).sin().abs();
+            c.fill_circle(4.0, h / 2.0, 4.0, p.accent, a);
+            x += 14.0;
         }
-        self.status.queue_draw();
-        self.push_tray();
+        let on = if matches!(phase, Phase::Error | Phase::Asking) { p.accent } else { p.fg };
+        dotfont::draw(&mut c, phase.label(), x, y, STATUS_PITCH, STATUS_DOT, (on, 1.0), (p.fg, 0.10), Some((p.bg, 0.5)));
+        Some(c.frame())
     }
 
-    fn set_theme(self: &Rc<Self>, mode: ThemeMode) {
-        self.st.borrow_mut().theme = mode;
-        self.push_tray();
-        // GTK reloads its theme for the new scheme in its own time.
-        self.refresh_palette_soon();
+    pub fn draw_panel(&self, w: f64, h: f64, regions: panel::Regions, scale: f64) -> Option<Frame> {
+        let mut c = Canvas::new(w, h, scale)?;
+        panel::draw(&mut c, w, h, &self.st.palette, regions, self.panel_look());
+        Some(c.frame())
     }
 
     fn panel_look(&self) -> panel::Look {
@@ -2009,34 +1758,38 @@ impl Ui {
         }
     }
 
-    /// Re-read colours from the GTK theme and the desktop accent.
-    fn refresh_palette(&self) {
-        let palette = {
-            let st = self.st.borrow();
-            let accent = self.accent_pin.or(st.desktop_accent);
-            Palette::from_theme(self.window.upcast_ref(), accent, st.theme)
-        };
-        if self.st.borrow().palette == palette {
-            return;
+    // --- state helpers --------------------------------------------------------
+
+    fn set_claude(&mut self, p: Phase) {
+        self.st.claude = p;
+        self.refresh();
+    }
+
+    /// Re-derive the displayed phase and push it everywhere.
+    fn refresh(&mut self) {
+        self.st.viz.phase = self.st.phase();
+        self.push_tray();
+    }
+
+    fn set_theme(&mut self, mode: ThemeMode) {
+        self.st.theme = mode;
+        self.push_tray();
+        self.refresh_palette();
+    }
+
+    /// Re-read colours from the desktop palette and accent.
+    fn refresh_palette(&mut self) {
+        let st = &self.st;
+        let accent = self.accent_pin.or(st.desktop_accent);
+        let palette = Palette::from_system(st.system, accent, st.theme);
+        if st.palette != palette {
+            self.st.palette = palette;
+            self.effects.push(Effect::Palette);
         }
-        self.st.borrow_mut().palette = palette;
-        self.css.load_from_string(&palette.css(&self.cfg.ui.font));
-        self.panel.queue_draw();
-        self.viz_area.queue_draw();
-        self.status.queue_draw();
     }
 
-    fn refresh_palette_soon(self: &Rc<Self>) {
-        let weak = Rc::downgrade(self);
-        glib::timeout_add_local_once(Duration::from_millis(250), move || {
-            if let Some(ui) = weak.upgrade() {
-                ui.refresh_palette();
-            }
-        });
-    }
-
-    fn push_tray(&self) {
-        let mut st = self.st.borrow_mut();
+    fn push_tray(&mut self) {
+        let st = &mut self.st;
         let state = IconState {
             phase: st.phase(),
             theme: st.theme,
@@ -2066,19 +1819,24 @@ impl Ui {
         }
     }
 
-    fn restore_meta(&self) {
-        let st = self.st.borrow();
+    fn set_meta(&mut self, text: String) {
+        if self.meta != text {
+            self.meta = text.clone();
+            self.effects.push(Effect::Meta(text));
+        }
+    }
+
+    fn restore_meta(&mut self) {
+        let st = &self.st;
         let mode = st.choices.mode.as_ref().map(|m| format!("{}  ·  ", m.current_name().to_uppercase())).unwrap_or_default();
-        self.meta.set_text(&format!("{}  ·  {mode}⏎ SEND  ·  ESC", st.model));
+        let text = format!("{}  ·  {mode}⏎ SEND  ·  ESC", st.model);
+        self.set_meta(text);
     }
 
     /// `fsc model` / `fsc mode` and the tray's Model and Mode menus: list
     /// what the agent offers, or switch (saved in the agent's config table).
-    fn set_choice(self: &Rc<Self>, which: Setting, value: Option<String>) -> Reply {
-        let (agent, sel) = {
-            let st = self.st.borrow();
-            (st.agent, st.choices.get(which).cloned())
-        };
+    fn set_choice(&mut self, which: Setting, value: Option<String>) -> Reply {
+        let (agent, sel) = (self.st.agent, self.st.choices.get(which).cloned());
         let what = if which == Setting::Mode { "mode" } else { "model" };
         let Some(value) = value else {
             let Some(sel) = sel else {
@@ -2114,144 +1872,33 @@ impl Ui {
         }
     }
 
-    fn flash_meta(self: &Rc<Self>, text: &str) {
+    pub fn flash_meta(&mut self, text: &str) {
         self.flash_meta_for(text, Duration::from_millis(3000));
     }
 
-    fn flash_meta_for(self: &Rc<Self>, text: &str, dur: Duration) {
-        self.meta.set_text(text);
-        let weak = Rc::downgrade(self);
-        let id = glib::timeout_add_local_once(dur, move || {
-            if let Some(ui) = weak.upgrade() {
-                ui.st.borrow_mut().meta_timer = None;
-                ui.restore_meta();
-            }
-        });
-        if let Some(old) = self.st.borrow_mut().meta_timer.replace(id) {
-            old.remove();
+    fn flash_meta_for(&mut self, text: &str, dur: Duration) {
+        self.set_meta(text.to_string());
+        self.st.meta_gen += 1;
+        self.st.meta_flashing = true;
+        self.timer(dur, Timer::Meta(self.st.meta_gen));
+    }
+
+    /// Show streamed text and the newest of it, once this pass of the event
+    /// loop is over: repeated calls before then share that one flush.
+    /// `force`: scroll even if you've scrolled up to read something.
+    fn scroll_to_end(&mut self, force: bool) {
+        self.scroll_force |= force;
+        if !std::mem::replace(&mut self.flush_pending, true) {
+            let _ = self.events.try_send(AppEvent::Flush);
         }
     }
 
-    /// Let `l`'s text be highlighted for copying. It never takes focus from
-    /// the text field. Clicking it clears the highlight in the line clicked
-    /// before, so the one highlight shown is what Ctrl+C copies.
-    fn selectable(self: &Rc<Self>, l: &gtk::Label) {
-        l.set_selectable(true);
-        l.set_focusable(false);
-        let click = gtk::GestureClick::new();
-        click.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let weak = Rc::downgrade(self);
-        let me = l.downgrade();
-        click.connect_pressed(move |_, _, _, _| {
-            let (Some(ui), Some(me)) = (weak.upgrade(), me.upgrade()) else { return };
-            let old = ui.picked.replace(me.downgrade()).upgrade();
-            if let Some(old) = old
-                && old != me
-            {
-                old.select_region(0, 0);
-            }
-        });
-        l.add_controller(click);
+    fn flush(&mut self) {
+        self.flush_pending = false;
+        self.show_current();
+        let force = std::mem::take(&mut self.scroll_force);
+        self.effects.push(Effect::Scroll { force });
     }
-
-    /// Copy the highlighted text of the line last clicked, if any is.
-    fn copy_picked(self: &Rc<Self>) -> bool {
-        let Some(l) = self.picked.borrow().upgrade() else { return false };
-        if l.selection_bounds().is_none_or(|(a, b)| a == b) {
-            return false;
-        }
-        // GTK's own copy: it knows the highlight's exact extent.
-        l.emit_by_name::<()>("copy-clipboard", &[]);
-        self.flash_meta("COPIED");
-        true
-    }
-
-    /// Copy every question and reply shown, as plain text.
-    fn copy_history(self: &Rc<Self>) {
-        if let Some(cur) = self.st.borrow_mut().current.as_mut() {
-            cur.show();
-        }
-        let text = history_text(&self.history);
-        if text.is_empty() {
-            self.flash_meta("NOTHING TO COPY");
-            return;
-        }
-        self.window.clipboard().set_text(&text);
-        self.flash_meta("CONVERSATION COPIED");
-    }
-
-    fn trim_history(&self) {
-        let mut n = 0;
-        let mut child = self.history.first_child();
-        while let Some(c) = child {
-            n += 1;
-            child = c.next_sibling();
-        }
-        while n > MAX_EXCHANGES {
-            if let Some(first) = self.history.first_child() {
-                self.history.remove(&first);
-            }
-            n -= 1;
-        }
-    }
-
-    /// On the next idle pass, show any streamed reply text and scroll to the
-    /// bottom. Repeated calls before then share that one pass.
-    fn scroll_to_end(self: &Rc<Self>) {
-        if self.scroll_pending.replace(true) {
-            return;
-        }
-        let weak = Rc::downgrade(self);
-        glib::idle_add_local_once(move || {
-            if let Some(ui) = weak.upgrade() {
-                ui.scroll_pending.set(false);
-                if let Some(cur) = ui.st.borrow_mut().current.as_mut() {
-                    cur.show();
-                }
-                let adj = ui.scroller.vadjustment();
-                adj.set_value(adj.upper() - adj.page_size());
-            }
-        });
-    }
-}
-
-/// The questions and replies under `history`, oldest first, one paragraph each.
-fn history_text(history: &gtk::Box) -> String {
-    let mut parts = Vec::new();
-    let mut ex = history.first_child();
-    while let Some(e) = ex {
-        let mut child = e.first_child();
-        while let Some(c) = child {
-            if let Some(l) = c.downcast_ref::<gtk::Label>()
-                && l.is_visible()
-            {
-                let text = l.text();
-                let text = text.trim();
-                if l.has_css_class("prompt") {
-                    // The mic/keyboard mark is an icon-font glyph; plain text gets "›".
-                    let q = text.split_once(' ').map_or(text, |(_, q)| q);
-                    parts.push(format!("› {q}"));
-                } else if l.has_css_class("reply") && !text.is_empty() {
-                    parts.push(text.to_string());
-                }
-            }
-            child = c.next_sibling();
-        }
-        ex = e.next_sibling();
-    }
-    parts.join("\n\n")
-}
-
-fn label(text: &str, class: &str) -> gtk::Label {
-    let l = gtk::Label::new(Some(text));
-    l.add_css_class(class);
-    l.set_xalign(0.0);
-    l.set_wrap(true);
-    l.set_wrap_mode(pango::WrapMode::WordChar);
-    // Keep the natural width small so long text wraps instead of widening the popup.
-    l.set_max_width_chars(1);
-    l.set_hexpand(true);
-    l
 }
 
 /// What fits the panel's status line.
@@ -2272,10 +1919,6 @@ fn sentence(s: &str) -> String {
         Some(f) => format!("{}{}.", f.to_uppercase(), c.as_str()),
         None => String::new(),
     }
-}
-
-fn notify(text: &str) {
-    crate::platform::notify(text);
 }
 
 /// How to ask for an answer: (spoken, status line). "Always" is never

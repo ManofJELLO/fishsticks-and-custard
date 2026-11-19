@@ -340,7 +340,8 @@ Some settings you might want to change:
 The full list, with explanations, is in
 `/usr/share/fishsticks-and-custard/config.example.toml`.
 
-The popup follows your GTK theme's colours and your desktop's light or dark mode.
+The popup follows your Qt theme's colours (qt6ct on Hyprland, as HyprCustard sets
+them) and your desktop's light or dark mode.
 
 **Personality:** how the assistant talks is described in
 `~/.local/share/fsc/home/persona.md`. Edit it and press **Ctrl+N** to start a

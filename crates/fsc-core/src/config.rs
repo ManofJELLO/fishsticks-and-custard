@@ -427,7 +427,7 @@ pub struct UiConfig {
     pub max_height: i32,
     pub font: String,
     /// The one colour allowed to shout: "system" (the desktop's accent, else
-    /// the GTK theme's selection colour) or hex, e.g. "#D71921".
+    /// the Qt palette's) or hex, e.g. "#D71921".
     pub accent: String,
     pub theme: ThemePref,
     pub tray_icon: TrayIcon,

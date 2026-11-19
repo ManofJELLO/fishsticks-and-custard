@@ -1,8 +1,7 @@
-//! Colours and stylesheet. Foreground, background and accent come from the
-//! GTK theme and the desktop; the built-in monochrome palette is only the
-//! fallback. The accent is used only for state.
-
-use gtk::prelude::*;
+//! Colours. Foreground, background and accent come from the desktop's Qt
+//! palette (qt6ct on Hyprland, the system's on Windows and macOS) and its
+//! accent; the built-in monochrome palette is only the fallback. The accent
+//! is used only for state.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeMode {
@@ -27,15 +26,6 @@ impl Rgb {
         ))
     }
 
-    pub fn css(self, a: f64) -> String {
-        format!(
-            "rgba({}, {}, {}, {a:.3})",
-            (self.0 * 255.0).round() as u8,
-            (self.1 * 255.0).round() as u8,
-            (self.2 * 255.0).round() as u8
-        )
-    }
-
     pub fn bytes(self) -> [u8; 3] {
         [(self.0 * 255.0) as u8, (self.1 * 255.0) as u8, (self.2 * 255.0) as u8]
     }
@@ -44,21 +34,24 @@ impl Rgb {
 pub const NOTHING_RED: Rgb = Rgb(0xD7 as f64 / 255.0, 0x19 as f64 / 255.0, 0x21 as f64 / 255.0);
 
 impl Rgb {
-    fn from_rgba(c: gtk::gdk::RGBA) -> Rgb {
-        Rgb(c.red() as f64, c.green() as f64, c.blue() as f64)
-    }
-
     /// Relative luminance, 0 (black) to 1 (white).
     pub fn luma(self) -> f64 {
         0.2126 * self.0 + 0.7152 * self.1 + 0.0722 * self.2
     }
+
+    /// `#rrggbb`.
+    pub fn hex(self) -> String {
+        let [r, g, b] = self.bytes();
+        format!("#{r:02x}{g:02x}{b:02x}")
+    }
 }
 
-/// The first of `names` the current GTK theme defines (`@define-color`).
-#[allow(deprecated)] // lookup_color has no replacement until GTK 5
-fn theme_color(w: &gtk::Widget, names: &[&str]) -> Option<Rgb> {
-    let ctx = w.style_context();
-    names.iter().find_map(|n| ctx.lookup_color(n)).map(Rgb::from_rgba)
+/// The desktop's colours, as its toolkit palette has them.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SystemColors {
+    pub bg: Option<Rgb>,
+    pub fg: Option<Rgb>,
+    pub accent: Option<Rgb>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -92,175 +85,45 @@ impl Palette {
         }
     }
 
-    /// Colours from the GTK theme `w` is styled with. `accent`: the desktop's
-    /// or the configured accent; `None` falls back to the theme's.
-    /// `fallback` is used for anything the theme doesn't define.
-    pub fn from_theme(w: &gtk::Widget, accent: Option<Rgb>, fallback: ThemeMode) -> Palette {
+    /// Colours from the desktop's palette. `accent`: the desktop's or the
+    /// configured accent; `None` falls back to the palette's own.
+    /// `fallback` is used for anything the palette doesn't give.
+    pub fn from_system(sys: SystemColors, accent: Option<Rgb>, fallback: ThemeMode) -> Palette {
         let base = Palette::new(fallback, accent.unwrap_or(NOTHING_RED));
-        let bg = theme_color(w, &["window_bg_color", "theme_bg_color"]);
-        let fg = theme_color(w, &["window_fg_color", "theme_fg_color"]);
-        let (bg, fg) = match (bg, fg) {
+        let (bg, fg) = match (sys.bg, sys.fg) {
             (Some(bg), Some(fg)) => (bg, fg),
             // Half a theme would risk unreadable text: all or nothing.
             _ => (base.bg, base.fg),
         };
-        let accent = accent
-            .or_else(|| theme_color(w, &["accent_bg_color", "accent_color", "theme_selected_bg_color"]))
-            .unwrap_or(base.accent);
-        let error = theme_color(w, &["error_color", "error_bg_color"]).unwrap_or(base.error);
+        let accent = accent.or(sys.accent).unwrap_or(base.accent);
+        // No toolkit palette has an error colour.
+        let error = base.error;
         let mode = if bg.luma() < 0.5 { ThemeMode::Dark } else { ThemeMode::Light };
         Palette { mode, fg, bg, accent, error }
     }
 
-    pub fn css(&self, font: &str) -> String {
-        let fg = |a: f64| self.fg.css(a);
-        let accent = |a: f64| self.accent.css(a);
-        format!(
-            r#"
-window.fsc {{
-    background: transparent;
-    font-family: "{font}", monospace;
-}}
-window.fsc * {{
-    font-family: "{font}", monospace;
-}}
-.fsc .meta {{
-    color: {meta};
-    font-size: 10px;
-    letter-spacing: 2px;
-    text-shadow: 0 0 3px {halo};
-}}
-.fsc .prompt {{
-    color: {dim};
-    font-size: 13px;
-}}
-.fsc .reply {{
-    color: {text};
-    font-size: 15px;
-}}
-.fsc .tool {{
-    color: {dim};
-    font-size: 11px;
-    letter-spacing: 1px;
-}}
-.fsc .note {{
-    color: {dim};
-    font-size: 11px;
-    letter-spacing: 1px;
-}}
-.fsc .error {{
-    color: {error};
-    font-size: 12px;
-}}
-.fsc .ask {{
-    border-left: 2px solid {red};
-    padding: 2px 0 2px 12px;
-}}
-.fsc .ask.answered {{
-    border-left-color: {faint};
-}}
-.fsc .ask-action {{
-    color: {text};
-    font-size: 14px;
-}}
-.fsc .ask-detail {{
-    color: {dim};
-    font-size: 12px;
-    background-color: {field};
-    border-radius: 8px;
-    padding: 6px 10px;
-}}
-.fsc button.ask-button {{
-    background-color: transparent;
-    background-image: none;
-    color: {text};
-    border: 1px solid {border};
-    border-radius: 999px;
-    padding: 2px 16px;
-    min-height: 24px;
-    font-size: 11px;
-    letter-spacing: 2px;
-    box-shadow: none;
-    text-shadow: none;
-    outline: none;
-}}
-.fsc button.ask-button:hover {{
-    border-color: {border_focus};
-    background-color: {field};
-}}
-.fsc button.ask-button.allow {{
-    background-color: {red};
-    border-color: {red};
-    color: {on_accent};
-}}
-.fsc button.ask-button.allow:hover {{
-    background-color: {red_hover};
-}}
-.fsc label selection {{
-    background-color: {sel};
-    color: {text};
-}}
-.fsc scrolledwindow, .fsc viewport {{
-    background: transparent;
-}}
-.fsc scrollbar {{
-    background: transparent;
-    border: none;
-}}
-.fsc scrollbar slider {{
-    background-color: {faint};
-    min-width: 3px;
-    border-radius: 99px;
-}}
-.fsc .divider {{
-    background-color: {faint};
-    min-height: 1px;
-}}
-.fsc entry {{
-    background-color: {field};
-    background-image: none;
-    color: {text};
-    caret-color: {red};
-    border: 1px solid {border};
-    border-radius: 999px;
-    padding: 8px 18px;
-    min-height: 26px;
-    box-shadow: none;
-    outline: none;
-    font-size: 14px;
-}}
-.fsc entry:focus-within,
-.fsc entry:hover,
-.fsc entry:hover:not(:focus-within) {{
-    background-color: {field};
-    box-shadow: none;
-    outline: 0 solid transparent;
-    outline-offset: 0;
-}}
-.fsc entry:focus-within {{
-    border-color: {border_focus};
-}}
-.fsc entry > text > placeholder {{
-    color: {placeholder};
-}}
-.fsc entry > text > selection {{
-    background-color: {sel};
-}}
-"#,
-            meta = fg(0.72),
-            halo = self.bg.css(0.85),
-            dim = fg(0.55),
-            text = fg(0.95),
-            red = accent(1.0),
-            red_hover = accent(0.85),
-            error = self.error.css(1.0),
-            on_accent = if self.accent.luma() > 0.6 { "#111111" } else { "#ffffff" },
-            sel = accent(0.35),
-            faint = fg(0.14),
-            field = fg(0.04),
-            border = fg(0.22),
-            border_focus = fg(0.55),
-            placeholder = fg(0.35),
-        )
+    /// What goes on the accent: dark text on a light accent, white otherwise.
+    pub fn on_accent(&self) -> Rgb {
+        if self.accent.luma() > 0.6 { Rgb(0.067, 0.067, 0.067) } else { Rgb(1.0, 1.0, 1.0) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn palette_from_system() {
+        let sys = SystemColors { bg: Some(Rgb(1.0, 1.0, 1.0)), fg: Some(Rgb(0.0, 0.0, 0.0)), accent: Some(Rgb(0.0, 0.0, 1.0)) };
+        let p = Palette::from_system(sys, None, ThemeMode::Dark);
+        assert_eq!(p.mode, ThemeMode::Light);
+        assert_eq!(p.accent, Rgb(0.0, 0.0, 1.0));
+        // A pinned or desktop accent wins over the palette's.
+        assert_eq!(Palette::from_system(sys, Some(NOTHING_RED), ThemeMode::Dark).accent, NOTHING_RED);
+        // Half a palette: the fallback's colours, all of them.
+        let half = SystemColors { bg: Some(Rgb(1.0, 1.0, 1.0)), ..Default::default() };
+        let p = Palette::from_system(half, None, ThemeMode::Dark);
+        assert_eq!((p.bg, p.mode), (Palette::new(ThemeMode::Dark, NOTHING_RED).bg, ThemeMode::Dark));
+        assert_eq!(Rgb(0.0, 0.5, 1.0).hex(), "#007fff");
     }
 }

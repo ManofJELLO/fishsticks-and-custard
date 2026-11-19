@@ -1,10 +1,8 @@
-//! A tiny 5x7 dot-matrix font, drawn as circles with cairo so the status
-//! label matches the visualiser exactly. Unlit dots are drawn faintly, like
-//! an LED panel.
+//! A tiny 5x7 dot-matrix font, drawn as circles so the status label
+//! matches the visualiser exactly. Unlit dots are drawn faintly, like an LED
+//! panel.
 
-use gtk::cairo::Context;
-use std::f64::consts::TAU;
-
+use super::Canvas;
 use crate::style::Rgb;
 
 pub const ROWS: usize = 7;
@@ -63,7 +61,7 @@ fn glyph(c: char) -> [u8; ROWS] {
 #[allow(clippy::too_many_arguments)]
 /// Draw `text` with its top-left dot centre at (x, y).
 pub fn draw(
-    cr: &Context,
+    cr: &mut Canvas,
     text: &str,
     x: f64,
     y: f64,
@@ -83,14 +81,11 @@ pub fn draw(
                 if a <= 0.0 {
                     continue;
                 }
+                let (dx, dy) = (gx + c as f64 * pitch, y + r as f64 * pitch);
                 if let (true, Some((h, ha))) = (lit, halo) {
-                    cr.set_source_rgba(h.0, h.1, h.2, ha);
-                    cr.arc(gx + c as f64 * pitch, y + r as f64 * pitch, radius + 1.0, 0.0, TAU);
-                    let _ = cr.fill();
+                    cr.fill_circle(dx, dy, radius + 1.0, h, ha);
                 }
-                cr.set_source_rgba(col.0, col.1, col.2, a);
-                cr.arc(gx + c as f64 * pitch, y + r as f64 * pitch, radius, 0.0, TAU);
-                let _ = cr.fill();
+                cr.fill_circle(dx, dy, radius, col, a);
             }
         }
     }

@@ -6,9 +6,9 @@
 //!   `ui.gradient` the opacity follows the content: most see-through behind
 //!   the visualiser, most solid behind text, with smooth fades between.
 
-use gtk::cairo::{Context, LinearGradient};
-use std::f64::consts::{FRAC_PI_2, PI};
+use tiny_skia::{GradientStop, LinearGradient, Point, SpreadMode, Transform};
 
+use super::{Canvas, color, rounded_rect};
 use crate::style::Palette;
 
 pub const RADIUS: f64 = 26.0;
@@ -41,32 +41,20 @@ const HEADER: f64 = 0.72;
 const GRAPHIC: f64 = 0.45;
 const TEXT: f64 = 1.0;
 
-pub fn rounded_rect(cr: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
-    let r = r.min(w / 2.0).min(h / 2.0);
-    cr.new_sub_path();
-    cr.arc(x + w - r, y + r, r, -FRAC_PI_2, 0.0);
-    cr.arc(x + w - r, y + h - r, r, 0.0, FRAC_PI_2);
-    cr.arc(x + r, y + h - r, r, FRAC_PI_2, PI);
-    cr.arc(x + r, y + r, r, PI, 3.0 * FRAC_PI_2);
-    cr.close_path();
-}
-
-pub fn draw(cr: &Context, w: f64, h: f64, p: &Palette, r: Regions, look: Look) {
+pub fn draw(cr: &mut Canvas, w: f64, h: f64, p: &Palette, r: Regions, look: Look) {
     if w < 2.0 || h < 2.0 {
         return;
     }
     let bg = p.bg;
     let o = look.opacity.clamp(0.0, 1.0);
     if !look.framed {
-        cr.set_source_rgba(bg.0, bg.1, bg.2, o);
-        cr.paint().ok();
+        cr.paint(bg, o);
         return;
     }
+    let Some(shape) = rounded_rect(0.5, 0.5, w - 1.0, h - 1.0, RADIUS) else { return };
     if !look.gradient {
-        rounded_rect(cr, 0.5, 0.5, w - 1.0, h - 1.0, RADIUS);
-        cr.set_source_rgba(bg.0, bg.1, bg.2, o);
-        cr.fill().ok();
-        hairline(cr, w, h, p);
+        cr.fill(&shape, bg, o);
+        hairline(cr, &shape, p);
         return;
     }
 
@@ -87,19 +75,37 @@ pub fn draw(cr: &Context, w: f64, h: f64, p: &Palette, r: Regions, look: Look) {
         last = s.0;
     }
 
-    let g = LinearGradient::new(0.0, 0.0, 0.0, h);
-    for (y, alpha) in stops {
-        g.add_color_stop_rgba(y / h, bg.0, bg.1, bg.2, alpha);
+    let stops = stops.into_iter().map(|(y, alpha)| GradientStop::new((y / h) as f32, color(bg, alpha))).collect();
+    let g = LinearGradient::new(Point::from_xy(0.0, 0.0), Point::from_xy(0.0, h as f32), stops, SpreadMode::Pad, Transform::identity());
+    match g {
+        Some(g) => cr.fill_with(&shape, g),
+        None => cr.fill(&shape, bg, o),
     }
-    rounded_rect(cr, 0.5, 0.5, w - 1.0, h - 1.0, RADIUS);
-    cr.set_source(&g).ok();
-    cr.fill().ok();
-    hairline(cr, w, h, p);
+    hairline(cr, &shape, p);
 }
 
-fn hairline(cr: &Context, w: f64, h: f64, p: &Palette) {
-    rounded_rect(cr, 0.5, 0.5, w - 1.0, h - 1.0, RADIUS);
-    cr.set_source_rgba(p.fg.0, p.fg.1, p.fg.2, 0.14);
-    cr.set_line_width(1.0);
-    cr.stroke().ok();
+fn hairline(cr: &mut Canvas, shape: &tiny_skia::Path, p: &Palette) {
+    cr.stroke(shape, p.fg, 0.14, 1.0);
+}
+
+/// `FSC_VIZ_PNG=dir cargo test -p fsc-app panel_preview -- --ignored`:
+/// the layer-mode panel, both themes, as PNGs.
+#[cfg(test)]
+mod preview {
+    use super::*;
+    use crate::style::{NOTHING_RED, ThemeMode};
+
+    #[test]
+    #[ignore]
+    fn panel_preview() {
+        let Ok(dir) = std::env::var("FSC_VIZ_PNG") else { return };
+        let (w, h) = (680.0, 300.0);
+        let regions = Regions { header_bottom: 40.0, graphic_top: 56.0, graphic_bottom: 144.0, text_top: 160.0 };
+        for (mode, name) in [(ThemeMode::Dark, "dark"), (ThemeMode::Light, "light")] {
+            let mut c = Canvas::new(w, h, 2.0).unwrap();
+            let look = Look { framed: true, opacity: 0.85, gradient: true };
+            draw(&mut c, w, h, &Palette::new(mode, NOTHING_RED), regions, look);
+            c.pixmap().save_png(format!("{dir}/panel-{name}.png")).unwrap();
+        }
+    }
 }

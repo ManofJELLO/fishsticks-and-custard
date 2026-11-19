@@ -37,7 +37,7 @@ jobs:
       - name: Install build tools
         run: |
           pacman -Syu --noconfirm --needed git github-cli rust clang cmake vulkan-headers shaderc \
-            gtk4 gtk4-layer-shell pipewire alsa-lib vulkan-icd-loader espeak-ng pcaudiolib libsonic
+            qt6-base qt6-declarative qt6-wayland layer-shell-qt pipewire alsa-lib vulkan-icd-loader espeak-ng pcaudiolib libsonic
 
       - uses: actions/checkout@v7
         with:

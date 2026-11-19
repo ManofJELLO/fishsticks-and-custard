@@ -1,28 +1,35 @@
 //! fscd: the Fishsticks & Custard assistant. Tray icon, popup UI, control
-//! socket and the Claude session, all in one process.
+//! socket and the agent session, all in one process.
 //!
-//! Threads: GTK runs on the main thread; tokio (socket, portal, tray, Claude)
+//! Threads: Qt runs on the main thread; tokio (socket, portal, tray, agent)
 //! runs on a small worker pool. Everything flows to the UI as `AppEvent`s
-//! over one async channel.
+//! over one async channel, which `qt::bridge` hands to the `controller` on
+//! the Qt thread.
 
+mod controller;
+mod draw;
+mod history;
 mod icon;
 mod log;
 mod platform;
+mod qt;
 mod server;
+mod speech_text;
 mod style;
+#[cfg(target_os = "linux")]
 mod theme;
+#[cfg(target_os = "linux")]
 mod tray;
-mod ui;
+#[cfg(not(target_os = "linux"))]
+#[path = "tray_none.rs"]
+mod tray;
 
 use anyhow::Result;
-use gtk::prelude::*;
-use gtk::glib;
-use std::cell::RefCell;
-use std::rc::Rc;
+use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
 use tokio::sync::{mpsc, oneshot};
 
 use fsc_core::agent::{AgentEvent, AgentHandle};
-use fsc_core::config::{Config, ThemePref};
+use fsc_core::config::{Config, Surface, ThemePref};
 use fsc_core::ipc::{Command, Reply};
 
 use crate::style::{Palette, Rgb, ThemeMode};
@@ -37,9 +44,17 @@ pub enum AppEvent {
     /// A voice download moved on: `Ok(Some(percent))` while it runs,
     /// `Ok(None)` when it's done, `Err` if it failed.
     VoiceFetch { voice: String, progress: Result<Option<u32>, String> },
+    /// A timer the controller set is due.
+    Timer(controller::Timer),
+    /// A minute has passed (idle sessions are rotated).
+    IdleTick,
+    /// A mic just chosen by id has this name.
+    MicName(String),
+    /// Show streamed text now: the events before this one are handled.
+    Flush,
 }
 
-const APP_ID: &str = "dev.fsc.FishsticksAndCustard";
+pub const APP_ID: &str = "dev.fsc.FishsticksAndCustard";
 
 fn main() -> std::process::ExitCode {
     let result = run();
@@ -51,14 +66,29 @@ fn main() -> std::process::ExitCode {
     if result.is_ok() { std::process::ExitCode::SUCCESS } else { std::process::ExitCode::FAILURE }
 }
 
+/// The platform Qt runs on. On Linux the popup is a Wayland surface (a
+/// layer-shell one has no X11 equivalent), though a test may ask for
+/// `offscreen`.
+fn offscreen() -> bool {
+    std::env::var("QT_QPA_PLATFORM").is_ok_and(|p| p == "offscreen")
+}
+
 fn run() -> Result<()> {
     // Before any threads exist (these set environment variables).
     fsc_audio::prepare_env();
-    // Wayland only: the popup is a layer-shell surface, which has no X11
-    // equivalent, and the session's GDK_BACKEND may list x11 as a fallback.
-    // SAFETY: no other threads exist yet.
-    unsafe { std::env::set_var("GDK_BACKEND", "wayland") };
-    gtk::gdk::set_allowed_backends("wayland");
+    // SAFETY (all set_var below): no other threads exist yet.
+    if cfg!(target_os = "linux") && !offscreen() {
+        unsafe { std::env::set_var("QT_QPA_PLATFORM", "wayland") };
+    }
+    // The popup draws every control itself; Basic is the style that imposes
+    // no colours of its own on the few parts Qt still draws.
+    if std::env::var_os("QT_QUICK_CONTROLS_STYLE").is_none() {
+        unsafe { std::env::set_var("QT_QUICK_CONTROLS_STYLE", "Basic") };
+    }
+    // Qt's Wayland text input warns each time focus leaves a text field.
+    if std::env::var_os("QT_LOGGING_RULES").is_none() {
+        unsafe { std::env::set_var("QT_LOGGING_RULES", "qt.qpa.wayland.textinput=false") };
+    }
 
     // Headless diagnostics: no display needed.
     let args: Vec<String> = std::env::args().collect();
@@ -77,7 +107,7 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+    if cfg!(target_os = "linux") && !offscreen() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
         anyhow::bail!("fscd needs a Wayland session (WAYLAND_DISPLAY is not set)");
     }
     // Only the instance that stays: a second launch mustn't rotate its log.
@@ -88,7 +118,7 @@ fn run() -> Result<()> {
     let accent = Rgb::from_hex(&cfg.ui.accent);
 
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
-    // Keep the runtime entered on the GTK thread so UI code can tokio::spawn.
+    // Keep the runtime entered on the Qt thread so UI code can tokio::spawn.
     let _guard = rt.enter();
 
     let (ev_tx, ev_rx) = async_channel::unbounded::<AppEvent>();
@@ -100,11 +130,14 @@ fn run() -> Result<()> {
         ThemePref::Light => ThemeMode::Light,
         ThemePref::Dark | ThemePref::Auto => ThemeMode::Dark,
     };
-    if cfg.ui.theme == ThemePref::Auto {
-        rt.spawn(theme::watch(ev_tx.clone()));
-    }
-    if accent.is_none() {
-        rt.spawn(theme::watch_accent(ev_tx.clone()));
+    #[cfg(target_os = "linux")]
+    {
+        if cfg.ui.theme == ThemePref::Auto {
+            rt.spawn(theme::watch(ev_tx.clone()));
+        }
+        if accent.is_none() {
+            rt.spawn(theme::watch_accent(ev_tx.clone()));
+        }
     }
 
     let (tray_tx, tray_rx) = mpsc::unbounded_channel();
@@ -122,7 +155,7 @@ fn run() -> Result<()> {
         ev_tx.clone(),
     ));
 
-    let claude = {
+    let agent = {
         let tx = ev_tx.clone();
         AgentHandle::spawn(&cfg, cfg.home(), move |e| {
             let _ = tx.try_send(AppEvent::Agent(e));
@@ -136,50 +169,17 @@ fn run() -> Result<()> {
         })
     };
 
-    let app = gtk::Application::builder().application_id(APP_ID).build();
-    let ui_cell: Rc<RefCell<Option<Rc<ui::Ui>>>> = Rc::default();
-    let ev_rx = RefCell::new(Some(ev_rx));
-
-    {
-        let ui_cell = ui_cell.clone();
-        let ev_tx = ev_tx.clone();
-        app.connect_activate(move |app| {
-            // Activated once at startup; a second fscd toggles us over the
-            // control socket instead (see above).
-            if ui_cell.borrow().is_some() {
-                return;
-            }
-            // Keep running with no visible window.
-            std::mem::forget(app.hold());
-            // The window's icon: the police box from the installed icon theme.
-            gtk::Window::set_default_icon_name(APP_ID);
-
-            let ui = ui::Ui::new(
-                app,
-                cfg.clone(),
-                Palette::new(initial_theme, accent.unwrap_or(style::NOTHING_RED)),
-                accent,
-                claude.clone(),
-                audio.clone(),
-                tray_tx.clone(),
-                ev_tx.clone(),
-            );
-            *ui_cell.borrow_mut() = Some(ui.clone());
-
-            if cfg.session_idle_minutes() > 0 {
-                let ui = ui.clone();
-                glib::timeout_add_seconds_local(60, move || {
-                    ui.tick_idle();
-                    glib::ControlFlow::Continue
-                });
-            }
-
-            let rx = ev_rx.borrow_mut().take().expect("activate runs once");
-            glib::spawn_future_local(async move {
-                while let Ok(ev) = rx.recv().await {
-                    ui.handle(ev);
+    if cfg.session_idle_minutes() > 0 {
+        let tx = ev_tx.clone();
+        rt.spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(60));
+            every.tick().await;
+            loop {
+                every.tick().await;
+                if tx.send(AppEvent::IdleTick).await.is_err() {
+                    break;
                 }
-            });
+            }
         });
     }
 
@@ -200,7 +200,47 @@ fn run() -> Result<()> {
         });
     }
 
-    app.run_with_args::<&str>(&[]);
+    let surface = cfg.ui.surface;
+    let ctl = controller::Controller::new(
+        cfg,
+        Palette::new(initial_theme, accent.unwrap_or(style::NOTHING_RED)),
+        accent,
+        agent,
+        audio,
+        tray_tx,
+        ev_tx.clone(),
+    );
+    qt::bridge::STARTUP.with(|s| *s.borrow_mut() = Some(qt::bridge::Startup { ctl, events: ev_rx }));
+
+    let mut app = QGuiApplication::new();
+    if let Some(mut app) = app.as_mut() {
+        app.as_mut().set_application_name(&QString::from("fscd"));
+        app.as_mut().set_application_display_name(&QString::from("Fishsticks & Custard"));
+        // The Wayland app id, which Hyprland's window rules match as the class.
+        QGuiApplication::set_desktop_file_name(&QString::from(APP_ID));
+    }
+    let mut engine = QQmlApplicationEngine::new();
+    if let Some(mut engine) = engine.as_mut() {
+        engine
+            .as_mut()
+            .on_object_creation_failed(|_, url| {
+                eprintln!(
+                    "fscd: the popup failed to load ({url}). On Arch, check that qt6-declarative \
+                     (and, for surface = \"layer\", layer-shell-qt) are installed."
+                );
+                std::process::exit(1);
+            })
+            .release();
+        // Layer shell is Wayland's; elsewhere the popup is a window.
+        let root = match surface {
+            Surface::Layer if cfg!(target_os = "linux") && !offscreen() => "LayerPopup",
+            _ => "WindowPopup",
+        };
+        engine.load(&QUrl::from(&format!("qrc:/qt/qml/dev/fsc/app/qml/{root}.qml")));
+    }
+    if let Some(app) = app.as_mut() {
+        app.exec();
+    }
     server::cleanup();
     Ok(())
 }

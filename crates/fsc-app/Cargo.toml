@@ -13,14 +13,27 @@ path = "src/main.rs"
 fsc-core.workspace = true
 fsc-audio.workspace = true
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
-gtk4-layer-shell = "0.8"
-ksni = "0.3"
-ashpd = { version = "0.14", default-features = false, features = ["tokio", "settings"] }
+cxx = "1"
+cxx-qt = "0.10"
+cxx-qt-lib = { version = "0.10", features = ["qt_gui", "qt_qml"] }
 async-channel = "2"
-libc = "0.2"
 futures-util = "0.3"
 tiny-skia = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# The tray (StatusNotifierItem over D-Bus) and the desktop's colour scheme
+# and accent (the XDG settings portal) are Linux's. Elsewhere: see tray_none.rs.
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.3"
+ashpd = { version = "0.14", default-features = false, features = ["tokio", "settings"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+# link_qt_object_files is what makes a Cargo-only build (no CMake) link a
+# QML module correctly.
+cxx-qt-build = { version = "0.10", features = ["link_qt_object_files"] }

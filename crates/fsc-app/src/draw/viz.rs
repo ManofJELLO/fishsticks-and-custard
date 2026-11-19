@@ -12,13 +12,12 @@
 //! synthesized speech while speaking. Phases without audio get made-up
 //! motion (a sweep while thinking, a babble while text streams in).
 
-use gtk::cairo::Context;
 use std::collections::VecDeque;
 
 use fsc_core::Phase;
 use fsc_core::config::{UiConfig, Visualiser};
 
-use super::panel::rounded_rect;
+use super::Canvas;
 use crate::style::Palette;
 
 pub const HEIGHT: i32 = 88;
@@ -180,7 +179,7 @@ impl Viz {
         }
     }
 
-    pub fn draw(&self, cr: &Context, w: f64, h: f64, p: &Palette) {
+    pub fn draw(&self, cr: &mut Canvas, w: f64, h: f64, p: &Palette) {
         let n = self.columns(w);
         let rows = self.blocks;
         let (bar_w, pitch) = match self.mode {
@@ -222,9 +221,7 @@ impl Viz {
                 } else {
                     (p.fg, 0.08)
                 };
-                rounded_rect(cr, x, y, bar_w, block_h, radius);
-                cr.set_source_rgba(col.0, col.1, col.2, a);
-                cr.fill().ok();
+                cr.fill_rounded((x, y, bar_w, block_h), radius, col, a);
             }
         }
     }
@@ -285,12 +282,11 @@ mod tests {
 }
 
 /// `FSC_VIZ_PNG=dir cargo test -p fsc-app viz_preview -- --ignored`: render
-/// a few frames to raw BGRA files for a look without running the app.
+/// a few frames to PNGs for a look without running the app.
 #[cfg(test)]
 mod preview {
     use super::*;
     use crate::style::{NOTHING_RED, Palette, ThemeMode};
-    use gtk::cairo::{Format, ImageSurface};
 
     #[test]
     #[ignore]
@@ -305,19 +301,9 @@ mod preview {
                 (0.9 * (-((x - 0.3) / 0.25).powi(2)).exp() + 0.05 * (i % 3) as f32).min(1.0)
             })
             .collect();
-        for (mode, name) in [
-            (Visualiser::Spectrum, "spectrum"),
-            (Visualiser::Loudness, "loudness"),
-        ] {
-            for (phase, pname) in [
-                (Phase::Listening, "listening"),
-                (Phase::Speaking, "speaking"),
-                (Phase::Asking, "asking"),
-            ] {
-                let cfg = UiConfig {
-                    visualiser: mode,
-                    ..Default::default()
-                };
+        for (mode, name) in [(Visualiser::Spectrum, "spectrum"), (Visualiser::Loudness, "loudness")] {
+            for (phase, pname) in [(Phase::Listening, "listening"), (Phase::Speaking, "speaking"), (Phase::Asking, "asking")] {
+                let cfg = UiConfig { visualiser: mode, ..Default::default() };
                 let mut v = Viz::new(&cfg);
                 v.phase = phase;
                 for i in 0..120 {
@@ -325,20 +311,14 @@ mod preview {
                     v.set_spectrum(Some(speechy.iter().map(|s| s * k).collect()));
                     v.tick(1.0 / 30.0, w);
                 }
-                let surf =
-                    ImageSurface::create(Format::ARgb32, w as i32 + 48, h as i32 + 48).unwrap();
-                let cr = Context::new(&surf).unwrap();
+                let mut c = Canvas::new(w + 48.0, h + 48.0, 2.0).unwrap();
                 let p = Palette::new(ThemeMode::Dark, NOTHING_RED);
-                cr.set_source_rgb(0.08, 0.08, 0.08);
-                cr.paint().unwrap();
-                cr.translate(24.0, 24.0);
-                v.draw(&cr, w, h, &p);
-                drop(cr);
-                // Raw BGRA; convert with `magick -size WxH -depth 8 bgra:FILE out.png`.
-                let (sw, sh) = (surf.width(), surf.height());
-                let mut surf = surf;
-                let data = surf.data().unwrap().to_vec();
-                std::fs::write(format!("{dir}/{name}-{pname}-{sw}x{sh}.bgra"), data).unwrap();
+                c.paint(crate::style::Rgb(0.08, 0.08, 0.08), 1.0);
+                let mut inner = Canvas::new(w, h, 2.0).unwrap();
+                v.draw(&mut inner, w, h, &p);
+                let mut out = c.pixmap().clone();
+                out.draw_pixmap(48, 48, inner.pixmap().as_ref(), &Default::default(), tiny_skia::Transform::identity(), None);
+                out.save_png(format!("{dir}/{name}-{pname}.png")).unwrap();
             }
         }
     }

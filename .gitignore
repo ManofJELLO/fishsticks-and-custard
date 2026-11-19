@@ -1,2 +1,4 @@
 /target
 .claude/settings.local.json
+# Editor helper for qmlls written by cxx-qt-build; it holds a local path.
+.qmlls.ini

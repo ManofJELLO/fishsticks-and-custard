@@ -12,7 +12,7 @@ arch=(x86_64)
 url="https://github.com/ManofJELLO/fishsticks-and-custard"
 license=(MIT)
 depends=(
-  gcc-libs glibc glib2 cairo pango gtk4 gtk4-layer-shell
+  gcc-libs glibc qt6-base qt6-declarative qt6-wayland layer-shell-qt
   pipewire alsa-lib vulkan-icd-loader
   espeak-ng pcaudiolib libsonic
 )

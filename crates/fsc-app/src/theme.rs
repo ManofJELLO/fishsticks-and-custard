@@ -45,7 +45,7 @@ pub async fn watch(tx: async_channel::Sender<AppEvent>) {
 }
 
 /// The desktop's accent colour (`org.freedesktop.appearance accent-color`),
-/// live. Sends `None` when the desktop doesn't set one, so the GTK theme's
+/// live. Sends `None` when the desktop doesn't set one, so the Qt palette's
 /// own accent is used.
 pub async fn watch_accent(tx: async_channel::Sender<AppEvent>) {
     let Ok(settings) = Settings::new().await else { return };
