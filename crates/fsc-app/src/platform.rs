@@ -166,6 +166,8 @@ fn merge_path(login: Option<&str>, current: &str, home: &Path, is_dir: impl Fn(&
 mod tests {
     use super::*;
 
+    /// PATH as macOS has it: Unix paths, ':' between them.
+    #[cfg(unix)]
     #[test]
     fn path_merges_login_given_and_usual_once() {
         let home = Path::new("/Users/u");

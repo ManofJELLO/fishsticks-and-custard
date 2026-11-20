@@ -15,6 +15,8 @@
 use std::path::PathBuf;
 
 /// Where the log goes: `<state dir>/fscd.log` (`fsc_core::paths::state_dir`).
+/// TODO(windows): no log there yet (stderr is caught with a Unix pipe).
+#[cfg(unix)]
 pub fn path() -> Option<PathBuf> {
     Some(fsc_core::paths::state_dir()?.join("fscd.log"))
 }

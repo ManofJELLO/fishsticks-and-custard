@@ -29,7 +29,7 @@ pub fn start(keys: &KeysConfig, tx: async_channel::Sender<AppEvent>) -> Option<H
             return None;
         }
     };
-    let mut register = |what: &str, spec: &str| -> Option<u32> {
+    let register = |what: &str, spec: &str| -> Option<u32> {
         let spec = spec.trim();
         if spec.is_empty() {
             return None;

@@ -25,6 +25,8 @@ pub struct IconState {
     pub shape: TrayIcon,
 }
 
+/// The sizes a StatusNotifierItem is offered (Linux).
+#[cfg(target_os = "linux")]
 pub const SIZES: [u32; 6] = [16, 22, 24, 32, 48, 64];
 
 /// Recording dot, in grid units.
