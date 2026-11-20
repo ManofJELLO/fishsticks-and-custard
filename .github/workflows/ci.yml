@@ -84,14 +84,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.3
 
       - name: Build
-        shell: bash
+        # PowerShell, not Git Bash: there Git's own `link` (coreutils)
+        # comes before MSVC's link.exe on PATH.
+        shell: pwsh
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
           CMAKE_GENERATOR: Ninja
         run: cargo build --release --workspace --locked
 
       - name: Test
-        shell: bash
+        # PowerShell, not Git Bash: there Git's own `link` (coreutils)
+        # comes before MSVC's link.exe on PATH.
+        shell: pwsh
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
           CMAKE_GENERATOR: Ninja
