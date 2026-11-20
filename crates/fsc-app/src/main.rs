@@ -23,6 +23,9 @@ mod tray;
 #[cfg(not(target_os = "linux"))]
 #[path = "tray_none.rs"]
 mod tray;
+// Until the menu bar shows it, only Linux reads the menu itself.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod tray_menu;
 
 use anyhow::Result;
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
