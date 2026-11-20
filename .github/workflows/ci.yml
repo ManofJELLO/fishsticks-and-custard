@@ -73,16 +73,26 @@ jobs:
           install_runtime: true
           cache: true
 
+      # whisper.cpp builds its shader tool as a separate CMake project, which
+      # under the Visual Studio generator finds no compiler. Ninja in a
+      # developer shell (cl.exe on PATH) gives both builds the same one.
+      - name: MSVC developer shell
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+      - name: Ninja
+        run: choco install ninja -y --no-progress
+
       - uses: Swatinem/rust-cache@v2.9.3
 
       - name: Build
         shell: bash
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
+          CMAKE_GENERATOR: Ninja
         run: cargo build --release --workspace --locked
 
       - name: Test
         shell: bash
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
+          CMAKE_GENERATOR: Ninja
         run: cargo test --release --workspace --locked
