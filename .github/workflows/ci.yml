@@ -24,6 +24,9 @@ env:
 jobs:
   macos:
     runs-on: macos-15
+    env:
+      # The app's minimum (Info.plist says the same); C and C++ builds too.
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
     steps:
       - uses: actions/checkout@v7
 
@@ -39,7 +42,7 @@ jobs:
       # espeak-rs builds espeak-ng from source with CMake; whisper.cpp too
       # (Metal on macOS, so no shader compiler is needed).
       - name: Build tools
-        run: brew install cmake pkg-config
+        run: brew install cmake pkg-config espeak-ng librsvg
 
       - uses: Swatinem/rust-cache@v2.9.3
 
@@ -48,6 +51,15 @@ jobs:
 
       - name: Test
         run: cargo test --release --workspace --locked
+
+      - name: App
+        run: packaging/macos/build-app.sh "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-ci" "$RUNNER_TEMP/app"
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: FishsticksAndCustard-macos
+          path: ${{ runner.temp }}/app/FishsticksAndCustard-*.zip*
+          retention-days: 14
 
   windows:
     # Visual Studio 2022: under 2026 (windows-latest), whisper.cpp's shader

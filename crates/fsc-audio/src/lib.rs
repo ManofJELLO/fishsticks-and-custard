@@ -156,14 +156,18 @@ impl AudioHandle {
 /// points the bundled espeak-ng at the system's phoneme data.
 pub fn prepare_env() {
     const VAR: &str = "PIPER_ESPEAKNG_DATA_DIRECTORY";
-    if std::env::var_os(VAR).is_none() {
-        for dir in ["/usr/share", "/usr/lib/x86_64-linux-gnu", "/usr/local/share"] {
-            if std::path::Path::new(dir).join("espeak-ng-data").exists() {
-                // SAFETY: documented to run before any other threads start.
-                unsafe { std::env::set_var(VAR, dir) };
-                break;
-            }
-        }
+    if std::env::var_os(VAR).is_some() {
+        return;
+    }
+    // The app's own copy first (it matches the espeak-ng built in): in a
+    // macOS app's Resources, or beside the program on Windows. Then the
+    // system's, and Homebrew's for a build run from the source tree.
+    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(std::path::Path::to_path_buf));
+    let bundled = exe_dir.iter().flat_map(|d| [d.join("../Resources"), d.clone()]);
+    let system = ["/usr/share", "/usr/lib/x86_64-linux-gnu", "/usr/local/share", "/opt/homebrew/share"].map(std::path::PathBuf::from);
+    if let Some(dir) = bundled.chain(system).find(|d| d.join("espeak-ng-data").is_dir()) {
+        // SAFETY: documented to run before any other threads start.
+        unsafe { std::env::set_var(VAR, dir) };
     }
 }
 
