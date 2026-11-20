@@ -1,0 +1,86 @@
+# Build and test on macOS (Apple Silicon) and Windows. Linux is built and
+# packaged by package.yml for each tag; these two have no package yet, so
+# this is where they're first compiled. Nothing here is published.
+
+name: ci
+
+on:
+  push:
+    branches: [main, macos]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  QT_VERSION: "6.8.3"
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Rust (stable)
+        run: rustup update stable && rustup default stable && rustc --version
+
+      - name: Qt
+        uses: jurplel/install-qt-action@v4.5.0
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+
+      # espeak-rs builds espeak-ng from source with CMake; whisper.cpp too
+      # (Metal on macOS, so no shader compiler is needed).
+      - name: Build tools
+        run: brew install cmake pkg-config
+
+      - uses: Swatinem/rust-cache@v2.9.3
+
+      - name: Build
+        run: cargo build --release --workspace --locked
+
+      - name: Test
+        run: cargo test --release --workspace --locked
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Rust (stable)
+        run: rustup update stable && rustup default stable && rustc --version
+
+      - name: Qt
+        uses: jurplel/install-qt-action@v4.5.0
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_msvc2022_64
+          cache: true
+
+      # whisper.cpp's Vulkan backend needs the SDK's headers, loader and glslc.
+      - name: Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1.8.1
+        with:
+          install_runtime: true
+          cache: true
+
+      - uses: Swatinem/rust-cache@v2.9.3
+
+      - name: Build
+        shell: bash
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: cargo build --release --workspace --locked
+
+      - name: Test
+        shell: bash
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: cargo test --release --workspace --locked
