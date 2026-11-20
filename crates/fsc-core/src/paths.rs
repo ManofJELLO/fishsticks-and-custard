@@ -15,3 +15,9 @@ pub fn state_dir() -> Option<PathBuf> {
     }
     directories::BaseDirs::new().map(|d| d.data_local_dir().join("fsc").join("state"))
 }
+
+/// The user's home folder, as the system has it: `$HOME` on Unix, the
+/// profile folder on Windows (which sets no `HOME`).
+pub fn home() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf())
+}

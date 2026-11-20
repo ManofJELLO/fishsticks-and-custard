@@ -719,11 +719,12 @@ fn tool_kind(call: &Value) -> &str {
 /// ~/.ssh), and "~" is home. Without a home to compare with, every path
 /// counts as secret: asking is the safe way to be wrong.
 fn touches_secret(call: &Value, cwd: &Path) -> bool {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return true };
+    // No home known: every read could be a secret one.
+    let Some(home) = crate::paths::home() else { return true };
     let resolve = |p: &str| -> PathBuf {
         match p.strip_prefix('~') {
             Some("") => home.clone(),
-            Some(rest) if rest.starts_with('/') => home.join(rest.trim_start_matches('/')),
+            Some(rest) if rest.starts_with(['/', '\\']) => home.join(rest.trim_start_matches(['/', '\\'])),
             _ if Path::new(p).is_absolute() => PathBuf::from(p),
             _ => cwd.join(p),
         }
@@ -817,7 +818,7 @@ mod tests {
 
     #[test]
     fn secret_reads_are_never_auto_allowed() {
-        let home = std::env::var("HOME").unwrap();
+        let home = crate::paths::home().unwrap().display().to_string();
         let cwd = PathBuf::from(&home).join(".local/share/fsc/home/workspace");
         let read = |path: &str| json!({ "kind": "read", "locations": [{ "path": path }] });
         assert!(touches_secret(&read(&format!("{home}/.ssh/id_ed25519")), &cwd));
@@ -825,6 +826,7 @@ mod tests {
         // From the workspace, and from "~".
         assert!(touches_secret(&json!({ "kind": "read", "rawInput": { "path": "../../../../../.ssh/id_ed25519" } }), &cwd));
         assert!(touches_secret(&read("~/.ssh/id_rsa"), &cwd));
+        assert!(touches_secret(&read("~\\.ssh\\id_rsa"), &cwd) == cfg!(windows));
         assert!(!touches_secret(&read(&format!("{home}/notes.txt")), &cwd));
         assert!(!touches_secret(&read("notes.txt"), &cwd));
         assert!(!touches_secret(&json!({ "kind": "read", "title": "Read notes.txt" }), &cwd));

@@ -763,8 +763,17 @@ mod tests {
 
     #[test]
     fn programs_are_found() {
-        assert!(find_program("sh").is_some());
-        assert!(find_program("/bin/sh").is_some());
+        #[cfg(unix)]
+        {
+            assert!(find_program("sh").is_some());
+            assert!(find_program("/bin/sh").is_some());
+        }
+        // A bare name finds the .exe through PATHEXT.
+        #[cfg(windows)]
+        {
+            assert!(find_program("cmd").is_some());
+            assert!(find_program(r"C:\Windows\System32\cmd.exe").is_some());
+        }
         assert!(find_program("surely-not-a-program-here").is_none());
     }
 
