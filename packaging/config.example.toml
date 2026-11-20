@@ -75,3 +75,7 @@ conversation = true                      # keep listening after spoken replies u
 hang_up_after_secs = 60                  # end a conversation after this much silence (0 = never)
 wake_word = true                         # watch for the wake phrase (also talks over a reply)
 wake_phrase = "fishsticks and custard"  # or change it live with `fsc wake <phrase>`; 5+ letters, up to 5 words
+
+[keys]                        # macOS and Windows only (on Linux, Hyprland binds the keys: see fsc.lua)
+type = "alt+a"                # open the popup to type ("alt" is Option on a Mac; "" for none)
+talk = "alt+shift+a"          # hold to talk, or tap and just talk

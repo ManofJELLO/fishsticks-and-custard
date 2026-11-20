@@ -16,6 +16,26 @@ pub struct Config {
     pub acp: AcpAgentConfig,
     pub ui: UiConfig,
     pub voice: VoiceConfig,
+    pub keys: KeysConfig,
+}
+
+/// Global keys fscd binds itself: on macOS and Windows. (On Linux the
+/// compositor binds them, e.g. Hyprland's `bind`s running `fsc type`.)
+/// Written like "alt+a", "option+shift+a", "ctrl+alt+space"; empty for none.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct KeysConfig {
+    /// Open the popup to type.
+    #[serde(rename = "type")]
+    pub type_key: String,
+    /// Hold to talk; a tap starts listening until you stop talking.
+    pub talk: String,
+}
+
+impl Default for KeysConfig {
+    fn default() -> Self {
+        Self { type_key: "alt+a".into(), talk: "alt+shift+a".into() }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -783,6 +803,15 @@ mod tests {
         let saved = set_value(&text, "voice", "speak", "always").unwrap();
         let cfg: Config = toml::from_str(&saved).unwrap();
         assert_eq!(cfg.voice.speak, SpeakMode::Always);
+    }
+
+    #[test]
+    fn example_keys_are_the_defaults() {
+        let example = include_str!("../../../packaging/config.example.toml");
+        let cfg: Config = toml::from_str(example).unwrap();
+        assert_eq!(cfg.keys, KeysConfig::default());
+        let none: Config = toml::from_str("[keys]\ntype = \"\"").unwrap();
+        assert_eq!((none.keys.type_key.as_str(), none.keys.talk.as_str()), ("", "alt+shift+a"));
     }
 
     #[test]

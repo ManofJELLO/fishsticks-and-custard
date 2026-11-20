@@ -9,6 +9,8 @@
 mod controller;
 mod draw;
 mod history;
+#[cfg(not(target_os = "linux"))]
+mod hotkeys;
 mod icon;
 mod log;
 mod platform;
@@ -129,6 +131,8 @@ fn run() -> Result<()> {
     eprintln!("fsc: {path_note}");
 
     let cfg = Config::load()?;
+    #[cfg(not(target_os = "linux"))]
+    let keys = cfg.keys.clone();
     // A hex colour in the config pins the accent; otherwise follow the desktop.
     let accent = Rgb::from_hex(&cfg.ui.accent);
 
@@ -236,6 +240,10 @@ fn run() -> Result<()> {
         // The Wayland app id, which Hyprland's window rules match as the class.
         QGuiApplication::set_desktop_file_name(&QString::from(APP_ID));
     }
+    // After the app exists, before its event loop runs (macOS sends the
+    // keys through it). Kept until fscd exits.
+    #[cfg(not(target_os = "linux"))]
+    let _hotkeys = hotkeys::start(&keys, ev_tx.clone());
     let mut engine = QQmlApplicationEngine::new();
     if let Some(mut engine) = engine.as_mut() {
         engine
