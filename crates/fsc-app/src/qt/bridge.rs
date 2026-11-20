@@ -48,6 +48,8 @@ pub mod qobject {
         #[qproperty(bool, history_shown, cxx_name = "historyShown")]
         /// A reply is on its way (the popup keeps room for it).
         #[qproperty(bool, busy)]
+        /// A voice is loaded: replies' speakers can read them aloud.
+        #[qproperty(bool, can_speak, cxx_name = "canSpeak")]
         #[qproperty(QColor, fg)]
         #[qproperty(QColor, bg)]
         #[qproperty(QColor, accent)]
@@ -141,6 +143,11 @@ pub mod qobject {
         #[cxx_name = "copyText"]
         fn copy_text(self: Pin<&mut Backend>, text: &QString);
 
+        /// A reply's speaker: read it aloud, or stop reading it.
+        #[qinvokable]
+        #[cxx_name = "readAloud"]
+        fn read_aloud(self: Pin<&mut Backend>, key: f64);
+
         #[qinvokable]
         #[cxx_name = "setEntryEmpty"]
         fn set_entry_empty(self: Pin<&mut Backend>, empty: bool);
@@ -221,6 +228,7 @@ pub struct BackendRust {
     shown: bool,
     history_shown: bool,
     busy: bool,
+    can_speak: bool,
     fg: QColor,
     bg: QColor,
     accent: QColor,
@@ -307,9 +315,13 @@ impl qobject::Backend {
         let ops = ctl.history.take_ops();
         let effects = ctl.take_effects();
         let busy = ctl.in_turn();
+        let can_speak = ctl.can_speak();
         self.as_mut().rust_mut().ctl = Some(ctl);
         if *self.busy() != busy {
             self.as_mut().set_busy(busy);
+        }
+        if *self.can_speak() != can_speak {
+            self.as_mut().set_can_speak(can_speak);
         }
         self.apply(ops, effects);
         r
@@ -396,6 +408,12 @@ impl qobject::Backend {
     pub fn copy_text(self: Pin<&mut Self>, text: &QString) {
         qobject::set_clipboard(text);
         self.with_ctl(|c| c.flash_meta("COPIED"));
+    }
+
+    pub fn read_aloud(self: Pin<&mut Self>, key: f64) {
+        if key.is_finite() && key >= 1.0 {
+            self.with_ctl(|c| c.read_aloud(key as u64));
+        }
     }
 
     pub fn set_entry_empty(self: Pin<&mut Self>, empty: bool) {

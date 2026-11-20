@@ -66,6 +66,9 @@ pub enum AudioEvent {
     NobodySpoke,
     SpeakingStarted,
     SpeakingDone,
+    /// A `stop_speaking` has been carried out. Speaking events before this
+    /// were for the speech it cut off; those after, for speech queued later.
+    SpeechStopped,
     /// After `set_language`: whether `voice` loaded (`false`: it isn't
     /// downloaded, or is broken; replies aren't spoken meanwhile).
     Voice { voice: String, ok: bool },
@@ -751,7 +754,10 @@ impl<F: Fn(AudioEvent)> Engine<F> {
                 }
             }
             Cmd::Speak(text) => self.queue_speech(text),
-            Cmd::StopSpeaking => self.stop_speaking(),
+            Cmd::StopSpeaking => {
+                self.stop_speaking();
+                (self.emit)(AudioEvent::SpeechStopped);
+            }
         }
     }
 

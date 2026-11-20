@@ -175,6 +175,12 @@ struct State {
     conversation: bool,
     /// Speech handed to the engine that hasn't finished playing yet.
     speech_pending: bool,
+    /// The reply being read aloud because its speaker was clicked. Other
+    /// speech waits until it's done or stopped.
+    reading: Option<u64>,
+    /// Stops sent to the audio engine and not yet carried out. Until they
+    /// are, its speaking events are about the speech being cut off.
+    stops_out: u32,
     /// The current listen was started automatically after a reply.
     follow_up: bool,
     /// Consecutive follow-ups that heard nothing (stops runaway re-listening).
@@ -302,6 +308,8 @@ impl Controller {
                 sentences,
                 conversation: false,
                 speech_pending: false,
+                reading: None,
+                stops_out: 0,
                 follow_up: false,
                 empty_follow_ups: 0,
                 session_dirty: false,
@@ -344,6 +352,11 @@ impl Controller {
     /// A prompt is out and its reply not yet finished.
     pub fn in_turn(&self) -> bool {
         self.st.current.is_some()
+    }
+
+    /// A voice is loaded, so a reply's speaker can read it.
+    pub fn can_speak(&self) -> bool {
+        self.st.voice.tts
     }
 
     pub fn is_open(&self) -> bool {
@@ -557,6 +570,7 @@ impl Controller {
                     self.speak(rest);
                 }
                 if let Some(cur) = &cur {
+                    self.history.update(cur.reply, |b| b.finished = true);
                     if cur.text.trim().is_empty() {
                         self.history.set_visible(cur.reply, false);
                     }
@@ -718,11 +732,23 @@ impl Controller {
                 self.refresh();
                 self.hang_up();
             }
+            AudioEvent::SpeechStopped => self.st.stops_out = self.st.stops_out.saturating_sub(1),
             AudioEvent::SpeakingStarted => {
                 self.st.speaking = true;
                 self.refresh();
             }
             AudioEvent::SpeakingDone => {
+                if self.st.reading.is_some() {
+                    if self.st.stops_out > 0 {
+                        // What the reading cut off, ending: the reading is
+                        // still to come, so nothing else may start yet.
+                        self.st.speaking = false;
+                        self.refresh();
+                        return;
+                    }
+                    // Read to the end (or it couldn't be: no output, say).
+                    self.end_reading();
+                }
                 let st = &mut self.st;
                 st.speaking = false;
                 st.speech_pending = false;
@@ -782,6 +808,40 @@ impl Controller {
         self.interrupt();
     }
 
+    /// A reply's speaker: read that reply aloud, or stop if it's the one
+    /// being read. Whatever else was being said stops first.
+    pub fn read_aloud(&mut self, id: u64) {
+        if self.st.reading == Some(id) {
+            self.stop_speaking();
+            return;
+        }
+        if !self.st.voice.tts {
+            self.flash_meta("NO VOICE · FSC FETCH-MODELS");
+            return;
+        }
+        let Some(text) = self.history.get(id).filter(|b| b.kind == Kind::Reply).map(|b| b.text.clone()) else {
+            return;
+        };
+        // Its own speech mustn't be heard as a question.
+        self.cancel_listen();
+        self.stop_speaking();
+        // A reply still streaming isn't spoken over this one.
+        self.st.sentences.clear();
+        let mut buf = SentenceBuffer::default();
+        buf.set_language(self.st.spoken.language());
+        let mut parts = buf.push(&text);
+        parts.extend(buf.flush());
+        if parts.is_empty() {
+            self.flash_meta("NOTHING TO READ");
+            return;
+        }
+        self.st.reading = Some(id);
+        self.history.update(id, |b| b.reading = true);
+        for part in parts {
+            self.speak(part);
+        }
+    }
+
     pub fn set_entry_empty(&mut self, empty: bool) {
         self.entry_empty = empty;
     }
@@ -815,7 +875,7 @@ impl Controller {
             self.flash_meta("BUSY · CTRL+C TO STOP");
             return false;
         }
-        self.audio.stop_speaking();
+        self.stop_speaking();
         // A highlight from before is done with: Ctrl+C during this reply stops it.
         self.effects.push(Effect::ClearPick);
         // Been a while? Start a fresh session (saving memory) before this
@@ -861,6 +921,7 @@ impl Controller {
     fn should_speak(&self) -> bool {
         let st = &self.st;
         st.voice.tts
+            && st.reading.is_none()
             && match st.speak {
                 SpeakMode::Voice => st.voice_turn,
                 SpeakMode::Always => true,
@@ -988,7 +1049,7 @@ impl Controller {
         self.push_tray();
         if mode == SpeakMode::Never {
             // Quiet now, not after the reply being read.
-            self.audio.stop_speaking();
+            self.stop_speaking();
         }
         self.flash_meta(&format!("SPEAK REPLIES: {}", mode.name().to_uppercase()));
         match Config::save_value("voice", "speak", mode.key()) {
@@ -1420,6 +1481,20 @@ impl Controller {
         }
     }
 
+    /// Stop all speech, a reading among it.
+    fn stop_speaking(&mut self) {
+        self.audio.stop_speaking();
+        self.st.stops_out += 1;
+        self.end_reading();
+    }
+
+    /// The reading (if any) is over: its speaker goes back to the start.
+    fn end_reading(&mut self) {
+        if let Some(id) = self.st.reading.take() {
+            self.history.update(id, |b| b.reading = false);
+        }
+    }
+
     fn speak(&mut self, text: String) {
         self.st.speech_pending = true;
         self.audio.speak(text);
@@ -1507,7 +1582,7 @@ impl Controller {
 
     /// Stop the reply: the agent's turn and any speech.
     fn interrupt(&mut self) {
-        self.audio.stop_speaking();
+        self.stop_speaking();
         let st = &mut self.st;
         st.sentences.clear();
         st.speech_pending = false;
@@ -1530,7 +1605,7 @@ impl Controller {
 
     pub fn new_conversation(&mut self) {
         self.cancel_listen();
-        self.audio.stop_speaking();
+        self.stop_speaking();
         self.end_session(false);
         self.history.clear();
         self.effects.push(Effect::HistoryShown(false));
@@ -1711,7 +1786,7 @@ impl Controller {
             st.voice_turn = false;
             st.speech_pending = false;
             st.sentences.clear();
-            self.audio.stop_speaking();
+            self.stop_speaking();
             self.audio.set_conversation(false);
         }
     }

@@ -121,6 +121,9 @@ after a minute of silence.
 **Interrupt it:** say the wake phrase while it's thinking or talking (*"Fishsticks and
 custard, actually…"*), or press the talk key. **Ctrl+C** in the popup stops a reply.
 
+**Hear a reply:** click the speaker at the end of a reply to have just that reply read
+aloud, even one you typed for. Click it again (it shows a square while reading) to stop.
+
 **Start over:** **Ctrl+N** starts a new conversation.
 
 **More room to read:** **EXPAND**, at the top right of the popup, makes the conversation

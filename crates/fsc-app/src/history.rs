@@ -45,6 +45,10 @@ pub struct Block {
     /// Space above it: none for the first shown, a little within a group,
     /// more between groups. Hidden blocks don't count.
     pub gap: u32,
+    /// A reply that's finished arriving: it can be read aloud.
+    pub finished: bool,
+    /// A reply being read aloud on request (its speaker shows stop).
+    pub reading: bool,
     #[serde(flatten)]
     pub card: Card,
 }
@@ -81,14 +85,23 @@ impl History {
 
     fn block(&mut self, group: u64, kind: Kind, text: &str) -> Block {
         self.next += 1;
-        Block { id: self.next, group, kind, text: text.to_string(), visible: true, gap: 0, card: Card::default() }
+        Block {
+            id: self.next,
+            group,
+            kind,
+            text: text.to_string(),
+            visible: true,
+            gap: 0,
+            finished: false,
+            reading: false,
+            card: Card::default(),
+        }
     }
 
     fn index(&self, id: u64) -> Option<usize> {
         self.blocks.iter().position(|b| b.id == id)
     }
 
-    #[cfg(test)]
     pub fn get(&self, id: u64) -> Option<&Block> {
         self.blocks.iter().find(|b| b.id == id)
     }
@@ -356,5 +369,7 @@ mod tests {
         assert_eq!(json["shown"], true);
         assert!(json["key"].is_u64());
         assert_eq!(json["kind"], "ask");
+        assert_eq!(json["finished"], false);
+        assert_eq!(json["reading"], false);
     }
 }

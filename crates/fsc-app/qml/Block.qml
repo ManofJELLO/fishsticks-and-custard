@@ -29,15 +29,49 @@ Item {
                        : plainPart
     }
 
+    // Room a reply keeps at its right for its speaker, from its first word
+    // on, so the speaker turning up at the end moves no text.
+    readonly property int speakerRoom: 26
+
     // A prompt or a reply: its text can be highlighted for copying. It
-    // never takes focus from the text field.
+    // never takes focus from the text field. A finished reply ends with a
+    // speaker that reads it aloud (and, while it does, stops it).
     Component {
         id: selectablePart
-        Line {
-            text: block.model.text
-            popup: block.popup
-            color: block.kind === "reply" ? block.fg(0.95) : block.fg(0.55)
-            font.pixelSize: block.kind === "reply" ? 15 : 13
+        Item {
+            implicitHeight: line.implicitHeight
+            Line {
+                id: line
+                width: parent.width - (block.kind === "reply" ? block.speakerRoom : 0)
+                text: block.model.text
+                popup: block.popup
+                color: block.kind === "reply" ? block.fg(0.95) : block.fg(0.55)
+                font.pixelSize: block.kind === "reply" ? 15 : 13
+            }
+            SpeakerButton {
+                id: speaker
+                visible: block.kind === "reply" && block.model.finished
+                reading: block.model.reading
+                // Just after the last word: on its line, in the room kept.
+                // Worked out once the text has been laid out.
+                property rect end
+                function place() {
+                    end = line.positionToRectangle(line.text.replace(/\s+$/, "").length)
+                }
+                function placeSoon() { Qt.callLater(place) }
+                Connections {
+                    target: line
+                    function onTextChanged() { speaker.placeSoon() }
+                    function onContentHeightChanged() { speaker.placeSoon() }
+                    function onContentWidthChanged() { speaker.placeSoon() }
+                    function onWidthChanged() { speaker.placeSoon() }
+                }
+                onVisibleChanged: placeSoon()
+                Component.onCompleted: placeSoon()
+                x: Math.min(end.x + 6, parent.width - width)
+                y: Math.max(0, Math.min(end.y + (end.height - height) / 2, parent.height - height))
+                onClicked: Backend.readAloud(block.model.key)
+            }
         }
     }
 

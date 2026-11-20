@@ -8,6 +8,7 @@ fn main() {
         "qml/PillButton.qml",
         "qml/Popup.qml",
         "qml/Shot.qml",
+        "qml/SpeakerButton.qml",
         "qml/WindowPopup.qml",
     ]);
     CxxQtBuilder::new_qml_module(module)
