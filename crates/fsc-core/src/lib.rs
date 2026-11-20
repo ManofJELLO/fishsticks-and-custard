@@ -7,6 +7,7 @@ pub mod lang;
 pub mod memory;
 pub mod model_hashes;
 pub mod models;
+pub mod own_env;
 pub mod paths;
 pub mod permission;
 pub mod phase;

@@ -341,6 +341,11 @@ impl Controller {
         &self.meta
     }
 
+    /// A prompt is out and its reply not yet finished.
+    pub fn in_turn(&self) -> bool {
+        self.st.current.is_some()
+    }
+
     pub fn is_open(&self) -> bool {
         self.open
     }

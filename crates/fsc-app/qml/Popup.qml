@@ -14,6 +14,13 @@ FocusScope {
     readonly property int padX: 24
     // The text line whose highlight Ctrl+C copies (the one last selected in).
     property Item picked: null
+    // The conversation area at its larger size, for reading long replies.
+    // Only the button changes it.
+    property bool expanded: false
+    // Pinned to the bottom edge, the popup grows upward: the size button
+    // goes by the text field there, so growing doesn't carry it away.
+    readonly property bool growsUp: Backend.surface === "layer"
+                                    && (Backend.anchors & 2) !== 0 && (Backend.anchors & 1) === 0
 
     implicitWidth: Backend.popupWidth
     implicitHeight: content.implicitHeight + content.anchors.topMargin + content.anchors.bottomMargin
@@ -47,6 +54,52 @@ FocusScope {
             return
         }
         event.accepted = true
+    }
+
+    function toggleSize() {
+        root.expanded = !root.expanded
+        history.settle()
+    }
+
+    // The button that gives the conversation more room, or takes it back.
+    // Always in the layout (hidden while there's no conversation), so its
+    // coming and going moves nothing else.
+    component SizeButton: Button {
+        id: sizeButton
+        focusPolicy: Qt.NoFocus
+        enabled: Backend.historyShown
+        opacity: enabled ? 1 : 0
+        text: root.expanded ? "COLLAPSE" : "EXPAND"
+        Accessible.name: root.expanded ? "Make the conversation smaller" : "Make the conversation bigger"
+        leftPadding: 10
+        rightPadding: 10
+        topPadding: 0
+        bottomPadding: 0
+        // As wide as its longer label, so switching labels moves nothing.
+        implicitWidth: widest.advanceWidth + leftPadding + rightPadding
+        implicitHeight: 18
+        TextMetrics {
+            id: widest
+            font: label.font
+            text: "COLLAPSE"
+        }
+        contentItem: Text {
+            id: label
+            text: sizeButton.text
+            font.family: Backend.fontFamily
+            font.pixelSize: 9
+            font.letterSpacing: 2
+            color: root.fg(sizeButton.hovered ? 0.95 : 0.72)
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+        background: Rectangle {
+            radius: height / 2
+            color: sizeButton.hovered ? root.fg(0.04) : "transparent"
+            border.width: 1
+            border.color: sizeButton.hovered ? root.fg(0.55) : root.fg(0.22)
+        }
+        onClicked: root.toggleSize()
     }
 
     // A line in the conversation was highlighted in: it's the one Ctrl+C
@@ -86,7 +139,11 @@ FocusScope {
         }
         function onBgChanged() { root.paintPanelSoon() }
         function onFgChanged() { root.paintPanelSoon() }
-        function onHistoryShownChanged() { root.paintPanelSoon() }
+        function onHistoryShownChanged() {
+            if (Backend.historyShown) history.settle()
+            root.paintPanelSoon()
+        }
+        function onShowPopup(focus) { history.settle() }
         function onClearPick() {
             if (root.picked) root.picked.deselect()
             root.picked = null
@@ -159,6 +216,10 @@ FocusScope {
                 style: Text.Outline
                 styleColor: Qt.rgba(Backend.bg.r, Backend.bg.g, Backend.bg.b, 0.5)
             }
+            SizeButton {
+                Layout.alignment: Qt.AlignVCenter
+                visible: !root.growsUp
+            }
         }
 
         Raster {
@@ -172,7 +233,7 @@ FocusScope {
         Flickable {
             id: history
             Layout.fillWidth: true
-            Layout.preferredHeight: Math.min(blocks.implicitHeight, Backend.maxHeight)
+            Layout.preferredHeight: held
             visible: Backend.historyShown
             clip: true
             contentWidth: width
@@ -194,10 +255,74 @@ FocusScope {
             onContentHeightChanged: if (stick) toEnd()
             onHeightChanged: if (stick) toEnd()
 
+            // The area's height. It changes only when you act: open the
+            // popup, send a prompt, press EXPAND or COLLAPSE. Streamed text
+            // never resizes it, so the text field and the ALLOW/DENY buttons
+            // stay where your pointer is headed.
+            property real held: 0
+            function limit() {
+                if (!root.expanded) return Backend.maxHeight
+                // Expanded: the whole popup takes about 70% of the screen.
+                const others = content.anchors.topMargin + content.anchors.bottomMargin
+                             + header.implicitHeight + viz.Layout.preferredHeight
+                             + entryRow.implicitHeight + 3 * content.spacing
+                return Math.max(Backend.maxHeight, Math.floor(root.Screen.height * 0.7) - others)
+            }
+            // Fit what's there, or, with a reply on its way, all it may hold.
+            function settle() {
+                blocks.forceLayout()
+                held = Backend.busy ? limit() : Math.min(blocks.implicitHeight, limit())
+            }
+
+            // Scrolled up to read: lines added, removed or resized above
+            // the view (old exchanges trimmed, a card answered, a tool line
+            // put above the reply) move the view by as much, so the text
+            // you're reading stays put.
+            function topOf(i) {
+                const item = lines.itemAt(i)
+                return item ? item.y : blocks.implicitHeight
+            }
+            function shiftBy(d) {
+                if (d === 0) return
+                blocks.forceLayout()
+                placing = true
+                contentY = Math.max(0, Math.min(contentY + d, contentHeight - height))
+                placing = false
+            }
+            function insertLine(index, data) {
+                if (stick) { blockModel.insert(index, data); return }
+                blocks.forceLayout()
+                const at = topOf(index)
+                blockModel.insert(index, data)
+                const item = lines.itemAt(index)
+                if (item && at <= contentY) shiftBy(item.height)
+            }
+            function updateLine(index, data) {
+                const item = stick ? null : lines.itemAt(index)
+                if (!item) { blockModel.set(index, data); return }
+                blocks.forceLayout()
+                const above = item.y + item.height <= contentY
+                const before = item.height
+                blockModel.set(index, data)
+                if (above) shiftBy(item.height - before)
+            }
+            function removeLines(index, count) {
+                if (stick) { blockModel.remove(index, count); return }
+                blocks.forceLayout()
+                const top = topOf(index)
+                const bottom = topOf(index + count)
+                blockModel.remove(index, count)
+                shiftBy(-Math.max(0, Math.min(bottom, contentY) - top))
+            }
+
             Connections {
                 target: Backend
                 function onScrollToEnd(force) {
-                    if (force) history.stick = true
+                    // Forced: you sent a prompt. Make room for the reply.
+                    if (force) {
+                        history.stick = true
+                        history.settle()
+                    }
                     if (history.stick) history.toEnd()
                 }
             }
@@ -224,6 +349,7 @@ FocusScope {
                 width: history.width
 
                 Repeater {
+                    id: lines
                     model: ListModel { id: blockModel }
                     delegate: Block {
                         width: blocks.width
@@ -234,9 +360,9 @@ FocusScope {
 
             Connections {
                 target: Backend
-                function onHistoryInsert(index, json) { blockModel.insert(index, JSON.parse(json)) }
-                function onHistoryUpdate(index, json) { blockModel.set(index, JSON.parse(json)) }
-                function onHistoryRemove(index, count) { blockModel.remove(index, count) }
+                function onHistoryInsert(index, json) { history.insertLine(index, JSON.parse(json)) }
+                function onHistoryUpdate(index, json) { history.updateLine(index, JSON.parse(json)) }
+                function onHistoryRemove(index, count) { history.removeLines(index, count) }
                 function onHistoryClear() {
                     root.picked = null
                     blockModel.clear()
@@ -245,49 +371,60 @@ FocusScope {
             }
         }
 
-        TextField {
-            id: entry
+        RowLayout {
+            id: entryRow
             Layout.fillWidth: true
-            focus: true
-            placeholderText: "Ask anything…"
-            placeholderTextColor: root.fg(0.35)
-            color: root.fg(0.95)
-            selectionColor: root.accentA(0.35)
-            selectedTextColor: root.fg(0.95)
-            font.family: Backend.fontFamily
-            font.pixelSize: 14
-            leftPadding: 18
-            rightPadding: 18
-            topPadding: 8
-            bottomPadding: 8
-            implicitHeight: 26 + topPadding + bottomPadding
+            spacing: 12
             onYChanged: root.paintPanelSoon()
-            background: Rectangle {
-                radius: height / 2
-                color: root.fg(0.04)
-                border.width: 1
-                border.color: entry.activeFocus ? root.fg(0.55) : root.fg(0.22)
-            }
-            cursorDelegate: Rectangle {
-                width: 1.5
-                color: Backend.accent
-                visible: entry.cursorVisible
-                SequentialAnimation on opacity {
-                    running: entry.cursorVisible
-                    loops: Animation.Infinite
-                    NumberAnimation { to: 1; duration: 0 }
-                    PauseAnimation { duration: 530 }
-                    NumberAnimation { to: 0; duration: 0 }
-                    PauseAnimation { duration: 530 }
+
+            TextField {
+                id: entry
+                Layout.fillWidth: true
+                focus: true
+                placeholderText: "Ask anything…"
+                placeholderTextColor: root.fg(0.35)
+                color: root.fg(0.95)
+                selectionColor: root.accentA(0.35)
+                selectedTextColor: root.fg(0.95)
+                font.family: Backend.fontFamily
+                font.pixelSize: 14
+                leftPadding: 18
+                rightPadding: 18
+                topPadding: 8
+                bottomPadding: 8
+                implicitHeight: 26 + topPadding + bottomPadding
+                background: Rectangle {
+                    radius: height / 2
+                    color: root.fg(0.04)
+                    border.width: 1
+                    border.color: entry.activeFocus ? root.fg(0.55) : root.fg(0.22)
                 }
-            }
-            Keys.onPressed: (event) => root.handleKey(event)
-            onAccepted: {
-                if (Backend.submit(text)) {
-                    text = ""
+                cursorDelegate: Rectangle {
+                    width: 1.5
+                    color: Backend.accent
+                    visible: entry.cursorVisible
+                    SequentialAnimation on opacity {
+                        running: entry.cursorVisible
+                        loops: Animation.Infinite
+                        NumberAnimation { to: 1; duration: 0 }
+                        PauseAnimation { duration: 530 }
+                        NumberAnimation { to: 0; duration: 0 }
+                        PauseAnimation { duration: 530 }
+                    }
                 }
+                Keys.onPressed: (event) => root.handleKey(event)
+                onAccepted: {
+                    if (Backend.submit(text)) {
+                        text = ""
+                    }
+                }
+                onTextChanged: Backend.setEntryEmpty(text.length === 0)
             }
-            onTextChanged: Backend.setEntryEmpty(text.length === 0)
+
+            SizeButton {
+                Layout.alignment: Qt.AlignVCenter
+                visible: root.growsUp
+            }
         }
     }
 }

@@ -14,10 +14,9 @@ pub fn notify(text: &str) {
     }
     #[cfg(target_os = "linux")]
     tokio::spawn(async move {
-        let _ = tokio::process::Command::new("notify-send")
-            .args(["--app-name=Fishsticks & Custard", "Fishsticks & Custard", &body])
-            .status()
-            .await;
+        let mut cmd = tokio::process::Command::new("notify-send");
+        fsc_core::own_env::restore(cmd.as_std_mut());
+        let _ = cmd.args(["--app-name=Fishsticks & Custard", "Fishsticks & Custard", &body]).status().await;
     });
     // TODO(cross-platform): the Qt tray's balloon message on Windows/macOS.
     #[cfg(not(target_os = "linux"))]
@@ -28,6 +27,8 @@ pub fn notify(text: &str) {
 /// outlives fscd and isn't sent fscd's signals. Reaped in the background.
 pub fn spawn_detached(prog: &str, args: &[String]) -> std::io::Result<()> {
     let mut cmd = std::process::Command::new(prog);
+    // Without fscd's own Qt settings: HyprCustard, for one, is a Qt app.
+    fsc_core::own_env::restore(&mut cmd);
     cmd.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null());
     #[cfg(unix)]
     {

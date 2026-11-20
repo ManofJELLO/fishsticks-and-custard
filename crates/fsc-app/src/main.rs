@@ -70,24 +70,26 @@ fn main() -> std::process::ExitCode {
 /// layer-shell one has no X11 equivalent), though a test may ask for
 /// `offscreen`.
 fn offscreen() -> bool {
-    std::env::var("QT_QPA_PLATFORM").is_ok_and(|p| p == "offscreen")
+    // Options may follow, as in "offscreen:configfile=screens.json".
+    std::env::var("QT_QPA_PLATFORM").is_ok_and(|p| p.split(':').next() == Some("offscreen"))
 }
 
 fn run() -> Result<()> {
     // Before any threads exist (these set environment variables).
     fsc_audio::prepare_env();
-    // SAFETY (all set_var below): no other threads exist yet.
+    // For fscd's own Qt only: the programs it starts get these as they were.
+    // (The QML imports QtQuick.Controls.Basic by name, so the user's
+    // QT_QUICK_CONTROLS_STYLE can't restyle the popup and needn't be set.)
+    // SAFETY (both below): no other threads exist yet.
     if cfg!(target_os = "linux") && !offscreen() {
-        unsafe { std::env::set_var("QT_QPA_PLATFORM", "wayland") };
+        unsafe { fsc_core::own_env::set("QT_QPA_PLATFORM", "wayland") };
     }
-    // The popup draws every control itself; Basic is the style that imposes
-    // no colours of its own on the few parts Qt still draws.
-    if std::env::var_os("QT_QUICK_CONTROLS_STYLE").is_none() {
-        unsafe { std::env::set_var("QT_QUICK_CONTROLS_STYLE", "Basic") };
-    }
+    // Qt's own messages (QML errors among them) go to the systemd journal
+    // when stderr isn't a terminal; fscd's stderr is the log, so keep them there.
+    unsafe { fsc_core::own_env::set("QT_FORCE_STDERR_LOGGING", "1") };
     // Qt's Wayland text input warns each time focus leaves a text field.
     if std::env::var_os("QT_LOGGING_RULES").is_none() {
-        unsafe { std::env::set_var("QT_LOGGING_RULES", "qt.qpa.wayland.textinput=false") };
+        unsafe { fsc_core::own_env::set("QT_LOGGING_RULES", "qt.qpa.wayland.textinput=false") };
     }
 
     // Headless diagnostics: no display needed.
@@ -228,6 +230,9 @@ fn run() -> Result<()> {
                     "fscd: the popup failed to load ({url}). On Arch, check that qt6-declarative \
                      (and, for surface = \"layer\", layer-shell-qt) are installed."
                 );
+                // Straight out, but not before the hint reaches the log.
+                server::cleanup();
+                log::drain();
                 std::process::exit(1);
             })
             .release();

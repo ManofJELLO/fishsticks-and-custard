@@ -130,6 +130,8 @@ impl Backend for Acp {
         let cwd = workspace(home);
         std::fs::create_dir_all(&cwd).map_err(|e| format!("could not create {}: {e}", cwd.display()))?;
         let mut cmd = tokio::process::Command::new(&self.program);
+        // Before `self.env`, which may set the same names on purpose.
+        crate::own_env::restore(cmd.as_std_mut());
         cmd.args(&self.args)
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .current_dir(&cwd)

@@ -46,6 +46,8 @@ pub mod qobject {
         #[qproperty(QString, meta)]
         #[qproperty(bool, shown)]
         #[qproperty(bool, history_shown, cxx_name = "historyShown")]
+        /// A reply is on its way (the popup keeps room for it).
+        #[qproperty(bool, busy)]
         #[qproperty(QColor, fg)]
         #[qproperty(QColor, bg)]
         #[qproperty(QColor, accent)]
@@ -218,6 +220,7 @@ pub struct BackendRust {
     meta: QString,
     shown: bool,
     history_shown: bool,
+    busy: bool,
     fg: QColor,
     bg: QColor,
     accent: QColor,
@@ -303,7 +306,11 @@ impl qobject::Backend {
         let r = f(&mut ctl);
         let ops = ctl.history.take_ops();
         let effects = ctl.take_effects();
+        let busy = ctl.in_turn();
         self.as_mut().rust_mut().ctl = Some(ctl);
+        if *self.busy() != busy {
+            self.as_mut().set_busy(busy);
+        }
         self.apply(ops, effects);
         r
     }

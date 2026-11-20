@@ -338,6 +338,7 @@ impl Conn for ClaudeConn {
 
 fn start(cfg: &ClaudeConfig, home: &Path, prompt: &str) -> Result<ClaudeConn, String> {
     let mut cmd = tokio::process::Command::new(&cfg.bin);
+    crate::own_env::restore(cmd.as_std_mut());
     cmd.args([
         "-p",
         "--input-format",

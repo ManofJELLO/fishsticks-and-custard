@@ -46,7 +46,7 @@ opacity = 0.92                # panel opacity (window mode: use Hyprland's opaci
 gradient = false              # fade: most see-through behind the visualiser, solid behind text
 # All modes:
 width = 680
-max_height = 360              # conversation area before it scrolls
+max_height = 360              # conversation area before it scrolls (EXPAND gives it ~70% of the screen)
 font = "0xProto Nerd Font"
 accent = "system"             # desktop accent (else the Qt palette's); or hex, e.g. "#D71921"
 theme = "auto"                # light/dark for the tray icon: "auto" follows the desktop portal; or "dark" / "light"

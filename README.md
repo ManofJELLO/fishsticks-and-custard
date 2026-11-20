@@ -123,6 +123,11 @@ custard, actually…"*), or press the talk key. **Ctrl+C** in the popup stops a 
 
 **Start over:** **Ctrl+N** starts a new conversation.
 
+**More room to read:** **EXPAND**, at the top right of the popup, makes the conversation
+area about two-thirds of the screen tall; **COLLAPSE** takes it back. The popup changes
+size only when you do something (open it, send a message, press one of these), never
+while a reply comes in, so the text field and buttons stay where you're reaching for them.
+
 ## When it asks first
 
 <p align="center"><img src="docs/images/popup-allow.png" alt="A permission card asking to run a command, with Allow and Deny buttons" width="680"></p>
@@ -330,7 +335,7 @@ Some settings you might want to change:
 | `[ui] tray_icon` | `"police-box"` (default) or `"fishbone"`. |
 | `[ui] visualiser` | `"spectrum"` (default) shows bars, `"loudness"` shows a level over time. |
 | `[ui] accent` | The highlight colour. By default it follows your desktop. |
-| `[ui] width`, `max_height` | The popup's size. |
+| `[ui] width`, `max_height` | The popup's width, and how tall the conversation gets before it scrolls (until you press EXPAND). |
 | `[voice] end_silence_ms` | How long a pause ends what you're saying. Raise it if it cuts you off mid-thought. |
 | `[voice] conversation` | Set it to `false` to stop listening again after each spoken reply. |
 | `[voice] hang_up_after_secs` | Seconds of silence before a voice conversation hangs up. |

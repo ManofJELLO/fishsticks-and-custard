@@ -60,7 +60,9 @@ Previews without running the app:
 - `FSC_SHOT=FILE.png` saves the popup to that PNG every second while it's up. With
   `QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software` it runs with no window on
   screen at all, so the look can be checked without taking focus (layer mode needs a
-  real Wayland session; offscreen shows the window version).
+  real Wayland session; offscreen shows the window version). For a particular screen
+  size, use `QT_QPA_PLATFORM=offscreen:configfile=screen.json` with
+  `{"screens":[{"name":"S1","x":0,"y":0,"width":2560,"height":1440,"logicalDpi":96,"logicalBaseDpi":96,"dpr":1}]}`.
 
 ## Releasing
 
