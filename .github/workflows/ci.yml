@@ -90,6 +90,9 @@ jobs:
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
           CMAKE_GENERATOR: Ninja
+          # Parallel cl.exe runs share a .pdb; /FS makes them take turns (C1041).
+          CFLAGS: /FS
+          CXXFLAGS: /FS
         run: cargo build --release --workspace --locked
 
       - name: Test
@@ -99,4 +102,7 @@ jobs:
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
           CMAKE_GENERATOR: Ninja
+          # Parallel cl.exe runs share a .pdb; /FS makes them take turns (C1041).
+          CFLAGS: /FS
+          CXXFLAGS: /FS
         run: cargo test --release --workspace --locked
