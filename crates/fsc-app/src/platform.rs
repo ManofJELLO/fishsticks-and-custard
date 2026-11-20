@@ -78,3 +78,101 @@ pub async fn quit_signal() -> bool {
         tokio::signal::ctrl_c().await.is_ok()
     }
 }
+
+/// macOS: an app started from Finder, the Dock or at login gets launchd's
+/// bare PATH (/usr/bin:/bin:/usr/sbin:/sbin): no Homebrew, no ~/.local/bin,
+/// nothing the shell's profile adds. Then `claude` and `codex`, and the
+/// `node` and `git` they run, aren't found. So take the login shell's PATH
+/// (as an interactive login shell has it, where nvm and the like set it up),
+/// once, at startup. Says what it did, for the log.
+///
+/// Must be called before any other thread exists: it sets PATH.
+#[cfg(target_os = "macos")]
+pub fn adopt_login_path() -> String {
+    let current = std::env::var("PATH").unwrap_or_default();
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let login = login_shell_path();
+    let merged = merge_path(login.as_deref().ok(), &current, &home, |p| p.is_dir());
+    // SAFETY: the caller guarantees no other threads exist yet.
+    unsafe { std::env::set_var("PATH", &merged) };
+    match login {
+        Ok(_) => format!("PATH from the login shell: {merged}"),
+        Err(e) => format!("PATH: the login shell's isn't known ({e}); using {merged}"),
+    }
+}
+
+/// The PATH an interactive login shell (`$SHELL`, else zsh) ends up with.
+/// Read from `env` between markers, since a profile may print things, and
+/// fish keeps PATH as a list that only `env` shows joined.
+#[cfg(target_os = "macos")]
+fn login_shell_path() -> Result<String, String> {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+    const MARK: &str = "_FSC_ENV_";
+    let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/zsh".into());
+    let mut child = std::process::Command::new(&shell)
+        .args(["-i", "-l", "-c", &format!("echo {MARK}; /usr/bin/env; echo {MARK}")])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("{shell}: {e}"))?;
+    // A profile that waits for input or hangs mustn't stop fscd starting.
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if start.elapsed() < Duration::from_secs(5) => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{shell} took too long"));
+            }
+        }
+    }
+    let mut out = String::new();
+    child.stdout.take().map(|mut s| s.read_to_string(&mut out));
+    let mut parts = out.split(MARK);
+    parts.next();
+    let env = parts.next().ok_or_else(|| format!("{shell} printed no environment"))?;
+    env.lines()
+        .find_map(|l| l.strip_prefix("PATH="))
+        .map(str::to_string)
+        .ok_or_else(|| format!("{shell} has no PATH"))
+}
+
+/// The login shell's PATH (if known), then what fscd was given, then the
+/// usual homes of Homebrew and user-installed CLIs that exist (`is_dir`),
+/// each once, in that order.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn merge_path(login: Option<&str>, current: &str, home: &Path, is_dir: impl Fn(&Path) -> bool) -> String {
+    let usual = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .chain([".local/bin", ".cargo/bin", ".bun/bin", ".npm-global/bin"].into_iter().map(|d| home.join(d)))
+        .filter(|d| is_dir(d))
+        .map(|d| d.display().to_string());
+    let mut out: Vec<String> = Vec::new();
+    let given = login.into_iter().chain([current]).flat_map(|p| p.split(':')).map(str::to_string);
+    for dir in given.chain(usual) {
+        if !dir.is_empty() && !out.contains(&dir) {
+            out.push(dir);
+        }
+    }
+    out.join(":")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_merges_login_given_and_usual_once() {
+        let home = Path::new("/Users/u");
+        let exists = |p: &Path| p == Path::new("/opt/homebrew/bin") || p == Path::new("/Users/u/.local/bin");
+        let merged = merge_path(Some("/Users/u/.local/bin:/opt/homebrew/bin:/usr/bin"), "/usr/bin:/bin", home, exists);
+        assert_eq!(merged, "/Users/u/.local/bin:/opt/homebrew/bin:/usr/bin:/bin");
+        // Without the login shell's, the usual places that exist are added.
+        assert_eq!(merge_path(None, "/usr/bin:/bin", home, exists), "/usr/bin:/bin:/opt/homebrew/bin:/Users/u/.local/bin");
+    }
+}

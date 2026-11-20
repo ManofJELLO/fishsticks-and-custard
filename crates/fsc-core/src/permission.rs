@@ -63,6 +63,21 @@ pub const SECRET_PATHS: &[&str] = &[
     "~/.gemini/oauth_creds.json",
     "~/.gemini/antigravity-cli/antigravity-oauth-token",
     "~/.local/share/opencode/auth.json",
+    // macOS: the keychains, browser profiles and Apple's own apps.
+    "~/Library/Keychains/**",
+    "~/Library/Cookies/**",
+    "~/Library/Safari/**",
+    "~/Library/Mail/**",
+    "~/Library/Messages/**",
+    "~/Library/Application Support/Firefox/**",
+    "~/Library/Application Support/librewolf/**",
+    "~/Library/Application Support/zen/**",
+    "~/Library/Application Support/Google/Chrome/**",
+    "~/Library/Application Support/Chromium/**",
+    "~/Library/Application Support/BraveSoftware/**",
+    "~/Library/Application Support/Vivaldi/**",
+    "~/Library/Application Support/Microsoft Edge/**",
+    "~/Library/Application Support/Arc/**",
 ];
 
 /// `path` is, or is inside, one of the [`SECRET_PATHS`] under `home`.
@@ -86,11 +101,20 @@ pub fn is_secret(path: &std::path::Path, home: &std::path::Path) -> bool {
         let rest = pattern.trim_start_matches("~/").trim_end_matches("/**");
         let secret = home.join(rest);
         let real_secret = std::fs::canonicalize(&secret).ok();
-        let inside = |p: &std::path::Path| {
-            p.starts_with(&secret) || real_secret.as_deref().is_some_and(|s| p.starts_with(s))
-        };
+        let inside = |p: &std::path::Path| under(p, &secret) || real_secret.as_deref().is_some_and(|s| under(p, s));
         inside(&lexical) || real.as_deref().is_some_and(inside)
     })
+}
+
+/// `p` is `dir` or inside it. macOS and Windows file systems ignore case
+/// (by default), so there `~/Library/keychains` is `~/Library/Keychains`.
+fn under(p: &std::path::Path, dir: &std::path::Path) -> bool {
+    if cfg!(any(target_os = "macos", windows)) {
+        let low = |x: &std::path::Path| std::path::PathBuf::from(x.to_string_lossy().to_lowercase());
+        low(p).starts_with(low(dir))
+    } else {
+        p.starts_with(dir)
+    }
 }
 
 /// Turn a reply ("yes", "yeah go ahead", "always", "no thanks") into an answer.
@@ -286,6 +310,19 @@ mod tests {
         assert!(!is_secret(std::path::Path::new("/home/u/.sshrc"), home));
         assert!(!is_secret(std::path::Path::new("/home/u/notes/ssh.txt"), home));
         assert!(!is_secret(std::path::Path::new("/home/u/.claude/settings.json"), home));
+        let mac = std::path::Path::new("/Users/u");
+        assert!(is_secret(std::path::Path::new("/Users/u/Library/Keychains/login.keychain-db"), mac));
+        assert!(is_secret(std::path::Path::new("/Users/u/Library/Application Support/Google/Chrome/Default/Cookies"), mac));
+        assert!(!is_secret(std::path::Path::new("/Users/u/Library/Application Support/fsc/config.toml"), mac));
+    }
+
+    /// macOS and Windows ignore case in paths, so the check must too.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn secret_paths_ignore_case_where_files_do() {
+        let home = std::path::Path::new("/Users/u");
+        assert!(is_secret(std::path::Path::new("/Users/u/library/KEYCHAINS/login.keychain-db"), home));
+        assert!(is_secret(std::path::Path::new("/users/U/.SSH/id_ed25519"), home));
     }
 
     #[test]

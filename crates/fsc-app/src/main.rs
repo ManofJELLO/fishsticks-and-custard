@@ -112,8 +112,13 @@ fn run() -> Result<()> {
     if cfg!(target_os = "linux") && !offscreen() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
         anyhow::bail!("fscd needs a Wayland session (WAYLAND_DISPLAY is not set)");
     }
+    // Still before any threads: this sets PATH, for fscd and all it starts.
+    #[cfg(target_os = "macos")]
+    let path_note = platform::adopt_login_path();
     // Only the instance that stays: a second launch mustn't rotate its log.
     log::start();
+    #[cfg(target_os = "macos")]
+    eprintln!("fsc: {path_note}");
 
     let cfg = Config::load()?;
     // A hex colour in the config pins the accent; otherwise follow the desktop.

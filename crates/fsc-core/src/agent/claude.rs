@@ -34,7 +34,26 @@ const SETTINGS: &str = include_str!("../../../../voice-home/.claude/settings.loc
 /// 1: Edit/Write/NotebookEdit denied. 2: they're asked about instead.
 /// 3: also in the `settings.json` seeded before 0.5.0, whose denials won.
 /// 4: opening a web page asks; reading `permission::SECRET_PATHS` is denied.
-const SETTINGS_VERSION: u32 = 4;
+/// 5: the macOS ones among them too (`ADDED_IN_5`).
+const SETTINGS_VERSION: u32 = 5;
+/// The secret paths added in settings version 5. Only these are added to
+/// a home at version 4, so one the user took out stays out.
+const ADDED_IN_5: &[&str] = &[
+    "~/Library/Keychains/**",
+    "~/Library/Cookies/**",
+    "~/Library/Safari/**",
+    "~/Library/Mail/**",
+    "~/Library/Messages/**",
+    "~/Library/Application Support/Firefox/**",
+    "~/Library/Application Support/librewolf/**",
+    "~/Library/Application Support/zen/**",
+    "~/Library/Application Support/Google/Chrome/**",
+    "~/Library/Application Support/Chromium/**",
+    "~/Library/Application Support/BraveSoftware/**",
+    "~/Library/Application Support/Vivaldi/**",
+    "~/Library/Application Support/Microsoft Edge/**",
+    "~/Library/Application Support/Arc/**",
+];
 const SETTINGS_VERSION_FILE: &str = ".claude/fsc-settings-version";
 
 pub(crate) struct ClaudeCli {
@@ -184,10 +203,13 @@ fn migrate_settings(text: &str, from: u32) -> Option<String> {
         if let Some(allow) = v.pointer_mut("/permissions/allow").and_then(Value::as_array_mut) {
             allow.retain(|r| r != "WebFetch");
         }
+    }
+    if from < 5 {
         // ...and whatever it says, keys and passwords stay out of reach.
         let perms = v.as_object_mut()?.entry("permissions").or_insert_with(|| json!({}));
         let deny = perms.as_object_mut()?.entry("deny").or_insert_with(|| json!([])).as_array_mut()?;
-        for path in crate::permission::SECRET_PATHS {
+        let new = crate::permission::SECRET_PATHS.iter().filter(|p| from < 4 || ADDED_IN_5.contains(p));
+        for path in new {
             let rule = Value::from(format!("Read({path})"));
             if !deny.contains(&rule) {
                 deny.push(rule);
@@ -577,8 +599,22 @@ mod tests {
         assert_eq!(read(&legacy)["permissions"]["allow"], json!(["Read"]));
         assert!(deny(&local).contains(&json!("Bash(rm:*)")));
         assert!(deny(&local).contains(&json!("Read(~/.ssh/**)")));
-        assert_eq!(std::fs::read_to_string(home.join(SETTINGS_VERSION_FILE)).unwrap().trim(), "4");
+        assert_eq!(std::fs::read_to_string(home.join(SETTINGS_VERSION_FILE)).unwrap().trim(), "5");
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn version_5_adds_only_the_macos_secrets() {
+        for p in ADDED_IN_5 {
+            assert!(crate::permission::SECRET_PATHS.contains(p), "{p} isn't in SECRET_PATHS");
+        }
+        // At version 4, with ~/.aws taken back out by the user.
+        let v4 = r#"{"permissions":{"deny":["Read(~/.ssh/**)"]}}"#;
+        let v: Value = serde_json::from_str(&migrate_settings(v4, 4).unwrap()).unwrap();
+        let deny = v["permissions"]["deny"].as_array().unwrap();
+        assert_eq!(deny.len(), 1 + ADDED_IN_5.len());
+        assert!(deny.contains(&json!("Read(~/Library/Keychains/**)")));
+        assert!(!deny.contains(&json!("Read(~/.aws/**)")));
     }
 
     #[test]

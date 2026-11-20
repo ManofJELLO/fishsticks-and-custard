@@ -57,7 +57,21 @@
       "Read(~/.codex/auth.json)",
       "Read(~/.gemini/oauth_creds.json)",
       "Read(~/.gemini/antigravity-cli/antigravity-oauth-token)",
-      "Read(~/.local/share/opencode/auth.json)"
+      "Read(~/.local/share/opencode/auth.json)",
+      "Read(~/Library/Keychains/**)",
+      "Read(~/Library/Cookies/**)",
+      "Read(~/Library/Safari/**)",
+      "Read(~/Library/Mail/**)",
+      "Read(~/Library/Messages/**)",
+      "Read(~/Library/Application Support/Firefox/**)",
+      "Read(~/Library/Application Support/librewolf/**)",
+      "Read(~/Library/Application Support/zen/**)",
+      "Read(~/Library/Application Support/Google/Chrome/**)",
+      "Read(~/Library/Application Support/Chromium/**)",
+      "Read(~/Library/Application Support/BraveSoftware/**)",
+      "Read(~/Library/Application Support/Vivaldi/**)",
+      "Read(~/Library/Application Support/Microsoft Edge/**)",
+      "Read(~/Library/Application Support/Arc/**)"
     ]
   }
 }
