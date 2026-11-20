@@ -53,6 +53,10 @@ jobs:
     # Visual Studio 2022: under 2026 (windows-latest), whisper.cpp's shader
     # tool finds no compiler and espeak-ng's headers fail its preprocessor.
     runs-on: windows-2022
+    env:
+      # whisper.cpp's nested shader-tool build nests deep enough to pass
+      # Windows' 260-character path limit under the checkout's target/.
+      CARGO_TARGET_DIR: C:\t
     steps:
       - uses: actions/checkout@v7
 
@@ -82,6 +86,8 @@ jobs:
         run: choco install ninja -y --no-progress
 
       - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: ". -> C:\\t"
 
       - name: Build
         # PowerShell, not Git Bash: there Git's own `link` (coreutils)
@@ -90,9 +96,6 @@ jobs:
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
           CMAKE_GENERATOR: Ninja
-          # Parallel cl.exe runs share a .pdb; /FS makes them take turns (C1041).
-          CFLAGS: /FS
-          CXXFLAGS: /FS
         run: cargo build --release --workspace --locked
 
       - name: Test
@@ -102,7 +105,4 @@ jobs:
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
           CMAKE_GENERATOR: Ninja
-          # Parallel cl.exe runs share a .pdb; /FS makes them take turns (C1041).
-          CFLAGS: /FS
-          CXXFLAGS: /FS
         run: cargo test --release --workspace --locked
