@@ -100,6 +100,18 @@ impl Opt {
     }
 }
 
+/// The tray icon's tooltip: what it's doing, and what's wrong.
+pub fn tooltip(st: &IconState, mic_missing: bool) -> String {
+    let mut desc = st.phase.label().to_lowercase();
+    if st.muted {
+        desc.push_str(" · wake word muted");
+    }
+    if mic_missing {
+        desc.push_str(" · microphone not connected");
+    }
+    desc
+}
+
 /// The whole menu, top to bottom.
 pub fn items(muted: bool, m: &MenuState, mics: &Mics) -> Vec<Item> {
     let action = |label: &str, icon, cmd| Item::Action { label: label.into(), icon, cmd };

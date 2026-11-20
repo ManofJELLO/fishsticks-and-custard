@@ -104,14 +104,8 @@ impl ksni::Tray for FscTray {
     }
 
     fn tool_tip(&self) -> ToolTip {
-        let mut desc = self.st.phase.label().to_lowercase();
-        if self.st.muted {
-            desc.push_str(" · wake word muted");
-        }
-        if self.menu.mic_missing {
-            desc.push_str(" · microphone not connected");
-        }
-        ToolTip { title: "Fishsticks & Custard".into(), description: desc, ..Default::default() }
+        let description = tray_menu::tooltip(&self.st, self.menu.mic_missing);
+        ToolTip { title: "Fishsticks & Custard".into(), description, ..Default::default() }
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {

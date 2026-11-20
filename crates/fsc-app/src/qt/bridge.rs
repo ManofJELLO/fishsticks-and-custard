@@ -66,6 +66,13 @@ pub mod qobject {
         #[qproperty(QString, shot)]
         /// The screen's device pixel ratio, for drawing sharp on HiDPI.
         #[qproperty(f64, scale)]
+        /// The Qt tray (`TrayIcon.qml`): its icon (a file URL), whether the
+        /// system tints it (a macOS template image), tooltip, and menu (JSON
+        /// from `tray_qt`).
+        #[qproperty(QString, tray_icon, cxx_name = "trayIcon")]
+        #[qproperty(bool, tray_mask, cxx_name = "trayMask")]
+        #[qproperty(QString, tray_tip, cxx_name = "trayTip")]
+        #[qproperty(QString, tray_menu, cxx_name = "trayMenu")]
         type Backend = super::BackendRust;
     }
 
@@ -147,6 +154,16 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "readAloud"]
         fn read_aloud(self: Pin<&mut Backend>, key: f64);
+
+        /// The Qt tray's menu is opening: look for microphones again.
+        #[qinvokable]
+        #[cxx_name = "trayOpening"]
+        fn tray_opening(self: Pin<&mut Backend>);
+
+        /// A Qt tray menu entry was chosen (its `act`).
+        #[qinvokable]
+        #[cxx_name = "trayActivate"]
+        fn tray_activate(self: Pin<&mut Backend>, act: i32);
 
         #[qinvokable]
         #[cxx_name = "setEntryEmpty"]
@@ -246,6 +263,11 @@ pub struct BackendRust {
     /// for checking the look without a compositor or taking focus).
     shot: QString,
     scale: f64,
+    tray_icon: QString,
+    tray_mask: bool,
+    tray_tip: QString,
+    tray_menu: QString,
+    tray: crate::tray_qt::QtTray,
     ctl: Option<Controller>,
 }
 
@@ -282,6 +304,8 @@ impl cxx_qt::Initialize for qobject::Backend {
         self.as_mut().set_status_height(controller::status_height() as i32);
         self.as_mut().set_shot(QString::from(&std::env::var("FSC_SHOT").unwrap_or_default()));
         self.as_mut().set_scale(1.0);
+        // The macOS menu bar tints a template image to suit itself.
+        self.as_mut().set_tray_mask(cfg!(target_os = "macos"));
         qobject::set_icon_name(&QString::from(crate::APP_ID));
 
         let meta = QString::from(start.ctl.meta());
@@ -304,7 +328,60 @@ impl cxx_qt::Initialize for qobject::Backend {
 
 impl qobject::Backend {
     fn handle_event(mut self: Pin<&mut Self>, ev: AppEvent) {
-        self.as_mut().with_ctl(|c| c.handle(ev));
+        match ev {
+            AppEvent::Tray(u) => self.tray_update(u),
+            AppEvent::TrayMics(mics) => {
+                if self.as_mut().rust_mut().tray.mics.update(mics) {
+                    self.tray_refresh(false);
+                }
+            }
+            ev => self.as_mut().with_ctl(|c| c.handle(ev)),
+        }
+    }
+
+    fn tray_update(mut self: Pin<&mut Self>, u: crate::tray_menu::TrayUpdate) {
+        use crate::tray_menu::TrayUpdate;
+        let icon = matches!(u, TrayUpdate::Icon(_));
+        match u {
+            TrayUpdate::Icon(st) => self.as_mut().rust_mut().tray.icon = Some(st),
+            TrayUpdate::Menu(m) => self.as_mut().rust_mut().tray.menu = Some(m),
+        }
+        self.tray_refresh(icon);
+    }
+
+    /// Show the Qt tray's state: the menu (only when it changed, so an
+    /// open menu isn't redone for nothing), the tooltip, and the icon too
+    /// when `icon`.
+    fn tray_refresh(mut self: Pin<&mut Self>, icon: bool) {
+        if icon && let Some(url) = self.as_ref().rust().tray.icon.and_then(|st| crate::tray_qt::icon_url(&st)) {
+            self.as_mut().set_tray_icon(QString::from(&url));
+        }
+        let tip = QString::from(&self.as_ref().rust().tray.tooltip());
+        if *self.tray_tip() != tip {
+            self.as_mut().set_tray_tip(tip);
+        }
+        if let Some(json) = self.as_mut().rust_mut().tray.menu_json() {
+            let json = QString::from(&json);
+            if *self.tray_menu() != json {
+                self.as_mut().set_tray_menu(json);
+            }
+        }
+    }
+
+    pub fn tray_opening(self: Pin<&mut Self>) {
+        let thread = self.qt_thread();
+        tokio::spawn(async move {
+            let mics = crate::tray_qt::list_mics().await;
+            let _ = thread.queue(move |b| b.handle_event(AppEvent::TrayMics(mics)));
+        });
+    }
+
+    pub fn tray_activate(self: Pin<&mut Self>, act: i32) {
+        if let Some(cmd) = self.as_ref().rust().tray.command(act) {
+            self.with_ctl(|c| {
+                c.command(cmd);
+            });
+        }
     }
 
     /// Run `f` on the controller, then show what it changed. The controller

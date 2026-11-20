@@ -9,6 +9,7 @@ fn main() {
         "qml/Popup.qml",
         "qml/Shot.qml",
         "qml/SpeakerButton.qml",
+        "qml/TrayIcon.qml",
         "qml/WindowPopup.qml",
     ]);
     CxxQtBuilder::new_qml_module(module)

@@ -20,12 +20,8 @@ mod style;
 mod theme;
 #[cfg(target_os = "linux")]
 mod tray;
-#[cfg(not(target_os = "linux"))]
-#[path = "tray_none.rs"]
-mod tray;
-// Until the menu bar shows it, only Linux reads the menu itself.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod tray_menu;
+mod tray_qt;
 
 use anyhow::Result;
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
@@ -55,6 +51,9 @@ pub enum AppEvent {
     MicName(String),
     /// Show streamed text now: the events before this one are handled.
     Flush,
+    /// For the Qt tray (`tray_qt`), which lives on the Qt thread.
+    Tray(tray_menu::TrayUpdate),
+    TrayMics(Vec<fsc_audio::Microphone>),
 }
 
 pub const APP_ID: &str = "dev.fsc.FishsticksAndCustard";
@@ -67,6 +66,12 @@ fn main() -> std::process::ExitCode {
     }
     log::drain();
     if result.is_ok() { std::process::ExitCode::SUCCESS } else { std::process::ExitCode::FAILURE }
+}
+
+/// The tray is Qt's (`tray_qt`): everywhere but Linux, and there when
+/// `FSC_QT_TRAY` is set, to try it.
+pub fn qt_tray() -> bool {
+    !cfg!(target_os = "linux") || std::env::var_os("FSC_QT_TRAY").is_some()
 }
 
 /// The platform Qt runs on. On Linux the popup is a Wayland surface (a
@@ -151,19 +156,21 @@ fn run() -> Result<()> {
     }
 
     let (tray_tx, tray_rx) = mpsc::unbounded_channel();
-    rt.spawn(tray::run(
-        icon::IconState {
-            phase: fsc_core::Phase::Idle,
-            theme: initial_theme,
-            muted: false,
-            // The recording dot is always red, whatever the theme.
-            accent: style::NOTHING_RED,
-            shape: cfg.ui.tray_icon,
-        },
-        tray::MenuState::new(&cfg),
-        tray_rx,
-        ev_tx.clone(),
-    ));
+    let first_icon = icon::IconState {
+        phase: fsc_core::Phase::Idle,
+        theme: initial_theme,
+        muted: false,
+        // The recording dot is always red, whatever the theme.
+        accent: style::NOTHING_RED,
+        shape: cfg.ui.tray_icon,
+    };
+    let first_menu = tray_menu::MenuState::new(&cfg);
+    if qt_tray() {
+        rt.spawn(tray_qt::run(first_icon, first_menu, tray_rx, ev_tx.clone()));
+    } else {
+        #[cfg(target_os = "linux")]
+        rt.spawn(tray::run(first_icon, first_menu, tray_rx, ev_tx.clone()));
+    }
 
     let agent = {
         let tx = ev_tx.clone();
@@ -234,6 +241,12 @@ fn run() -> Result<()> {
         engine
             .as_mut()
             .on_object_creation_failed(|_, url| {
+                // Without its tray icon fscd still works (hotkeys, the wake
+                // phrase, `fsc`): say so and carry on.
+                if format!("{url}").ends_with("TrayIcon.qml") {
+                    eprintln!("fscd: the tray icon failed to load ({url}); carrying on without it");
+                    return;
+                }
                 eprintln!(
                     "fscd: the popup failed to load ({url}). On Arch, check that qt6-declarative \
                      (and, for surface = \"layer\", layer-shell-qt) are installed."
@@ -249,7 +262,10 @@ fn run() -> Result<()> {
             Surface::Layer if cfg!(target_os = "linux") && !offscreen() => "LayerPopup",
             _ => "WindowPopup",
         };
-        engine.load(&QUrl::from(&format!("qrc:/qt/qml/dev/fsc/app/qml/{root}.qml")));
+        engine.as_mut().load(&QUrl::from(&format!("qrc:/qt/qml/dev/fsc/app/qml/{root}.qml")));
+        if qt_tray() {
+            engine.load(&QUrl::from("qrc:/qt/qml/dev/fsc/app/qml/TrayIcon.qml"));
+        }
     }
     if let Some(app) = app.as_mut() {
         app.exec();

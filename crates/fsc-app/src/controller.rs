@@ -25,7 +25,7 @@ use crate::icon::IconState;
 use crate::platform::notify;
 use crate::speech_text::SentenceBuffer;
 use crate::style::{self, Palette, Rgb, SystemColors, ThemeMode};
-use crate::tray::{self, TrayUpdate};
+use crate::tray_menu::{self as tray, TrayUpdate};
 
 const MAX_EXCHANGES: usize = 20;
 pub const STATUS_PITCH: f64 = 3.0;
@@ -398,6 +398,8 @@ impl Controller {
             AppEvent::IdleTick => self.tick_idle(),
             AppEvent::MicName(name) => self.flash_meta(&short_meta(&format!("MIC: {}", name.to_uppercase()))),
             AppEvent::Flush => self.flush(),
+            // The Qt tray's, taken by the bridge before they get here.
+            AppEvent::Tray(_) | AppEvent::TrayMics(_) => {}
         }
     }
 
