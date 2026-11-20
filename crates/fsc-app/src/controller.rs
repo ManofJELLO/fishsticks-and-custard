@@ -1068,7 +1068,7 @@ impl Controller {
         } else {
             match Config::ensure_file() {
                 Ok(path) => {
-                    let (prog, args) = crate::platform::opener(&path);
+                    let (prog, args) = crate::platform::text_opener(&path);
                     (prog, args, path.display().to_string())
                 }
                 Err(e) => return Reply::err(format!("no config file: {e:#}")),

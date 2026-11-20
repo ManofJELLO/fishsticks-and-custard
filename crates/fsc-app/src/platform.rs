@@ -18,8 +18,20 @@ pub fn notify(text: &str) {
         fsc_core::own_env::restore(cmd.as_std_mut());
         let _ = cmd.args(["--app-name=Fishsticks & Custard", "Fishsticks & Custard", &body]).status().await;
     });
-    // TODO(cross-platform): the Qt tray's balloon message on Windows/macOS.
-    #[cfg(not(target_os = "linux"))]
+    // macOS: through AppleScript, the text passed as an argument so nothing
+    // in it is read as script. (Shown as from Script Editor until the app is
+    // signed and can post its own.)
+    #[cfg(target_os = "macos")]
+    tokio::spawn(async move {
+        let script = ["on run argv", "display notification (item 1 of argv) with title \"Fishsticks & Custard\"", "end run"];
+        let mut cmd = tokio::process::Command::new("/usr/bin/osascript");
+        for line in script {
+            cmd.args(["-e", line]);
+        }
+        let _ = cmd.arg("--").arg(&body).status().await;
+    });
+    // TODO(windows): a toast.
+    #[cfg(windows)]
     eprintln!("fsc: {body}");
 }
 
@@ -40,13 +52,15 @@ pub fn spawn_detached(prog: &str, args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The program and arguments that open `path` in the desktop's app for it.
-pub fn opener(path: &Path) -> (&'static str, Vec<String>) {
+/// The program and arguments that open the text file `path` to edit: the
+/// default text editor on macOS (a `.toml` may have no app of its own),
+/// Notepad on Windows, the desktop's choice on Linux.
+pub fn text_opener(path: &Path) -> (&'static str, Vec<String>) {
     let p = path.display().to_string();
     if cfg!(target_os = "macos") {
-        ("open", vec![p])
+        ("open", vec!["-t".into(), p])
     } else if cfg!(windows) {
-        ("explorer", vec![p])
+        ("notepad", vec![p])
     } else {
         ("xdg-open", vec![p])
     }

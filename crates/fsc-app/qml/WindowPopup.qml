@@ -1,6 +1,9 @@
 // The popup as a normal window: Hyprland's window rules (matched by the
 // class dev.fsc.FishsticksAndCustard) float, place and decorate it. Also
 // the root in headless mode, where it's never shown.
+//
+// On macOS it places itself, centred near the top of the screen, and floats
+// like a launcher: on every Space and over full-screen apps.
 import QtQuick
 import QtQuick.Window
 import dev.fsc.app
@@ -22,6 +25,8 @@ Window {
     minimumHeight: popup.implicitHeight
     maximumHeight: popup.implicitHeight
 
+    readonly property bool mac: Qt.platform.os === "osx" || Qt.platform.os === "macos"
+
     Popup {
         id: popup
         anchors.fill: parent
@@ -38,6 +43,15 @@ Window {
     Connections {
         target: Backend
         function onShowPopup(focus) {
+            if (win.mac) {
+                // Placed only as it opens: once up, it never moves.
+                if (!win.visible) {
+                    const s = win.screen
+                    win.x = s.virtualX + Math.round((s.width - win.width) / 2)
+                    win.y = s.virtualY + Math.round(s.height * 0.12)
+                }
+                Backend.floatWindow(win, focus)
+            }
             win.visible = true
             win.raise()
             if (focus) {

@@ -35,6 +35,11 @@ pub mod qobject {
         #[namespace = "fsc"]
         fn quit_app();
 
+        /// macOS: the popup floats on every Space and over full-screen apps;
+        /// with `activate`, fscd becomes the active app. Nothing elsewhere.
+        #[namespace = "fsc"]
+        unsafe fn float_window(window: *mut QObject, activate: bool);
+
         #[namespace = "fsc"]
         fn set_icon_name(name: &QString);
     }
@@ -191,6 +196,11 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "setSystemColors"]
         fn set_system_colors(self: Pin<&mut Backend>, bg: &QColor, fg: &QColor, accent: &QColor);
+
+        /// macOS: float the popup's window (see `fsc::float_window`).
+        #[qinvokable]
+        #[cxx_name = "floatWindow"]
+        unsafe fn float_window_from_qml(self: Pin<&mut Backend>, window: *mut QObject, activate: bool);
 
         /// Give the popup's LayerShellQt window (`LayerShell.Window`) its margins.
         #[qinvokable]
@@ -530,6 +540,13 @@ impl qobject::Backend {
     pub fn set_system_colors(self: Pin<&mut Self>, bg: &QColor, fg: &QColor, accent: &QColor) {
         let sys = SystemColors { bg: rgb(bg), fg: rgb(fg), accent: rgb(accent) };
         self.with_ctl(|c| c.set_system_colors(sys));
+    }
+
+    /// # Safety
+    /// `window` is the popup's live Window, from QML (or null).
+    pub unsafe fn float_window_from_qml(self: Pin<&mut Self>, window: *mut qobject::QObject, activate: bool) {
+        // SAFETY: QML passes its own window object, alive for this call.
+        unsafe { qobject::float_window(window, activate) };
     }
 
     /// # Safety
