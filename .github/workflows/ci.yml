@@ -80,6 +80,16 @@ jobs:
       # whisper.cpp builds its shader tool as a separate CMake project, which
       # under the Visual Studio generator finds no compiler. Ninja in a
       # developer shell (cl.exe on PATH) gives both builds the same one.
+      # whisper.cpp loads vulkan-1.dll, which a GPU driver puts in System32;
+      # the runner has none, so use the runtime the SDK step installed.
+      - name: Vulkan runtime on PATH
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem C:\VulkanSDK -Recurse -Filter vulkan-1.dll | Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1
+          if (-not $dll) { $dll = Get-ChildItem C:\VulkanSDK -Recurse -Filter vulkan-1.dll | Select-Object -First 1 }
+          Write-Output "vulkan-1.dll: $($dll.FullName)"
+          $dll.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
       - name: MSVC developer shell
         uses: ilammy/msvc-dev-cmd@v1.13.0
       - name: Ninja
@@ -106,3 +116,10 @@ jobs:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
           CMAKE_GENERATOR: Ninja
         run: cargo test --release --workspace --locked
+
+      # A test program that can't start (STATUS_DLL_NOT_FOUND): name its DLLs.
+      - name: DLLs the test programs need
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-ChildItem C:\t\release -Recurse -Filter "fsc_*.exe" | ForEach-Object { dumpbin /nologo /dependents $_.FullName }
