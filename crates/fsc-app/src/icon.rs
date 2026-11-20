@@ -178,6 +178,7 @@ fn fishbone(pm: &mut Pixmap, paint: &Paint, t: Transform, size: u32) {
 }
 
 /// StatusNotifierItem wants ARGB32 in network byte order, non-premultiplied.
+#[cfg(target_os = "linux")]
 pub fn to_sni(pm: &Pixmap) -> ksni::Icon {
     let mut data = Vec::with_capacity(pm.pixels().len() * 4);
     for p in pm.pixels() {
@@ -191,6 +192,7 @@ pub fn to_sni(pm: &Pixmap) -> ksni::Icon {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn sni_icons(st: &IconState) -> Vec<ksni::Icon> {
     SIZES.iter().map(|&s| to_sni(&render(s, st))).collect()
 }

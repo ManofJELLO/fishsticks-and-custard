@@ -102,7 +102,7 @@ fn open() -> std::io::Result<PathBuf> {
     // SAFETY: plain libc calls on descriptors we own; fd 2 is replaced
     // atomically by dup2, so no write to stderr is lost or misdirected.
     let (read, terminal) = unsafe {
-        if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+        if cloexec_pipe(&mut fds) != 0 {
             return Err(std::io::Error::last_os_error());
         }
         let terminal = if libc::isatty(2) == 1 {
@@ -161,6 +161,27 @@ fn copy(read: File, mut file: File, mut terminal: Option<File>) {
             let _ = file.sync_data();
         }
         PENDING.store(!reader.buffer().is_empty(), Ordering::Release);
+    }
+}
+
+/// A pipe whose ends aren't inherited by programs fscd starts. Linux sets
+/// that atomically; macOS has no `pipe2`, but nothing is started this early.
+unsafe fn cloexec_pipe(fds: &mut [libc::c_int; 2]) -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    // SAFETY: `fds` has room for both descriptors.
+    return unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    // SAFETY: as above; then only the new descriptors' flags are set.
+    unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return -1;
+        }
+        for &fd in fds.iter() {
+            if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) != 0 {
+                return -1;
+            }
+        }
+        0
     }
 }
 }

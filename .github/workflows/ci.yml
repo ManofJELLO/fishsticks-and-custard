@@ -50,7 +50,9 @@ jobs:
         run: cargo test --release --workspace --locked
 
   windows:
-    runs-on: windows-latest
+    # Visual Studio 2022: under 2026 (windows-latest), whisper.cpp's shader
+    # tool finds no compiler and espeak-ng's headers fail its preprocessor.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v7
 
