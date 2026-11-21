@@ -5,7 +5,8 @@
 // once, then kept the same length and order: entries are greyed out, never
 // added or removed, so nothing moves under the pointer. Only a submenu's
 // own list is redone when what it lists changes (a mic plugged in, the
-// agent's models loaded).
+// agent's models loaded), and never while the menu is open: that waits
+// until it closes.
 import QtQuick
 import Qt.labs.platform as P
 import dev.fsc.app
@@ -20,8 +21,23 @@ P.SystemTrayIcon {
 
     menu: P.Menu {
         id: menu
-        onAboutToShow: Backend.trayOpening()
+        onAboutToShow: {
+            tray.menuOpen = true
+            Backend.trayOpening()
+        }
+        onAboutToHide: {
+            tray.menuOpen = false
+            if (tray.relistDue) {
+                tray.relistDue = false
+                tray.show()
+            }
+        }
     }
+
+    // While the menu is open, a submenu whose list changed keeps the old
+    // one (relistDue) until it closes.
+    property bool menuOpen: false
+    property bool relistDue: false
 
     // The top-level entries as built, in order.
     property var entries: []
@@ -110,6 +126,10 @@ P.SystemTrayIcon {
         sub.title = label(it.label)
         sub.enabled = it.enabled
         const shape = JSON.stringify(it.options.map(o => [o.label, o.act]))
+        if (shape !== sub.built && tray.menuOpen && sub.built !== "") {
+            tray.relistDue = true
+            return
+        }
         if (shape !== sub.built) {
             for (const o of sub.options) {
                 sub.removeItem(o)

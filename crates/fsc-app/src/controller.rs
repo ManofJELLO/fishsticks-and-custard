@@ -233,6 +233,10 @@ enum Spot {
     Hearing,
     /// Said; being heard in full.
     Finishing,
+    /// The popup was closed while it was heard: a "no". The audio engine
+    /// still finishes it (Transcribing, then Wake or WakeDropped), and none
+    /// of that may show or reopen the popup.
+    Closed,
 }
 
 pub struct Controller {
@@ -714,6 +718,7 @@ impl Controller {
                 }
             }
             AudioEvent::SpeechStarted => {}
+            AudioEvent::Transcribing if self.st.spot == Spot::Closed => {}
             AudioEvent::Transcribing if self.st.spot == Spot::Hearing => {
                 self.st.spot = Spot::Finishing;
                 self.st.viz.set_spectrum(None);
@@ -1494,7 +1499,14 @@ impl Controller {
         }
         self.st.spot = Spot::None;
         self.st.viz.set_spectrum(None);
-        let idle = self.st.listening.is_none() && !self.st.claude.busy() && !self.st.speaking && self.st.asks.is_empty();
+        // Not while it's in use: something typed, a reply, a question.
+        let st = &self.st;
+        let idle = st.listening.is_none()
+            && !st.transcribing
+            && !st.claude.busy()
+            && !st.speaking
+            && st.asks.is_empty()
+            && self.entry_empty;
         if std::mem::take(&mut self.st.spot_opened) && idle {
             self.hide();
         }
@@ -1502,7 +1514,9 @@ impl Controller {
     }
 
     fn on_wake(&mut self, command: Option<String>) {
-        self.st.spot = Spot::None;
+        if std::mem::take(&mut self.st.spot) == Spot::Closed {
+            return; // closed while it was being said
+        }
         self.st.spot_opened = false;
         self.show(false);
         let start_conversation = self.cfg.voice.conversation && !self.st.conversation;
@@ -1694,7 +1708,9 @@ impl Controller {
         }
         self.cancel_listen();
         self.end_conversation();
-        self.st.spot = Spot::None;
+        if self.st.spot != Spot::None {
+            self.st.spot = Spot::Closed;
+        }
         self.st.spot_opened = false;
         self.open = false;
         if !self.headless() {

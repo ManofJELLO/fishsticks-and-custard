@@ -348,7 +348,7 @@ Some settings you might want to change:
 | `[voice] conversation` | Set it to `false` to stop listening again after each spoken reply. |
 | `[voice] hang_up_after_secs` | Seconds of silence before a voice conversation hangs up. |
 | `[voice] speech_rate` | How fast it talks. |
-| `[voice] wake_model` | The speech model that listens for the wake phrase: `"small-q8_0"` (default) is fast. `""` uses the full model for it too, slower to notice the phrase. |
+| `[voice] wake_model` | The speech model that listens for the wake phrase: `"small-q8_0"` (default) is fast. `""` uses the full model for it too, slower to notice the phrase. It's only used when it's smaller than `whisper_model`. |
 | `[agent] session_idle_minutes` | Minutes without a message before a new conversation starts. |
 
 The full list, with explanations, is in

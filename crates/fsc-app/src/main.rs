@@ -125,6 +125,14 @@ fn run() -> Result<()> {
     // Still before any threads: this sets PATH, for fscd and all it starts.
     #[cfg(target_os = "macos")]
     let path_note = platform::adopt_login_path();
+    // Asked again: reading the login shell's PATH can take seconds, and
+    // another launch may have started meanwhile.
+    #[cfg(target_os = "macos")]
+    if fsc_core::ipc::send(&Command::Status).is_ok() {
+        fsc_core::ipc::send(&Command::Toggle)?;
+        println!("fscd is already running; toggled its popup");
+        return Ok(());
+    }
     // Only the instance that stays: a second launch mustn't rotate its log.
     log::start();
     #[cfg(target_os = "macos")]

@@ -107,7 +107,9 @@ pub fn adopt_login_path() -> String {
     let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     let login = login_shell_path();
     let merged = merge_path(login.as_deref().ok(), &current, &home, |p| p.is_dir());
-    // SAFETY: the caller guarantees no other threads exist yet.
+    // SAFETY: the caller guarantees no other threads exist yet. (If the
+    // shell timed out, its output reader may still be waiting on the pipe;
+    // it only reads that, never the environment.)
     unsafe { std::env::set_var("PATH", &merged) };
     match login {
         Ok(_) => format!("PATH from the login shell: {merged}"),
@@ -131,6 +133,15 @@ fn login_shell_path() -> Result<String, String> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("{shell}: {e}"))?;
+    // Read as it's written: a chatty profile could fill the pipe, and the
+    // shell would wait for room that's never made.
+    let reader = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut out = String::new();
+            let _ = s.read_to_string(&mut out);
+            out
+        })
+    });
     // A profile that waits for input or hangs mustn't stop fscd starting.
     let start = Instant::now();
     loop {
@@ -140,12 +151,13 @@ fn login_shell_path() -> Result<String, String> {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
+                // Not joined: something the shell started could keep the
+                // pipe open. That reader touches nothing else.
                 return Err(format!("{shell} took too long"));
             }
         }
     }
-    let mut out = String::new();
-    child.stdout.take().map(|mut s| s.read_to_string(&mut out));
+    let out = reader.and_then(|r| r.join().ok()).unwrap_or_default();
     let mut parts = out.split(MARK);
     parts.next();
     let env = parts.next().ok_or_else(|| format!("{shell} printed no environment"))?;

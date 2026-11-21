@@ -41,11 +41,22 @@ pub fn whisper_path(v: &VoiceConfig) -> PathBuf {
     models_dir().join(format!("ggml-{}.bin", v.whisper_model))
 }
 
-/// The wake phrase's own model (`voice.wake_model`), if it has one: not when
-/// that's empty or the same as `whisper_model`.
+/// The wake phrase's own model (`voice.wake_model`), if it has one: only
+/// when it's a smaller kind of model than `whisper_model`, as it's there to
+/// be quicker. (Someone running `base` keeps hearing it with `base`.)
 pub fn wake_path(v: &VoiceConfig) -> Option<PathBuf> {
     let name = v.wake_model.trim();
-    (!name.is_empty() && name != v.whisper_model).then(|| models_dir().join(format!("ggml-{name}.bin")))
+    separate_wake(name, v.whisper_model.trim()).then(|| models_dir().join(format!("ggml-{name}.bin")))
+}
+
+fn separate_wake(wake: &str, main: &str) -> bool {
+    // tiny < base < small < medium < large; a name we don't know counts as
+    // large (a custom main model, say).
+    let size = |name: &str| {
+        let kind = name.split(['-', '.']).next().unwrap_or("");
+        ["tiny", "base", "small", "medium"].iter().position(|k| *k == kind).unwrap_or(4)
+    };
+    !wake.is_empty() && wake != main && size(wake) < size(main)
 }
 
 pub fn vad_path() -> PathBuf {
@@ -274,7 +285,19 @@ pub fn missing(v: &VoiceConfig) -> Vec<ModelFile> {
 
 #[cfg(test)]
 mod tests {
+    use super::separate_wake;
     use crate::model_hashes::PIPER_REV;
+
+    #[test]
+    fn wake_model_only_when_smaller() {
+        assert!(separate_wake("small-q8_0", "large-v3-turbo-q5_0"));
+        assert!(separate_wake("small-q8_0", "medium.en"));
+        assert!(separate_wake("base", "my-own-model"));
+        assert!(!separate_wake("small-q8_0", "base"));
+        assert!(!separate_wake("small-q8_0", "small"));
+        assert!(!separate_wake("small-q8_0", "small-q8_0"));
+        assert!(!separate_wake("", "large-v3-turbo"));
+    }
 
     #[test]
     fn bad_voice_name_is_reported_not_skipped() {

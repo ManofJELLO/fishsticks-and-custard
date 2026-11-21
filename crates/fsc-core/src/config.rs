@@ -111,7 +111,8 @@ pub struct VoiceConfig {
     pub wake_word: bool,
     pub wake_phrase: String,
     /// The whisper model that listens for the wake phrase: small, so it's
-    /// heard fast; what's asked is heard with `whisper_model`. Empty: use
+    /// heard fast; what's asked is heard with `whisper_model`. Used only
+    /// when it's a smaller kind than `whisper_model`; empty: use
     /// `whisper_model` for both.
     pub wake_model: String,
 }

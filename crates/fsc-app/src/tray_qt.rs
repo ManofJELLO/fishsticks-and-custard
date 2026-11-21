@@ -6,7 +6,7 @@
 //! The menu is `tray_menu`'s, sent to QML as JSON. Commands stay here: an
 //! item carries the index of its command, and choosing it hands that back.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -95,9 +95,14 @@ impl QtTray {
 
 /// The icon for `st` as a PNG file, written once per look, as a file URL
 /// (Qt's tray takes an image by URL). In the state directory, or the
-/// temporary one.
+/// temporary one, in a folder for this version: an update that redraws an
+/// icon mustn't keep showing the old drawing. Older versions' folders go.
 pub fn icon_url(st: &IconState) -> Option<String> {
-    let dir = fsc_core::paths::state_dir().unwrap_or_else(std::env::temp_dir).join("tray");
+    let root = fsc_core::paths::state_dir().unwrap_or_else(std::env::temp_dir).join("tray");
+    let dir = root.join(env!("CARGO_PKG_VERSION"));
+    if !dir.is_dir() {
+        clear_old_icons(&root);
+    }
     // Every part of the look, so a file never shows another state's icon.
     let name = format!("{:?}-{:?}-{}-{:?}-{:02x}{:02x}{:02x}.png", st.shape, st.phase, st.muted, st.theme, to8(st.accent.0), to8(st.accent.1), to8(st.accent.2))
         .to_lowercase();
@@ -110,7 +115,25 @@ pub fn icon_url(st: &IconState) -> Option<String> {
         std::fs::write(&tmp, png).ok()?;
         std::fs::rename(&tmp, &path).ok()?;
     }
-    Some(format!("file://{}", path.display()))
+    Some(file_url(&path))
+}
+
+/// Everything in `root` (the tray icon folder) left by other versions.
+fn clear_old_icons(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+    }
+}
+
+/// `path` (absolute) as a file URL: `file:///Users/…`, or on Windows
+/// `file:///C:/Users/…` (not `file://C:\Users\…`, where `C:` would be read
+/// as the host).
+fn file_url(path: &Path) -> String {
+    let p = path.display().to_string();
+    let p = if cfg!(windows) { p.replace('\\', "/") } else { p };
+    if p.starts_with('/') { format!("file://{p}") } else { format!("file:///{p}") }
 }
 
 fn to8(c: f64) -> u8 {
@@ -121,6 +144,14 @@ fn to8(c: f64) -> u8 {
 mod tests {
     use super::*;
     use fsc_core::config::{AgentKind, SpeakMode};
+
+    #[test]
+    fn icon_urls_are_file_urls() {
+        #[cfg(unix)]
+        assert_eq!(file_url(Path::new("/Users/u/Library/Application Support/fsc/x.png")), "file:///Users/u/Library/Application Support/fsc/x.png");
+        #[cfg(windows)]
+        assert_eq!(file_url(Path::new(r"C:\Users\u\x.png")), "file:///C:/Users/u/x.png");
+    }
 
     #[test]
     fn menu_json_carries_commands_by_index() {
