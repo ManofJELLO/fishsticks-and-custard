@@ -33,6 +33,15 @@ Window {
         focus: true
     }
 
+    // macOS: the glass's shadow is cut from what's drawn, and the glass is
+    // light or dark with the theme, so both are redone as those change.
+    function restyle() {
+        if (win.mac && win.visible) {
+            Backend.floatWindow(win, false)
+        }
+    }
+    onHeightChanged: Qt.callLater(win.restyle)
+
     // Closing it (e.g. Hyprland's killactive) hides it; the assistant keeps
     // running in the tray.
     onClosing: (close) => {
@@ -60,6 +69,7 @@ Window {
             }
         }
         function onHidePopup() { win.visible = false }
+        function onBgChanged() { Qt.callLater(win.restyle) }
     }
 
     Shot { target: popup }

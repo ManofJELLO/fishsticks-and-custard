@@ -1897,8 +1897,14 @@ impl Controller {
     }
 
     fn panel_look(&self) -> panel::Look {
-        match self.cfg.ui.surface {
-            Surface::Layer => panel::Look { framed: true, opacity: self.cfg.ui.opacity, gradient: self.cfg.ui.gradient },
+        let ui = &self.cfg.ui;
+        match ui.surface {
+            Surface::Layer => panel::Look { framed: true, opacity: ui.opacity, gradient: ui.gradient },
+            // macOS: rounded and tinted over the system's glass (or, with
+            // `glass = false`, over whatever is behind it).
+            Surface::Window if cfg!(target_os = "macos") => {
+                panel::Look { framed: true, opacity: ui.opacity, gradient: ui.gradient }
+            }
             // Opaque: Hyprland's `opacity` window rule makes it see-through.
             Surface::Window | Surface::Headless => panel::Look { framed: false, opacity: 1.0, gradient: false },
         }

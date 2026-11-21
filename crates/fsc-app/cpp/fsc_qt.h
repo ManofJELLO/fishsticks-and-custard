@@ -12,6 +12,7 @@
 #include <QtGui/QWindow>
 
 #ifdef __APPLE__
+#include <CoreGraphics/CGGeometry.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #endif
@@ -58,6 +59,108 @@ inline bool responds(id obj, const char* sel)
 {
     return reinterpret_cast<BOOL (*)(id, SEL, SEL)>(objc_msgSend)(obj, sel_registerName("respondsToSelector:"), sel_registerName(sel));
 }
+inline id cls(const char* name)
+{
+    return reinterpret_cast<id>(objc_getClass(name));
+}
+inline id string(const char* s)
+{
+    return reinterpret_cast<id (*)(id, SEL, const char*)>(objc_msgSend)(cls("NSString"), sel_registerName("stringWithUTF8String:"), s);
+}
+inline void set_bool(id obj, const char* sel, bool v)
+{
+    reinterpret_cast<void (*)(id, SEL, BOOL)>(objc_msgSend)(obj, sel_registerName(sel), v ? YES : NO);
+}
+inline void set_long(id obj, const char* sel, long v)
+{
+    reinterpret_cast<void (*)(id, SEL, long)>(objc_msgSend)(obj, sel_registerName(sel), v);
+}
+inline void set_double(id obj, const char* sel, double v)
+{
+    reinterpret_cast<void (*)(id, SEL, CGFloat)>(objc_msgSend)(obj, sel_registerName(sel), static_cast<CGFloat>(v));
+}
+inline void set_id(id obj, const char* sel, id v)
+{
+    reinterpret_cast<void (*)(id, SEL, id)>(objc_msgSend)(obj, sel_registerName(sel), v);
+}
+
+// The name the glass view goes by, so it's found again and made once.
+inline constexpr const char* GLASS_ID = "dev.fsc.glass";
+
+// The glass view among `frame`'s subviews, or null.
+inline id find_glass(id frame)
+{
+    id views = send(frame, "subviews");
+    id want = string(GLASS_ID);
+    auto count = reinterpret_cast<unsigned long (*)(id, SEL)>(objc_msgSend)(views, sel_registerName("count"));
+    for (unsigned long i = 0; i < count; i++) {
+        id v = reinterpret_cast<id (*)(id, SEL, unsigned long)>(objc_msgSend)(views, sel_registerName("objectAtIndex:"), i);
+        id name = send(v, "identifier");
+        if (name && reinterpret_cast<BOOL (*)(id, SEL, id)>(objc_msgSend)(name, sel_registerName("isEqualToString:"), want)) {
+            return v;
+        }
+    }
+    return nullptr;
+}
+
+// Put the system's glass behind the window's content: Liquid Glass
+// (NSGlassEffectView, macOS 26 and later), else the frosted blur
+// (NSVisualEffectView). It's a sibling just below Qt's view rather than its
+// parent, so Qt still sees its view as the window's content view and keeps
+// sizing the window itself. The window goes clear around it, with a shadow
+// that follows the rounded shape. Without `on`, the glass is taken away.
+inline void glass(id nswindow, double w, double h, bool on, bool dark, double radius)
+{
+    id content = send(nswindow, "contentView");
+    id frame = content ? send(content, "superview") : nullptr;
+    if (!frame) {
+        return;
+    }
+    id existing = find_glass(frame);
+    if (!on) {
+        if (existing) {
+            send(existing, "removeFromSuperview");
+        }
+        return;
+    }
+    if (!existing) {
+        id liquid = cls("NSGlassEffectView");
+        id v = send(send(liquid ? liquid : cls("NSVisualEffectView"), "alloc"), "init");
+        if (!v) {
+            return;
+        }
+        reinterpret_cast<void (*)(id, SEL, CGRect)>(objc_msgSend)(v, sel_registerName("setFrame:"), CGRectMake(0, 0, w, h));
+        // NSViewWidthSizable | NSViewHeightSizable: it follows the window.
+        set_long(v, "setAutoresizingMask:", 2 | 16);
+        set_id(v, "setIdentifier:", string(GLASS_ID));
+        if (liquid) {
+            set_double(v, "setCornerRadius:", radius);
+        } else {
+            set_long(v, "setMaterial:", 6);     // NSVisualEffectMaterialPopover
+            set_long(v, "setBlendingMode:", 0); // behind the window
+            set_long(v, "setState:", 1);        // active even when fscd isn't
+            set_bool(v, "setWantsLayer:", true);
+            id layer = send(v, "layer");
+            if (layer) {
+                set_double(layer, "setCornerRadius:", radius);
+                set_bool(layer, "setMasksToBounds:", true);
+            }
+        }
+        // NSWindowBelow
+        reinterpret_cast<void (*)(id, SEL, id, long, id)>(objc_msgSend)(
+            frame, sel_registerName("addSubview:positioned:relativeTo:"), v, -1L, content);
+        send(v, "release"); // the window's view now holds it
+    }
+    set_bool(nswindow, "setOpaque:", false);
+    set_id(nswindow, "setBackgroundColor:", send(cls("NSColor"), "clearColor"));
+    set_bool(nswindow, "setHasShadow:", true);
+    // Light or dark glass, matching the panel drawn over it.
+    id look = reinterpret_cast<id (*)(id, SEL, id)>(objc_msgSend)(
+        cls("NSAppearance"), sel_registerName("appearanceNamed:"), string(dark ? "NSAppearanceNameDarkAqua" : "NSAppearanceNameAqua"));
+    set_id(nswindow, "setAppearance:", look);
+    // The shadow is cut from what's drawn, which changes as it grows.
+    send(nswindow, "invalidateShadow");
+}
 } // namespace mac
 #endif
 
@@ -65,8 +168,10 @@ inline bool responds(id obj, const char* sel)
 // Space and over full-screen apps, stays above other windows, and isn't
 // hidden by macOS when another app becomes active (fscd keeps track of
 // whether it's shown). With `activate`, fscd also becomes the active app,
-// so typing goes to the popup. Nothing elsewhere.
-inline void float_window(QObject* window, bool activate)
+// so typing goes to the popup. `glass` puts macOS's glass behind it (see
+// mac::glass), light or dark, its corners `radius` round. Nothing elsewhere.
+// Called again as the popup changes size or theme; it's cheap.
+inline void float_window(QObject* window, bool activate, bool glass, bool dark, double radius)
 {
 #ifdef __APPLE__
     auto* w = qobject_cast<QWindow*>(window);
@@ -84,6 +189,7 @@ inline void float_window(QObject* window, bool activate)
         // NSFloatingWindowLevel
         reinterpret_cast<void (*)(id, SEL, long)>(objc_msgSend)(nswindow, sel_registerName("setLevel:"), 3L);
         reinterpret_cast<void (*)(id, SEL, BOOL)>(objc_msgSend)(nswindow, sel_registerName("setHidesOnDeactivate:"), NO);
+        mac::glass(nswindow, w->width(), w->height(), glass, dark, radius);
     }
     if (activate) {
         id app = mac::send(reinterpret_cast<id>(objc_getClass("NSApplication")), "sharedApplication");
@@ -96,6 +202,9 @@ inline void float_window(QObject* window, bool activate)
 #else
     (void)window;
     (void)activate;
+    (void)glass;
+    (void)dark;
+    (void)radius;
 #endif
 }
 

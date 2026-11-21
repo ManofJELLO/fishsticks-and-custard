@@ -1,7 +1,8 @@
 //! The popup's panel, in the theme's background colour.
 //!
 //! - window: a plain, full rectangle. Hyprland adds rounding, border,
-//!   shadow and opacity through its window rules.
+//!   shadow and opacity through its window rules. On macOS it's drawn like
+//!   layer, a tint over the system's glass, which rounds to `RADIUS` too.
 //! - layer: rounded with a hairline edge, at `ui.opacity`. With
 //!   `ui.gradient` the opacity follows the content: most see-through behind
 //!   the visualiser, most solid behind text, with smooth fades between.

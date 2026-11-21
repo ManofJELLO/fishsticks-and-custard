@@ -36,9 +36,10 @@ pub mod qobject {
         fn quit_app();
 
         /// macOS: the popup floats on every Space and over full-screen apps;
-        /// with `activate`, fscd becomes the active app. Nothing elsewhere.
+        /// with `activate`, fscd becomes the active app; with `glass`, the
+        /// system's glass is behind it. Nothing elsewhere.
         #[namespace = "fsc"]
-        unsafe fn float_window(window: *mut QObject, activate: bool);
+        unsafe fn float_window(window: *mut QObject, activate: bool, glass: bool, dark: bool, radius: f64);
 
         #[namespace = "fsc"]
         fn set_icon_name(name: &QString);
@@ -240,7 +241,7 @@ use crate::AppEvent;
 use crate::controller::{self, Controller, Effect};
 use crate::draw::{self, Part, panel};
 use crate::history::Op;
-use crate::style::{Rgb, SystemColors};
+use crate::style::{Rgb, SystemColors, ThemeMode};
 
 /// What `main` hands the singleton when QML first asks for it.
 pub struct Startup {
@@ -558,8 +559,11 @@ impl qobject::Backend {
     /// # Safety
     /// `window` is the popup's live Window, from QML (or null).
     pub unsafe fn float_window_from_qml(self: Pin<&mut Self>, window: *mut qobject::QObject, activate: bool) {
+        let this = self.as_ref();
+        let Some(ctl) = this.rust().ctl.as_ref() else { return };
+        let dark = ctl.palette().mode == ThemeMode::Dark;
         // SAFETY: QML passes its own window object, alive for this call.
-        unsafe { qobject::float_window(window, activate) };
+        unsafe { qobject::float_window(window, activate, ctl.cfg.ui.glass, dark, panel::RADIUS) };
     }
 
     /// # Safety
