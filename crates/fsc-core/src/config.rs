@@ -490,7 +490,7 @@ impl Default for UiConfig {
             margin_x: 24,
             monitor: String::new(),
             // Over the glass on macOS, a tint you can see through.
-            opacity: if cfg!(target_os = "macos") { 0.5 } else { 0.92 },
+            opacity: if cfg!(target_os = "macos") { 0.25 } else { 0.92 },
             gradient: false,
             glass: true,
             width: 680,

@@ -42,7 +42,7 @@ anchor = "top"                # top, top-left, top-right, bottom, bottom-left, b
 margin = 80                   # px from the top/bottom edge it's pinned to (added below Waybar)
 margin_x = 24                 # px from the left/right edge it's pinned to
 monitor = ""                  # output name, e.g. "DP-1"; empty = focused
-opacity = 0.92                # panel opacity (window mode: use Hyprland's opacity rule); macOS: 0.5, the tint over the glass
+opacity = 0.92                # panel opacity (window mode: use Hyprland's opacity rule); macOS: 0.25, the tint over the glass
 gradient = false              # fade: most see-through behind the visualiser, solid behind text (also macOS)
 glass = true                  # macOS only: the system's glass behind the panel (Liquid Glass on macOS 26+)
 # All modes:

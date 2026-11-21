@@ -340,7 +340,7 @@ Some settings you might want to change:
 |---|---|
 | `[ui] surface` | `"window"` (default) is a normal floating window. `"layer"` pins the popup to a screen edge or corner (`anchor`, `margin`). `"headless"` shows no popup: you talk to it, and questions and typed replies arrive as notifications. |
 | `[ui] tray_icon` | `"police-box"` (default), `"fishbone"` or `"fez"` (the default on macOS, where the menu bar shows icons in one colour). |
-| `[ui] glass`, `opacity` | macOS: the popup sits on the system's glass (Liquid Glass on macOS 26 and later), tinted by `opacity` (0.5 by default; higher is darker in dark mode, lighter in light mode). `glass = false` turns it off. |
+| `[ui] glass`, `opacity` | macOS: the popup sits on the system's glass (Liquid Glass on macOS 26 and later), tinted by `opacity` (0.25 by default; higher is darker in dark mode, lighter in light mode). `glass = false` turns it off. |
 | `[ui] visualiser` | `"spectrum"` (default) shows bars, `"loudness"` shows a level over time. |
 | `[ui] accent` | The highlight colour. By default it follows your desktop. |
 | `[ui] width`, `max_height` | The popup's width, and how tall the conversation gets before it scrolls (until you press EXPAND). |
