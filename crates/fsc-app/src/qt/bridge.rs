@@ -42,6 +42,10 @@ pub mod qobject {
 
         #[namespace = "fsc"]
         fn set_icon_name(name: &QString);
+
+        /// macOS 27: keep Qt's tray from crashing on a click (see the header).
+        #[namespace = "fsc"]
+        fn patch_tray_clicks() -> bool;
     }
 
     extern "RustQt" {
@@ -314,6 +318,9 @@ impl cxx_qt::Initialize for qobject::Backend {
         self.as_mut().set_status_height(controller::status_height() as i32);
         self.as_mut().set_shot(QString::from(&std::env::var("FSC_SHOT").unwrap_or_default()));
         self.as_mut().set_scale(1.0);
+        if cfg!(target_os = "macos") && !qobject::patch_tray_clicks() {
+            eprintln!("fsc: couldn't guard Qt's menu-bar icon against macOS 27's clicks; clicking it may crash");
+        }
         qobject::set_icon_name(&QString::from(crate::APP_ID));
 
         let meta = QString::from(start.ctl.meta());

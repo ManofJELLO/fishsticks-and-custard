@@ -99,4 +99,70 @@ inline void float_window(QObject* window, bool activate)
 #endif
 }
 
+#ifdef __APPLE__
+namespace mac {
+// Qt's original handlers, called when the event is a real click.
+inline IMP tray_clicked = nullptr;
+inline IMP tray_tracking = nullptr;
+
+// Whether the event being handled is a mouse button going down or up, the
+// only kind Qt's tray handler can ask for a click count without AppKit
+// throwing.
+inline bool is_click()
+{
+    id app = send(reinterpret_cast<id>(objc_getClass("NSApplication")), "sharedApplication");
+    id event = app ? send(app, "currentEvent") : nullptr;
+    if (!event) {
+        return false;
+    }
+    auto type = reinterpret_cast<unsigned long (*)(id, SEL)>(objc_msgSend)(event, sel_registerName("type"));
+    // Left, right and other buttons, down and up.
+    return type == 1 || type == 2 || type == 3 || type == 4 || type == 25 || type == 26;
+}
+
+inline void on_tray_clicked(id self, SEL sel)
+{
+    if (tray_clicked && is_click()) {
+        reinterpret_cast<void (*)(id, SEL)>(tray_clicked)(self, sel);
+    }
+}
+
+inline void on_tray_tracking(id self, SEL sel, id note)
+{
+    if (tray_tracking && is_click()) {
+        reinterpret_cast<void (*)(id, SEL, id)>(tray_tracking)(self, sel, note);
+    }
+}
+} // namespace mac
+#endif
+
+// macOS 27: clicking the menu-bar icon can kill the app. Qt (up to 6.11.1)
+// asks the current event for its click count when the icon is clicked or
+// its menu opens, and on macOS 27 that event can be a mouse-exit, for
+// which AppKit throws. Qt's own fix (qcocoasystemtrayicon.mm, "macOS 27")
+// isn't in a release yet, so this does the same from outside: Qt's two
+// handlers run only for real clicks. fscd doesn't use the signal they
+// send. False if Qt's tray class wasn't found (another Qt, or not macOS).
+inline bool patch_tray_clicks()
+{
+#ifdef __APPLE__
+    Class cls = objc_getClass("QStatusItemDelegate");
+    if (!cls) {
+        return false;
+    }
+    Method clicked = class_getInstanceMethod(cls, sel_registerName("statusItemClicked"));
+    Method tracking = class_getInstanceMethod(cls, sel_registerName("statusItemMenuBeganTracking:"));
+    if (!clicked || !tracking) {
+        return false;
+    }
+    if (!mac::tray_clicked) {
+        mac::tray_clicked = method_setImplementation(clicked, reinterpret_cast<IMP>(&mac::on_tray_clicked));
+        mac::tray_tracking = method_setImplementation(tracking, reinterpret_cast<IMP>(&mac::on_tray_tracking));
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 } // namespace fsc

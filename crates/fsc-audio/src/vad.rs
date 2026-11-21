@@ -22,6 +22,10 @@ pub struct Vad {
 impl Vad {
     pub fn load(env: &ort::environment::Environment, path: &Path) -> Result<Self> {
         let session = Session::builder(env)?
+            // On the CPU, everywhere. ONNX Runtime's own pick would be Core ML on
+            // macOS, which crashes running these models (and they're small).
+            .with_auto_device(ort::session::builder::AutoDevicePolicy::PreferCPU)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_intra_threads(1)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .commit_from_file(path)
