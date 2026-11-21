@@ -3,7 +3,7 @@ post_install() {
 ==> Fishsticks & Custard installed. To finish setting up (as your user):
     1. Install and sign in to an agent: the Claude Code CLI (`claude`) by default,
        or Codex / Antigravity (see "Choosing an agent" in the README).
-    2. Download the speech models (~640 MB, with a voice for your desktop's
+    2. Download the speech models (~900 MB, with a voice for your desktop's
        language):                                 fsc fetch-models
        and check them:                            fscd --self-test
     3. Add the Hyprland lines from /usr/share/fishsticks-and-custard/hyprland/fsc.lua
@@ -15,5 +15,11 @@ MSG
 
 post_upgrade() {
   echo "==> Fishsticks & Custard updated. Restart it to use the new version: fsc quit; fscd &"
-  echo "    New models may be needed after some updates: fsc fetch-models"
+  if [ "$(vercmp "$2" 0.10.0)" -lt 0 ]; then
+    echo "    0.10.0 hears the wake phrase with a small, fast model (~250 MB). Get it with:"
+    echo "        fsc fetch-models"
+    echo "    Until then the wake phrase is heard by the full model, more slowly."
+  else
+    echo "    New models may be needed after some updates: fsc fetch-models"
+  fi
 }

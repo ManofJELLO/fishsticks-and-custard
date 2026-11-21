@@ -1,10 +1,10 @@
 {
-  "date": "2026-11-20",
+  "date": "2026-11-21",
   "agents": {
-    "claude": "2.1.329",
-    "codex-acp": "2.8.0",
+    "claude": "2.1.330",
+    "codex-acp": "2.9.0",
     "codex": "0.171.0",
-    "agy": "1.5.12",
+    "agy": "1.5.13",
     "opencode": "2.3.2"
   },
   "models": {
@@ -15,6 +15,7 @@
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q5_0.bin": "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
     "https://raw.githubusercontent.com/snakers4/silero-vad/bfdc0193023f121ea5b3cc7b176dbed570a68a59/src/silero_vad/data/silero_vad.onnx": "d3a3e41a0aabf8b7c4eb24238f86a62101403508d1d54338603fa82e6f571c87",
     "https://huggingface.co/rhasspy/piper-voices/resolve/e9ab671f2a0e50a701b34361136ba3e6a3a9eb0c/en/en_GB/alan/medium/en_GB-alan-medium.onnx": "0a309668932205e762801f1efc2736cd4b0120329622adf62be09e56339d3330",
-    "https://huggingface.co/rhasspy/piper-voices/resolve/e9ab671f2a0e50a701b34361136ba3e6a3a9eb0c/en/en_GB/alan/medium/en_GB-alan-medium.onnx.json": "31f864659bfb7678af373cf4e58a7a0866ff52af"
+    "https://huggingface.co/rhasspy/piper-voices/resolve/e9ab671f2a0e50a701b34361136ba3e6a3a9eb0c/en/en_GB/alan/medium/en_GB-alan-medium.onnx.json": "31f864659bfb7678af373cf4e58a7a0866ff52af",
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small-q8_0.bin": "49c8fb02b65e6049d5fa6c04f81f53b867b5ec9540406812c643f177317f779f"
   }
 }
