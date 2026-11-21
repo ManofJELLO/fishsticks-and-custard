@@ -521,6 +521,8 @@ const PAD: usize = (MIC_RATE as usize * 3) / 10; // 300 ms either side of speech
 impl<F: Fn(AudioEvent)> Engine<F> {
     fn new(cfg: VoiceConfig, emit: F) -> Self {
         Self {
+            // Muted when the config says so (`set_wake_enabled` from then on).
+            wake_enabled: cfg.wake_word,
             cfg,
             emit,
             vad: None,
@@ -531,7 +533,6 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             listening: None,
             held: None,
             watching: None,
-            wake_enabled: true,
             watch_failed_at: None,
             mic_missing: false,
             conversation: false,
@@ -914,7 +915,7 @@ impl<F: Fn(AudioEvent)> Engine<F> {
     }
 
     fn wake_active(&self) -> bool {
-        self.cfg.wake_word && self.wake_enabled && self.vad.is_some() && self.stt.is_some()
+        self.wake_enabled && self.vad.is_some() && self.stt.is_some()
     }
 
     /// Take the open mic from whoever is idling with it.
@@ -1244,7 +1245,7 @@ pub fn self_test(cfg: &VoiceConfig) -> anyhow::Result<()> {
         let mut pcm16 = Vec::new();
         rs.push(&pcm, &mut pcm16);
         let t = Instant::now();
-        let heard = stt.transcribe(&pcm16)?;
+        let heard = stt.transcribe_wake(&pcm16)?;
         let verdict = match wake::match_wake(&heard, &cfg.wake_phrase) {
             Some(rest) if rest.is_empty() => "WAKE".to_string(),
             Some(rest) => format!("WAKE + command {rest:?}"),

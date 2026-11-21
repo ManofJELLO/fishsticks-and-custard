@@ -107,6 +107,7 @@ pub struct VoiceConfig {
     /// (0 = wait until the popup is closed).
     pub hang_up_after_secs: u32,
     /// Listen for the wake phrase whenever the mic isn't otherwise in use.
+    /// Off is "muted": the tray's Mute wake word and `fsc mute` save it.
     pub wake_word: bool,
     pub wake_phrase: String,
 }
@@ -596,7 +597,7 @@ impl Config {
 
     /// Set `[table] key = value` in the config file, keeping the rest of it
     /// (comments included) as it is.
-    pub fn save_value(table: &str, key: &str, value: &str) -> Result<()> {
+    pub fn save_value(table: &str, key: &str, value: impl Into<toml_edit::Value>) -> Result<()> {
         let path = Self::path().context("no config directory")?;
         let text = match std::fs::read_to_string(&path) {
             Ok(s) => s,
@@ -647,7 +648,8 @@ impl Config {
 }
 
 /// `text` (a config file) with `[table] key` set to `value`.
-fn set_value(text: &str, table: &str, key: &str, value: &str) -> Result<String> {
+fn set_value(text: &str, table: &str, key: &str, value: impl Into<toml_edit::Value>) -> Result<String> {
+    let value = value.into();
     let mut doc: toml_edit::DocumentMut = text.parse()?;
     let t = doc.entry(table).or_insert_with(toml_edit::table);
     let t = t.as_table_like_mut().with_context(|| format!("`{table}` isn't a table"))?;
@@ -832,6 +834,15 @@ mod tests {
         assert_eq!(cfg.keys, KeysConfig::default());
         let none: Config = toml::from_str("[keys]\ntype = \"\"").unwrap();
         assert_eq!((none.keys.type_key.as_str(), none.keys.talk.as_str()), ("", "alt+shift+a"));
+    }
+
+    #[test]
+    fn mute_is_saved_as_a_bool() {
+        let text = "[voice]\nwake_word = true # comment\n";
+        let saved = set_value(text, "voice", "wake_word", false).unwrap();
+        assert_eq!(saved, "[voice]\nwake_word = false # comment\n");
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        assert!(!cfg.voice.wake_word);
     }
 
     #[test]

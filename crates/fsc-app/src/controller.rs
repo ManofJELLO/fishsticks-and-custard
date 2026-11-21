@@ -258,6 +258,8 @@ impl Controller {
         let (agent, agents) = (cfg.agent.backend, AgentKind::ALL.map(|k| cfg.available(k)));
         let memory_on = cfg.memory();
         let wake_phrase = cfg.voice.wake_phrase.clone();
+        // Muted is the wake word turned off in the config, so it lasts.
+        let muted = !cfg.voice.wake_word;
         let (mic, speak) = (cfg.voice.input_device.clone(), cfg.voice.speak);
         let (language, spoken, piper_voice, voice_name) =
             (cfg.voice.language.clone(), cfg.voice.spoken(), cfg.voice.piper_voice.clone(), cfg.voice.voice());
@@ -279,7 +281,7 @@ impl Controller {
                 palette,
                 desktop_accent: None,
                 system: SystemColors::default(),
-                muted: false,
+                muted,
                 wake_phrase,
                 mic,
                 mic_missing: false,
@@ -466,8 +468,13 @@ impl Controller {
                 self.st.muted = on.unwrap_or(!self.st.muted);
                 let muted = self.st.muted;
                 self.audio.set_wake_enabled(!muted);
+                self.cfg.voice.wake_word = !muted;
                 self.flash_meta(if muted { "WAKE WORD MUTED" } else { "WAKE WORD ON" });
                 self.push_tray();
+                let said = if muted { "wake word muted" } else { "wake word on" };
+                if let Err(e) = Config::save_value("voice", "wake_word", !muted) {
+                    return Reply::state(format!("{said} until fscd restarts (not saved: {e:#})"));
+                }
             }
             Command::Wake { phrase: None } => return Reply::state(self.st.wake_phrase.clone()),
             Command::Wake { phrase: Some(phrase) } => return self.set_wake_phrase(&phrase),

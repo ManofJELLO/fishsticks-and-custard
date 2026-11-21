@@ -163,7 +163,7 @@ fn run() -> Result<()> {
     let first_icon = icon::IconState {
         phase: fsc_core::Phase::Idle,
         theme: initial_theme,
-        muted: false,
+        muted: !cfg.voice.wake_word,
         // The recording dot is always red, whatever the theme.
         accent: style::NOTHING_RED,
         shape: cfg.ui.tray_icon,

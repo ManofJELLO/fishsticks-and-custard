@@ -168,7 +168,7 @@ Right-click the icon for its menu:
 | Menu item | What it does |
 |---|---|
 | **Type…** / **Talk** | Opens the popup for typing, or starts listening. |
-| **Mute wake word** | Stops it listening for the wake phrase. The talk key still works. |
+| **Mute wake word** | Stops it listening for the wake phrase, and closes the mic until you talk (on macOS the orange mic dot goes away). The talk key still works. Stays muted after a restart. |
 | **Microphone** | Chooses which microphone to use. |
 | **Speak replies** | Chooses when replies are read aloud: when you talk (the default), always, or never. |
 | **Language** / **Voice** | Chooses the language it speaks and listens in, and the voice it uses. |
