@@ -18,7 +18,8 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
 # The programs: fscd (the app) and fsc (the command line; the cask links it).
 cp "$target/fscd" "$target/fsc" "$app/Contents/MacOS/"
-sed "s/@VERSION@/$version/g" "$root/packaging/macos/Info.plist" > "$app/Contents/Info.plist"
+# macOS wants plain numbers there: "0.10.0" for 0.10.0-beta.1.
+sed "s/@VERSION@/${version%%-*}/g" "$root/packaging/macos/Info.plist" > "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist"
 
 # The icon, from the same SVG as the Linux one.
