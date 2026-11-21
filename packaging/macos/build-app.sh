@@ -37,12 +37,17 @@ cp -R "$(brew --prefix espeak-ng)/share/espeak-ng-data" "$app/Contents/Resources
 
 # Qt's frameworks and the QML modules the popup and menu bar import.
 macdeployqt "$app" -qmldir="$root/crates/fsc-app/qml" -always-overwrite -verbose=1
+# Database drivers come along with Qt's plugins; fscd uses no database.
+rm -rf "$app/Contents/PlugIns/sqldrivers"
 
-# Nothing may point at this machine's build or Homebrew paths.
-if otool -L "$app/Contents/MacOS/fscd" "$app/Contents/MacOS/fsc" | grep -E "/Users/|/opt/homebrew/|/usr/local/" ; then
-    echo "error: the programs link to libraries outside the app (above)" >&2
-    exit 1
-fi
+# Nothing may point at this machine's build or Homebrew paths. (`otool -L`
+# names the file first; its libraries follow, indented.)
+for bin in "$app/Contents/MacOS/fscd" "$app/Contents/MacOS/fsc"; do
+    if otool -L "$bin" | tail -n +2 | grep -E "/Users/|/opt/homebrew/|/usr/local/"; then
+        echo "error: $(basename "$bin") links to libraries outside the app (above)" >&2
+        exit 1
+    fi
+done
 
 # Apple Silicon runs only signed code: sign it ad hoc (no developer ID).
 codesign --force --deep --sign - "$app"
