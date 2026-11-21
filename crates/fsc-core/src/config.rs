@@ -627,9 +627,10 @@ impl Config {
         Ok(())
     }
 
-    /// The config file, created first if there isn't one: the packaged
-    /// example (every setting, with its default and a note) with its values
-    /// commented out, so later versions' defaults still apply.
+    /// The config file, created first if there isn't one: the example
+    /// (every setting, with its default and a note; built in, so it's there
+    /// on every platform) with its values commented out, so later versions'
+    /// defaults still apply.
     pub fn ensure_file() -> Result<PathBuf> {
         let path = Self::path().context("no config directory")?;
         if path.exists() {
@@ -638,11 +639,7 @@ impl Config {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        const EXAMPLE: &str = "/usr/share/fishsticks-and-custard/config.example.toml";
-        let text = match std::fs::read_to_string(EXAMPLE) {
-            Ok(example) => commented_out(&example),
-            Err(_) => format!("# Fishsticks & Custard settings. Every key is optional; see {EXAMPLE}.\n"),
-        };
+        let text = commented_out(include_str!("../../../packaging/config.example.toml"));
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
         Ok(path)
     }
