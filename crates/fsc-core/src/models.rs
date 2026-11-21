@@ -41,6 +41,13 @@ pub fn whisper_path(v: &VoiceConfig) -> PathBuf {
     models_dir().join(format!("ggml-{}.bin", v.whisper_model))
 }
 
+/// The wake phrase's own model (`voice.wake_model`), if it has one: not when
+/// that's empty or the same as `whisper_model`.
+pub fn wake_path(v: &VoiceConfig) -> Option<PathBuf> {
+    let name = v.wake_model.trim();
+    (!name.is_empty() && name != v.whisper_model).then(|| models_dir().join(format!("ggml-{name}.bin")))
+}
+
 pub fn vad_path() -> PathBuf {
     models_dir().join("silero_vad.onnx")
 }
@@ -162,6 +169,16 @@ pub fn required(v: &VoiceConfig) -> Vec<ModelFile> {
             path: vad_path(),
         },
     ];
+    if let Some(path) = wake_path(v) {
+        out.push(ModelFile {
+            label: "wake phrase (whisper)",
+            url: Some(format!(
+                "https://huggingface.co/ggerganov/whisper.cpp/resolve/{WHISPER_REV}/ggml-{}.bin",
+                v.wake_model.trim()
+            )),
+            path,
+        });
+    }
     // Always listed, so a malformed name shows up as missing (with a clear
     // error from fetch-models) instead of silently disabling speech.
     out.extend(voice_files(&v.voice()));

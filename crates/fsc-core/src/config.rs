@@ -110,6 +110,10 @@ pub struct VoiceConfig {
     /// Off is "muted": the tray's Mute wake word and `fsc mute` save it.
     pub wake_word: bool,
     pub wake_phrase: String,
+    /// The whisper model that listens for the wake phrase: small, so it's
+    /// heard fast; what's asked is heard with `whisper_model`. Empty: use
+    /// `whisper_model` for both.
+    pub wake_model: String,
 }
 
 impl Default for VoiceConfig {
@@ -130,6 +134,7 @@ impl Default for VoiceConfig {
             hang_up_after_secs: 60,
             wake_word: true,
             wake_phrase: "fishsticks and custard".into(),
+            wake_model: "small-q8_0".into(),
         }
     }
 }

@@ -112,6 +112,11 @@ struct State {
     claude: Phase,
     listening: Option<Instant>,
     transcribing: bool,
+    /// The wake phrase was spotted in what's being said, before it's all
+    /// been heard: shown as listening, then transcribing.
+    spot: Spot,
+    /// That spot opened the popup (closed again if it wasn't the phrase).
+    spot_opened: bool,
     speaking: bool,
 
     palette: Palette,
@@ -208,9 +213,9 @@ struct State {
 
 impl State {
     fn phase(&self) -> Phase {
-        if self.listening.is_some() {
+        if self.listening.is_some() || self.spot == Spot::Hearing {
             Phase::Listening
-        } else if self.transcribing {
+        } else if self.transcribing || self.spot == Spot::Finishing {
             Phase::Transcribing
         } else if self.speaking {
             Phase::Speaking
@@ -218,6 +223,16 @@ impl State {
             self.claude
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+enum Spot {
+    #[default]
+    None,
+    /// Still being said.
+    Hearing,
+    /// Said; being heard in full.
+    Finishing,
 }
 
 pub struct Controller {
@@ -276,6 +291,8 @@ impl Controller {
                 claude: Phase::Idle,
                 listening: None,
                 transcribing: false,
+                spot: Spot::None,
+                spot_opened: false,
                 speaking: false,
                 theme: palette.mode,
                 palette,
@@ -697,6 +714,11 @@ impl Controller {
                 }
             }
             AudioEvent::SpeechStarted => {}
+            AudioEvent::Transcribing if self.st.spot == Spot::Hearing => {
+                self.st.spot = Spot::Finishing;
+                self.st.viz.set_spectrum(None);
+                self.refresh();
+            }
             AudioEvent::Transcribing => {
                 let st = &mut self.st;
                 st.listening = None;
@@ -766,6 +788,8 @@ impl Controller {
                 self.maybe_release_mic();
                 self.maybe_follow_up();
             }
+            AudioEvent::WakeSpotted => self.on_wake_spotted(),
+            AudioEvent::WakeDropped => self.on_wake_dropped(),
             AudioEvent::Wake { command } => self.on_wake(command),
             AudioEvent::MicMissing(name) => {
                 let was = std::mem::replace(&mut self.st.mic_missing, name.is_some());
@@ -1450,7 +1474,36 @@ impl Controller {
     }
 
     /// The wake phrase was heard ("fishsticks[, <command>]").
+    /// The wake phrase was spotted while it's still being said: show it's
+    /// listening now, rather than once all of it has been heard.
+    fn on_wake_spotted(&mut self) {
+        if self.st.listening.is_some() || self.st.transcribing || self.st.spot != Spot::None {
+            return;
+        }
+        self.st.spot = Spot::Hearing;
+        self.st.spot_opened = !self.open;
+        self.st.viz.set_spectrum(None);
+        self.show(false);
+        self.refresh();
+    }
+
+    /// What was spotted wasn't the wake phrase: back to how things were.
+    fn on_wake_dropped(&mut self) {
+        if self.st.spot == Spot::None {
+            return;
+        }
+        self.st.spot = Spot::None;
+        self.st.viz.set_spectrum(None);
+        let idle = self.st.listening.is_none() && !self.st.claude.busy() && !self.st.speaking && self.st.asks.is_empty();
+        if std::mem::take(&mut self.st.spot_opened) && idle {
+            self.hide();
+        }
+        self.refresh();
+    }
+
     fn on_wake(&mut self, command: Option<String>) {
+        self.st.spot = Spot::None;
+        self.st.spot_opened = false;
         self.show(false);
         let start_conversation = self.cfg.voice.conversation && !self.st.conversation;
         self.st.empty_follow_ups = 0;
@@ -1554,6 +1607,8 @@ impl Controller {
         let st = &mut self.st;
         st.listening = Some(Instant::now());
         st.transcribing = false;
+        st.spot = Spot::None;
+        st.spot_opened = false;
         st.follow_up = follow_up;
         st.viz.set_spectrum(None);
         if start_conversation {
@@ -1639,6 +1694,8 @@ impl Controller {
         }
         self.cancel_listen();
         self.end_conversation();
+        self.st.spot = Spot::None;
+        self.st.spot_opened = false;
         self.open = false;
         if !self.headless() {
             self.effects.push(Effect::Hide);

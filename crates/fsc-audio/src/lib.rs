@@ -72,6 +72,13 @@ pub enum AudioEvent {
     /// After `set_language`: whether `voice` loaded (`false`: it isn't
     /// downloaded, or is broken; replies aren't spoken meanwhile).
     Voice { voice: String, ok: bool },
+    /// The wake phrase was heard at the start of what's still being said:
+    /// show that it's listening. `Wake` follows once it's all been heard
+    /// (or `WakeDropped`, if the whole of it turns out not to start with
+    /// the phrase); `Transcribing` meanwhile, once it's been said.
+    WakeSpotted,
+    /// What `WakeSpotted` was for wasn't the wake phrase after all.
+    WakeDropped,
     /// The wake phrase was heard. `command` is anything said right after it
     /// in the same breath ("fishsticks and custard, what time is it?").
     Wake { command: Option<String> },
@@ -249,6 +256,13 @@ struct WakeDetector {
     jobs: VecDeque<Job>,
     /// An early check heard the phrase at the start of this segment.
     heard: bool,
+    /// Said once to the engine (`take_news`), for the UI: an early check
+    /// just heard the phrase; the segment it was heard in ended (and is
+    /// being heard in full); its full transcript didn't have the phrase
+    /// after all.
+    spotted: bool,
+    finishing: bool,
+    dropped: bool,
 }
 
 #[derive(Default, PartialEq)]
@@ -270,8 +284,18 @@ struct Job {
     /// An early check of this segment had already heard the phrase.
     heard: bool,
     /// What was heard in the wake phrase's language, and, for a finished
-    /// segment with a command after the phrase in another language, in that.
-    rx: mpsc::Receiver<(String, Option<String>)>,
+    /// segment with a command after the phrase, that heard again by the main
+    /// model in the language spoken (when the phrase has a model or a
+    /// language of its own). Then whether the languages differ.
+    rx: mpsc::Receiver<(String, Option<String>, bool)>,
+}
+
+/// What `WakeDetector::take_news` reports.
+#[derive(Debug, Default, PartialEq)]
+struct WakeNews {
+    spotted: bool,
+    finishing: bool,
+    dropped: bool,
 }
 
 impl WakeDetector {
@@ -301,6 +325,7 @@ impl WakeDetector {
                         let seg = self.seg.take().unwrap_or_default();
                         self.onset.reset();
                         self.check = Check::Done;
+                        self.finishing |= self.heard;
                         self.transcribe(stt, seg, true, phrase);
                     } else if let Check::Due(at) = self.check
                         && seg.len() >= at
@@ -315,6 +340,21 @@ impl WakeDetector {
                 }
             }
         }
+    }
+
+    /// What's happened since last asked (see `spotted`).
+    fn take_news(&mut self) -> WakeNews {
+        WakeNews {
+            spotted: std::mem::take(&mut self.spotted),
+            finishing: std::mem::take(&mut self.finishing),
+            dropped: std::mem::take(&mut self.dropped),
+        }
+    }
+
+    /// The segment in progress, once an early check has heard the phrase
+    /// in it: for the visualiser.
+    fn heard_audio(&self) -> Option<&[f32]> {
+        self.seg.as_deref().filter(|_| self.heard)
     }
 
     fn start(&mut self, seg: Vec<f32>, check_at: usize, lead: wake::Lead) {
@@ -334,15 +374,17 @@ impl WakeDetector {
             .name("fsc-wake-stt".into())
             .spawn(move || {
                 let text = stt.transcribe_wake(&audio).unwrap_or_default();
-                // Woken with a command in another language than the phrase:
-                // hear the command in its own (here, off the audio thread).
-                let command = done
-                    && stt.wake_differs()
-                    && (heard_early
-                        || wake::match_wake_after(&text, &phrase, lead, &stt.language())
-                            .is_some_and(|r| !r.trim().is_empty()));
+                let said_more = || {
+                    wake::match_wake_after(&text, &phrase, lead, &stt.language()).is_some_and(|r| !r.trim().is_empty())
+                };
+                // Woken with a command: hear it again with the main model
+                // when the phrase has a smaller one of its own, or in its
+                // own language when that's another than the phrase's (here,
+                // off the audio thread).
+                let differs = stt.wake_differs();
+                let command = done && ((differs && (heard_early || said_more())) || (stt.separate_wake() && said_more()));
                 let main = command.then(|| stt.transcribe(&audio).unwrap_or_default());
-                let _ = tx.send((text, main));
+                let _ = tx.send((text, main, differs));
             });
         match spawned {
             Ok(_) => self.jobs.push_back(Job { generation: self.generation, done, lead: self.lead, heard: self.heard, rx }),
@@ -354,10 +396,10 @@ impl WakeDetector {
     /// the phrase) once a finished segment starts with the wake phrase.
     fn poll(&mut self, phrase: &str, language: &str) -> Option<(String, String)> {
         while let Some(job) = self.jobs.front() {
-            let (heard, main) = match job.rx.try_recv() {
+            let (heard, main, differs) = match job.rx.try_recv() {
                 Ok(r) => r,
                 Err(mpsc::TryRecvError::Empty) => return None,
-                Err(mpsc::TryRecvError::Disconnected) => (String::new(), None),
+                Err(mpsc::TryRecvError::Disconnected) => (String::new(), None, false),
             };
             let Some(job) = self.jobs.pop_front() else { break };
             let hit = wake::match_wake_after(&heard, phrase, job.lead, language);
@@ -365,17 +407,21 @@ impl WakeDetector {
                 eprintln!("TRACE done={} gen={}/{} lead={:?} {heard:?} -> {hit:?}", job.done, job.generation, self.generation, job.lead);
             }
             if job.done {
-                // The command as said, when it was heard again in its own
-                // language: after the phrase if whisper kept that, else all.
+                // The command as heard again by the main model: after the
+                // phrase if whisper kept that, else (the phrase was in
+                // another language, so left out) all of it; or, if it kept
+                // nothing like the phrase, what the wake model heard.
                 let command = |rest: String| match &main {
                     Some(m) => wake::match_wake_after(m, phrase, wake::Lead::Any(usize::MAX), language)
-                        .unwrap_or_else(|| m.clone()),
+                        .unwrap_or_else(|| if differs { m.clone() } else { rest }),
                     None => rest,
                 };
                 if let Some(rest) = hit {
                     return Some((heard, command(rest)));
                 }
-                if job.heard && let Some(m) = main {
+                self.dropped |= job.heard;
+                if job.heard && differs && let Some(m) = main {
+                    self.dropped = false;
                     // The early look heard the phrase but the whole segment's
                     // transcript lost it: whisper can leave out a phrase in
                     // another language than it's set to. Only then (`main`
@@ -397,6 +443,7 @@ impl WakeDetector {
                 self.check = Check::Done;
                 self.lead = wake::Lead::Any(usize::MAX);
                 self.heard = true;
+                self.spotted = true;
             } else if wake::could_start(&heard, phrase) {
                 // Maybe mid-phrase ("hey, uh... fishsticks and"): look again later.
                 self.check = Check::Due(seg.len() + RECHECK);
@@ -431,8 +478,10 @@ fn detect_wake(
 const PREROLL: usize = MIC_RATE as usize / 2;
 /// Transcribe a long segment's first part this early to reject non-wake
 /// speech (a TV, a conversation) without transcribing all of it.
-const EARLY_CHECK: usize = MIC_RATE as usize * 5 / 2;
+/// Early: the phrase is shown as heard as soon as an early check hears it.
+const EARLY_CHECK: usize = MIC_RATE as usize * 3 / 2;
 /// After an early check, look again once this much more has been said.
+/// (Not less: over continuous speech, shorter windows cut the phrase.)
 const RECHECK: usize = MIC_RATE as usize * 2;
 /// What's kept of a rejected segment that's still going: room for the wake
 /// phrase to have started just before the cut.
@@ -481,6 +530,9 @@ struct Engine<F> {
     speaking: Option<Speaking>,
     /// When a spoken sentence last contained the wake phrase.
     said_phrase_at: Option<Instant>,
+    /// The UI was told the phrase was spotted (`WakeSpotted`), and hasn't
+    /// yet had the `Wake` or `WakeDropped` that settles it.
+    spotted: bool,
     analyzer: Analyzer,
     last_spectrum: Instant,
 }
@@ -538,6 +590,7 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             conversation: false,
             speaking: None,
             said_phrase_at: None,
+            spotted: false,
             analyzer: Analyzer::default(),
             last_spectrum: Instant::now(),
         }
@@ -565,10 +618,15 @@ impl<F: Fn(AudioEvent)> Engine<F> {
         self.voice = self.cfg.voice();
         self.load_voice();
         let t0 = Instant::now();
-        match Stt::load(&models::whisper_path(&self.cfg), &self.cfg.spoken().whisper, self.cfg.gpu, &self.cfg.wake_phrase) {
+        let wake = models::wake_path(&self.cfg);
+        match Stt::load(&models::whisper_path(&self.cfg), wake.as_deref(), &self.cfg.spoken().whisper, self.cfg.gpu, &self.cfg.wake_phrase) {
             Ok(s) => {
                 // Warm up: the first run compiles GPU shaders.
                 let _ = s.transcribe(&[0.0; MIC_RATE as usize]);
+                if s.separate_wake() {
+                    let _ = s.transcribe_wake(&[0.0; MIC_RATE as usize]);
+                    eprintln!("fsc: the wake phrase is heard by {}", self.cfg.wake_model.trim());
+                }
                 eprintln!("fsc: whisper ready in {:.1}s", t0.elapsed().as_secs_f32());
                 self.stt = Some(Arc::new(s));
             }
@@ -941,6 +999,12 @@ impl<F: Fn(AudioEvent)> Engine<F> {
 
     /// Keep a mic open for the wake phrase whenever nothing else is using it.
     fn step_watch(&mut self) {
+        // The watch ended (muted, another mic, a recording took the mic)
+        // with a spot unsettled.
+        if self.spotted && self.watching.is_none() {
+            self.spotted = false;
+            (self.emit)(AudioEvent::WakeDropped);
+        }
         if !self.wake_active() {
             self.watching = None;
             return;
@@ -981,7 +1045,20 @@ impl<F: Fn(AudioEvent)> Engine<F> {
             return;
         }
         let (Some(vad), Some(stt)) = (self.vad.as_mut(), self.stt.as_ref()) else { return };
-        let Some(hit) = detect_wake(&mut w.det, &fresh, vad, stt, &self.cfg) else { return };
+        let hit = detect_wake(&mut w.det, &fresh, vad, stt, &self.cfg);
+        let news = w.det.take_news();
+        if news.spotted && !self.own_voice() {
+            self.spotted = true;
+            (self.emit)(AudioEvent::WakeSpotted);
+        }
+        if news.finishing && self.spotted {
+            (self.emit)(AudioEvent::Transcribing);
+        }
+        if news.dropped && std::mem::take(&mut self.spotted) {
+            eprintln!("fsc: not the wake phrase after all");
+            (self.emit)(AudioEvent::WakeDropped);
+        }
+        let Some(hit) = hit else { return };
         if self.wake_heard(hit) {
             // Keep the mic for what comes next, like after any utterance.
             if let Some(w) = self.watching.take() {
@@ -993,13 +1070,22 @@ impl<F: Fn(AudioEvent)> Engine<F> {
 
     /// The wake phrase was heard: tell the UI, unless it was our own voice.
     fn wake_heard(&mut self, (heard, rest): (String, String)) -> bool {
-        if self.said_phrase_at.is_some_and(|t| t.elapsed() < OWN_VOICE_WINDOW) {
+        let spotted = std::mem::take(&mut self.spotted);
+        if self.own_voice() {
             eprintln!("fsc: ignored wake phrase (probably our own voice): {heard:?}");
+            if spotted {
+                (self.emit)(AudioEvent::WakeDropped);
+            }
             return false;
         }
         eprintln!("fsc: wake phrase heard: {heard:?}");
         (self.emit)(AudioEvent::Wake { command: (!rest.is_empty()).then_some(rest) });
         true
+    }
+
+    /// A wake phrase heard now is probably our own voice coming back.
+    fn own_voice(&self) -> bool {
+        self.said_phrase_at.is_some_and(|t| t.elapsed() < OWN_VOICE_WINDOW)
     }
 
     /// Start the idle countdown on an open-but-silent player.
@@ -1157,8 +1243,11 @@ impl<F: Fn(AudioEvent)> Engine<F> {
         if self.last_spectrum.elapsed() < SPECTRUM_EVERY {
             return;
         }
+        let spotted = self.watching.as_ref().filter(|_| self.spotted).and_then(|w| w.det.heard_audio());
         let bands = if let Some(l) = &self.listening {
             Some(self.analyzer.analyze(&l.pcm[l.pcm.len().saturating_sub(1024)..], MIC_RATE))
+        } else if let Some(pcm) = spotted {
+            Some(self.analyzer.analyze(&pcm[pcm.len().saturating_sub(1024)..], MIC_RATE))
         } else if let Some(s) = self.speaking.as_ref().filter(|s| s.active) {
             Some(self.analyzer.analyze(&s.player.recent(), s.player.rate))
         } else {
@@ -1192,7 +1281,8 @@ pub fn self_test(cfg: &VoiceConfig) -> anyhow::Result<()> {
     println!("piper    loaded in {:.2}s", t.elapsed().as_secs_f32());
 
     let t = Instant::now();
-    let stt = Stt::load(&models::whisper_path(cfg), &cfg.spoken().whisper, cfg.gpu, &cfg.wake_phrase)?;
+    let wake = models::wake_path(cfg);
+    let stt = Stt::load(&models::whisper_path(cfg), wake.as_deref(), &cfg.spoken().whisper, cfg.gpu, &cfg.wake_phrase)?;
     println!("whisper  loaded in {:.2}s (gpu: {})", t.elapsed().as_secs_f32(), cfg.gpu);
 
     let sentence = "Fishsticks and custard. What is the weather like in London today?";
@@ -1277,7 +1367,7 @@ mod tests {
         use fsc_core::permission::{Answer, parse_answer};
         let env = test_env();
         let base = VoiceConfig::default();
-        let stt = Arc::new(Stt::load(&models::whisper_path(&base), "en", base.gpu, &base.wake_phrase).unwrap());
+        let stt = Arc::new(Stt::load(&models::whisper_path(&base), None, "en", base.gpu, &base.wake_phrase).unwrap());
         let fetch = |voice: &str| {
             for m in models::voice_files(voice) {
                 if !m.path.exists() {
@@ -1364,7 +1454,8 @@ mod tests {
         let mut vad = Vad::load(env, &models::vad_path()).unwrap();
         let voice = cfg.voice();
         let mut tts = Tts::load(env, &models::piper_path(&voice), &models::piper_config_path(&voice), 1.0).unwrap();
-        let stt = Arc::new(Stt::load(&models::whisper_path(&cfg), &cfg.spoken().whisper, cfg.gpu, &cfg.wake_phrase).unwrap());
+        let wake = models::wake_path(&cfg);
+        let stt = Arc::new(Stt::load(&models::whisper_path(&cfg), wake.as_deref(), &cfg.spoken().whisper, cfg.gpu, &cfg.wake_phrase).unwrap());
         let say = |tts: &mut Tts, text: &str| {
             let pcm = tts.synth(text).unwrap();
             let mut rs = io::Resampler::new(tts.sample_rate(), MIC_RATE);
@@ -1378,17 +1469,29 @@ mod tests {
             let mut det = WakeDetector::default();
             let t = Instant::now();
             // In real time, as a mic delivers it, so transcriptions keep pace.
+            let news = |det: &mut WakeDetector| {
+                let n = det.take_news();
+                if n != WakeNews::default() {
+                    eprintln!("  {:.2}s {n:?}", t.elapsed().as_secs_f32());
+                }
+            };
             for c in audio.chunks(MIC_RATE as usize / 50) {
                 std::thread::sleep(Duration::from_millis(20));
-                if let Some(hit) = detect_wake(&mut det, c, vad, &stt, &cfg) {
-                    return Some(hit);
+                let hit = detect_wake(&mut det, c, vad, &stt, &cfg);
+                news(&mut det);
+                if hit.is_some() {
+                    eprintln!("  {:.2}s wake", t.elapsed().as_secs_f32());
+                    return hit;
                 }
             }
             // Let the last transcriptions finish.
             while t.elapsed() < Duration::from_secs(20) && !det.jobs.is_empty() {
                 std::thread::sleep(Duration::from_millis(20));
-                if let Some(hit) = det.poll(&cfg.wake_phrase, "en") {
-                    return Some(hit);
+                let hit = det.poll(&cfg.wake_phrase, "en");
+                news(&mut det);
+                if hit.is_some() {
+                    eprintln!("  {:.2}s wake", t.elapsed().as_secs_f32());
+                    return hit;
                 }
             }
             None

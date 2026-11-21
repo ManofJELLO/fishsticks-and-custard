@@ -59,6 +59,7 @@ notify_when_hidden = true
 
 [voice]
 whisper_model = "large-v3-turbo-q5_0"   # file ggml-<name>.bin; "*.en" models are English-only
+wake_model = "small-q8_0"                # hears the wake phrase, fast; "" uses whisper_model for it too
 language = ""                            # "de", "fr", ... (`fsc language`); empty = your desktop's (tray: Language)
 gpu = true                               # whisper on Vulkan
 piper_voice = ""                         # empty = the language's usual one; any from huggingface.co/rhasspy/piper-voices (tray: Voice)

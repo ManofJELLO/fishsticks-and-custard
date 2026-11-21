@@ -78,7 +78,7 @@ if you spoke, reads the reply aloud.
    [Claude Code](https://claude.com/claude-code) CLI and run `claude` once to sign in. For
    the others, see [Choosing an agent](#choosing-an-agent).
 
-5. **Download the speech models** (about 640 MB, including a voice for your desktop's
+5. **Download the speech models** (about 900 MB, including a voice for your desktop's
    language), then check them:
 
    ```sh
@@ -281,6 +281,10 @@ and whatever is said after a false wake goes to the agent.
 It only wakes when the phrase starts what you're saying. *"Okay, fishsticks and custard"*
 works, but *"we had fish sticks and custard"* doesn't.
 
+A small, fast speech model listens for the phrase, so the popup shows **LISTENING** while
+you're still talking. What you ask is then heard by the full model. If it turns out you
+didn't say the phrase, the popup goes back to how it was.
+
 The wake phrase works best with a wired or USB microphone that's always connected. Choose
 one from the tray's **Microphone** menu. If that microphone is unplugged, it waits for it
 to come back rather than switching to another. The tray tooltip says when it's missing.
@@ -343,6 +347,7 @@ Some settings you might want to change:
 | `[voice] conversation` | Set it to `false` to stop listening again after each spoken reply. |
 | `[voice] hang_up_after_secs` | Seconds of silence before a voice conversation hangs up. |
 | `[voice] speech_rate` | How fast it talks. |
+| `[voice] wake_model` | The speech model that listens for the wake phrase: `"small-q8_0"` (default) is fast. `""` uses the full model for it too, slower to notice the phrase. |
 | `[agent] session_idle_minutes` | Minutes without a message before a new conversation starts. |
 
 The full list, with explanations, is in

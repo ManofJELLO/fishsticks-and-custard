@@ -8,10 +8,12 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 /// Shared between the audio thread and wake-phrase transcriptions. One
 /// whisper state is reused for every run, which also means runs take turns
-/// (on the GPU they would anyway).
+/// (on the GPU they would anyway). The wake phrase may have a small model of
+/// its own (`voice.wake_model`), so it's heard fast.
 pub struct Stt {
     _ctx: WhisperContext,
     state: Mutex<WhisperState>,
+    wake: Option<(WhisperContext, Mutex<WhisperState>)>,
     /// "en", "de", ... or "auto".
     language: Mutex<String>,
     wake_phrase: Mutex<String>,
@@ -103,20 +105,25 @@ fn device(gpu: bool) -> String {
 }
 
 impl Stt {
-    pub fn load(path: &Path, language: &str, gpu: bool, wake_phrase: &str) -> Result<Self> {
+    /// `wake`: the wake phrase's own model, if it has one. If that one
+    /// can't be loaded, the main model listens for the phrase too.
+    pub fn load(path: &Path, wake: Option<&Path>, language: &str, gpu: bool, wake_phrase: &str) -> Result<Self> {
         // SAFETY: `whisper_log` is a plain function that never unwinds.
         unsafe { whisper_rs::whisper_rs_sys::whisper_log_set(Some(whisper_log), std::ptr::null_mut()) };
         GPU_FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
-        let mut params = WhisperContextParameters::default();
-        params.use_gpu(gpu).flash_attn(gpu);
-        let ctx = WhisperContext::new_with_params(path, params)
-            .map_err(|e| anyhow!("{e}"))
-            .with_context(|| format!("loading {}", path.display()))?;
-        let state = ctx.create_state().map_err(|e| anyhow!("{e}"))?;
+        let (ctx, state) = load_model(path, gpu)?;
         eprintln!("fsc: speech recognition runs on {}", device(gpu));
+        let wake = wake.and_then(|p| match load_model(p, gpu) {
+            Ok((c, s)) => Some((c, Mutex::new(s))),
+            Err(e) => {
+                eprintln!("fsc: wake phrase model unavailable ({e:#}); the main model listens for it");
+                None
+            }
+        });
         Ok(Self {
             _ctx: ctx,
             state: Mutex::new(state),
+            wake,
             language: Mutex::new(language.to_string()),
             wake_phrase: Mutex::new(wake_phrase.to_string()),
         })
@@ -151,17 +158,25 @@ impl Stt {
     /// What was said, in the language spoken. `pcm`: mono f32 at 16 kHz.
     pub fn transcribe(&self, pcm: &[f32]) -> Result<String> {
         let (language, phrase) = self.languages();
-        self.run(pcm, &language, &prompt_for(&language, &phrase))
+        self.run(&self.state, pcm, &language, &prompt_for(&language, &phrase))
     }
 
-    /// What was said, heard in the wake phrase's language: for spotting it.
+    /// What was said, heard in the wake phrase's language (by the wake
+    /// phrase's model, if it has one): for spotting it.
     pub fn transcribe_wake(&self, pcm: &[f32]) -> Result<String> {
         let (language, phrase) = self.languages();
         let language = wake_language(&phrase, &language);
-        self.run(pcm, &language, &prompt_for(&language, &phrase))
+        let state = self.wake.as_ref().map_or(&self.state, |(_, s)| s);
+        self.run(state, pcm, &language, &prompt_for(&language, &phrase))
     }
 
-    fn run(&self, pcm: &[f32], language: &str, prompt: &str) -> Result<String> {
+    /// The wake phrase has a (smaller) model of its own: what's said after
+    /// it is heard again with the main one.
+    pub fn separate_wake(&self) -> bool {
+        self.wake.is_some()
+    }
+
+    fn run(&self, state: &Mutex<WhisperState>, pcm: &[f32], language: &str, prompt: &str) -> Result<String> {
         let mut p = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         p.set_language((language != "auto" && !language.is_empty()).then_some(language));
         p.set_n_threads(4);
@@ -183,7 +198,7 @@ impl Stt {
         if audio.len() < 16_000 + 1_600 {
             audio.resize(16_000 + 1_600, 0.0);
         }
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         state.full(p, &audio).map_err(|e| anyhow!("{e}"))?;
 
         let mut text = String::new();
@@ -194,6 +209,16 @@ impl Stt {
         }
         Ok(clean(&text))
     }
+}
+
+fn load_model(path: &Path, gpu: bool) -> Result<(WhisperContext, WhisperState)> {
+    let mut params = WhisperContextParameters::default();
+    params.use_gpu(gpu).flash_attn(gpu);
+    let ctx = WhisperContext::new_with_params(path, params)
+        .map_err(|e| anyhow!("{e}"))
+        .with_context(|| format!("loading {}", path.display()))?;
+    let state = ctx.create_state().map_err(|e| anyhow!("{e}"))?;
+    Ok((ctx, state))
 }
 
 /// Whole lines whisper invents on short or quiet clips, learned from video
