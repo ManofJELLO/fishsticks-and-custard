@@ -1,9 +1,10 @@
 //! The tray icon, drawn on a 32-unit grid and rasterised at whatever
-//! sizes the tray asks for. Two shapes: a police box (default) or a
-//! fishbone at 45°.
+//! sizes the tray asks for. Three shapes: a police box (the default on
+//! Linux and Windows), a fishbone at 45°, or a fez (the default on macOS).
 //!
 //! - police box: blue with white lamp and windows, on any theme
-//! - fishbone: white on dark themes, black on light themes
+//! - fishbone and fez: white on dark themes, black on light themes (the
+//!   macOS menu bar tints them itself, from their shape alone)
 //! - recording: a red dot in the bottom-right corner, cut out of the shape
 //! - muted: dimmed
 
@@ -53,6 +54,7 @@ pub fn render(size: u32, st: &IconState) -> Pixmap {
     match st.shape {
         TrayIcon::PoliceBox => police_box(&mut pm, alpha, t, size),
         TrayIcon::Fishbone => fishbone(&mut pm, &paint, t, size),
+        TrayIcon::Fez => fez(&mut pm, &paint, t, size),
     }
 
     if recording {
@@ -176,6 +178,64 @@ fn fishbone(pm: &mut Pixmap, paint: &Paint, t: Transform, size: u32) {
     };
     if let Some(path) = bones.finish() {
         pm.stroke_path(&path, paint, &stroke, t, None);
+    }
+}
+
+/// A fez, its tassel hanging off the left (the bottom-right corner is the
+/// recording dot's). Drawn by its outline alone, with a band cut out above
+/// the brim, so it reads when the menu bar keeps only its shape.
+fn fez(pm: &mut Pixmap, paint: &Paint, t: Transform, size: u32) {
+    // The body: a cone cut flat, its top slightly domed, its brim curved.
+    let mut body = PathBuilder::new();
+    body.move_to(11.0, 9.6);
+    body.quad_to(17.0, 8.2, 23.0, 9.6);
+    body.line_to(26.2, 26.6);
+    body.quad_to(16.6, 29.4, 7.0, 26.6);
+    body.close();
+    if let Some(path) = body.finish() {
+        pm.fill_path(&path, paint, FillRule::Winding, t, None);
+    }
+
+    // The band above the brim, cut out of the body.
+    let clear = Paint {
+        blend_mode: BlendMode::Clear,
+        anti_alias: true,
+        ..Default::default()
+    };
+    let mut band = PathBuilder::new();
+    band.move_to(5.0, 21.4);
+    band.quad_to(16.6, 24.4, 28.0, 21.4);
+    let cut = Stroke {
+        width: if size <= 22 { 1.9 } else { 1.5 },
+        ..Default::default()
+    };
+    if let Some(path) = band.finish() {
+        pm.stroke_path(&path, &clear, &cut, t, None);
+    }
+
+    // The tassel: a cord from the button on top, over to the left and down,
+    // ending in a tuft.
+    let mut cord = PathBuilder::new();
+    cord.move_to(17.0, 8.6);
+    cord.quad_to(9.0, 3.0, 5.6, 9.4);
+    cord.line_to(5.0, 14.6);
+    let stroke = Stroke {
+        width: if size <= 22 { 2.0 } else { 1.6 },
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..Default::default()
+    };
+    if let Some(path) = cord.finish() {
+        pm.stroke_path(&path, paint, &stroke, t, None);
+    }
+    fill_circle(pm, paint, t, (17.0, 8.4), 1.7);
+    let mut tuft = PathBuilder::new();
+    tuft.move_to(5.0, 13.4);
+    tuft.line_to(7.0, 20.2);
+    tuft.quad_to(5.0, 21.2, 3.0, 20.2);
+    tuft.close();
+    if let Some(path) = tuft.finish() {
+        pm.fill_path(&path, paint, FillRule::Winding, t, None);
     }
 }
 

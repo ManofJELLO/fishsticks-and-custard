@@ -314,8 +314,6 @@ impl cxx_qt::Initialize for qobject::Backend {
         self.as_mut().set_status_height(controller::status_height() as i32);
         self.as_mut().set_shot(QString::from(&std::env::var("FSC_SHOT").unwrap_or_default()));
         self.as_mut().set_scale(1.0);
-        // The macOS menu bar tints a template image to suit itself.
-        self.as_mut().set_tray_mask(cfg!(target_os = "macos"));
         qobject::set_icon_name(&QString::from(crate::APP_ID));
 
         let meta = QString::from(start.ctl.meta());
@@ -363,8 +361,16 @@ impl qobject::Backend {
     /// open menu isn't redone for nothing), the tooltip, and the icon too
     /// when `icon`.
     fn tray_refresh(mut self: Pin<&mut Self>, icon: bool) {
-        if icon && let Some(url) = self.as_ref().rust().tray.icon.and_then(|st| crate::tray_qt::icon_url(&st)) {
-            self.as_mut().set_tray_icon(QString::from(&url));
+        if icon && let Some(st) = self.as_ref().rust().tray.icon {
+            // The macOS menu bar tints a one-colour (template) image to suit
+            // itself; the police box keeps its own colours.
+            let mask = cfg!(target_os = "macos") && st.shape.one_colour();
+            if *self.tray_mask() != mask {
+                self.as_mut().set_tray_mask(mask);
+            }
+            if let Some(url) = crate::tray_qt::icon_url(&st) {
+                self.as_mut().set_tray_icon(QString::from(&url));
+            }
         }
         let tip = QString::from(&self.as_ref().rust().tray.tooltip());
         if *self.tray_tip() != tip {

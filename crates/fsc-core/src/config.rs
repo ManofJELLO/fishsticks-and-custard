@@ -409,9 +409,20 @@ pub enum ThemePref {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum TrayIcon {
-    #[default]
+    #[cfg_attr(not(target_os = "macos"), default)]
     PoliceBox,
     Fishbone,
+    /// One colour, so it suits the macOS menu bar (where it's the default):
+    /// the police box's colours are lost there, leaving a blob.
+    #[cfg_attr(target_os = "macos", default)]
+    Fez,
+}
+
+impl TrayIcon {
+    /// Drawn in one colour (tinted by the macOS menu bar to suit itself).
+    pub fn one_colour(self) -> bool {
+        self != TrayIcon::PoliceBox
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -475,7 +486,7 @@ impl Default for UiConfig {
             font: "0xProto Nerd Font".into(),
             accent: "system".into(),
             theme: ThemePref::Auto,
-            tray_icon: TrayIcon::PoliceBox,
+            tray_icon: TrayIcon::default(),
             visualiser: Visualiser::Spectrum,
             bands: 16,
             block_percent: 10,

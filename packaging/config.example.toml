@@ -51,7 +51,7 @@ font = "0xProto Nerd Font"
 accent = "system"             # desktop accent (else the Qt palette's); or hex, e.g. "#D71921"
 theme = "auto"                # light/dark for the tray icon: "auto" follows the desktop portal; or "dark" / "light"
 # Panel and text colours come from your Qt palette (qt6ct on Hyprland).
-tray_icon = "police-box"      # or "fishbone"; a red dot in the corner means it's recording
+tray_icon = "police-box"      # or "fishbone" or "fez" (macOS default); a dot in the corner means it's recording
 visualiser = "spectrum"       # "spectrum" (frequency bars) or "loudness" (level over time)
 bands = 16                    # spectrum bars
 block_percent = 10            # each bar lights in blocks of this many percent

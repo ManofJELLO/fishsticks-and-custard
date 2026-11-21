@@ -287,7 +287,7 @@ fn dump_icons(dir: &str) -> Result<()> {
     use fsc_core::Phase;
     use fsc_core::config::TrayIcon;
     std::fs::create_dir_all(dir)?;
-    for shape in [TrayIcon::PoliceBox, TrayIcon::Fishbone] {
+    for shape in [TrayIcon::PoliceBox, TrayIcon::Fishbone, TrayIcon::Fez] {
         for theme in [ThemeMode::Dark, ThemeMode::Light] {
             for (name, phase, muted) in [("idle", Phase::Idle, false), ("rec", Phase::Listening, false), ("muted", Phase::Idle, true)] {
                 let st = icon::IconState {
