@@ -1,8 +1,8 @@
 # Fishsticks & Custard
 
-A voice assistant for your Hyprland desktop. Say *"fishsticks and custard"*, press a key or
-click the police box in your tray, then ask it something. It answers in a small popup and,
-if you spoke, reads the reply aloud.
+A voice assistant for your Mac or your Hyprland desktop. Say *"fishsticks and custard"*,
+press a key or click its icon in the menu bar or tray, then ask it something. It answers in
+a small popup and, if you spoke, reads the reply aloud.
 
 <p align="center"><img src="docs/images/popup-reply.png" alt="The popup showing a typed question and its reply" width="680"></p>
 
@@ -33,25 +33,60 @@ if you spoke, reads the reply aloud.
 - [Conversations and memory](#conversations-and-memory)
 - [Bluetooth headsets](#bluetooth-headsets)
 - [Privacy](#privacy)
-- [Settings](#settings)
+- [Settings](#settings) and [where things are kept](#where-things-are-kept)
 - [Troubleshooting](#troubleshooting)
 - [Updating and uninstalling](#updating-and-uninstalling)
 
 ## What you need
 
-- **Arch Linux with Hyprland.** Other Wayland compositors may work, but it's made for
-  Hyprland. It doesn't run on X11.
-- **A system tray** for the icon, such as Waybar's `tray` module.
+- **A Mac with Apple Silicon** (M1 or newer) on macOS 13 Ventura or later, with
+  [Homebrew](https://brew.sh). Speech recognition runs on the Mac's GPU.
+- **Or Arch Linux with Hyprland.** Other Wayland compositors may work, but it's made for
+  Hyprland. It doesn't run on X11. You also need a system tray for the icon, such as
+  Waybar's `tray` module.
 - **An account with one of the agents** (see [Choosing an agent](#choosing-an-agent)).
   Claude Code is the default. OpenCode needs no account at all.
 - **For voice:** a microphone, and speakers or headphones. Typing works without either.
-- **About 700 MB of disk** for the speech models.
-- **A graphics card with Vulkan drivers** makes speech recognition fast: AMD
+- **About 900 MB of disk** for the speech models.
+- **On Linux, a graphics card with Vulkan drivers** makes speech recognition fast: AMD
   (`vulkan-radeon`), Intel (`vulkan-intel`) or NVIDIA (`nvidia-utils`, or `vulkan-nouveau`
   with the open driver). Without one it runs on the CPU, which takes several seconds per
   question. The log says which it's using.
 
 ## Install
+
+### macOS
+
+1. **Install it with Homebrew:**
+
+   ```sh
+   brew install --cask manofjello/tap/fishsticks-and-custard
+   ```
+
+2. **Install an agent and sign in.** For Claude, install the
+   [Claude Code](https://claude.com/claude-code) CLI and run `claude` once to sign in. For
+   the others, see [Choosing an agent](#choosing-an-agent).
+
+3. **Download the speech models** (about 900 MB), then check them:
+
+   ```sh
+   fsc fetch-models
+   /Applications/FishsticksAndCustard.app/Contents/MacOS/fscd --self-test
+   ```
+
+   The self-test speaks a sentence out loud and transcribes it back, so turn your
+   volume up.
+
+4. **Start it.** Open **Fishsticks & Custard** from Applications or Spotlight. A fez
+   appears in the menu bar. The first time you talk to it, macOS asks whether it may use
+   the microphone: allow it.
+
+5. **To start it when you log in,** add it in System Settings › General › Login Items.
+
+The app isn't signed with an Apple developer ID, so after an update macOS may ask for
+microphone access again.
+
+### Arch Linux
 
 1. **Trust the package signing key:**
 
@@ -101,6 +136,9 @@ if you spoke, reads the reply aloud.
 
 7. **Start it.** Run `fscd`, or open **Fishsticks & Custard** from your app launcher. The
    police box appears in your tray.
+
+Below, **Super+A** and **Super+Shift+A** are the Linux keys. On a Mac they're
+**Option+A** and **Option+Shift+A**, and the popup's **Ctrl** keys are **Cmd**.
 
 ## Getting started
 
@@ -159,11 +197,13 @@ Opening a page asks because a page can contain instructions aimed at the agent. 
 
 ## The tray icon
 
-<p align="center"><img src="docs/images/tray-icons.png" alt="Tray icons: police box when ready, with a red dot while recording, dimmed when the wake word is muted, and the fishbone alternative" width="600"></p>
+<p align="center"><img src="docs/images/tray-icons.png" alt="Tray icons: police box when ready, with a red dot while recording, dimmed when the wake word is muted; the fishbone alternative; and the fez used in the macOS menu bar" width="780"></p>
 
-Click the icon to show or hide the popup. A red dot means the microphone is recording.
-If you prefer, a fishbone icon is available as well (see [Settings](#settings)).
-Right-click the icon for its menu:
+On Linux, click the icon to show or hide the popup, and right-click it for its menu. On a
+Mac the icon is a fez in the menu bar, and clicking it opens the menu. A red dot means the
+microphone is recording. A fishbone icon is available as well (see [Settings](#settings)).
+
+The menu:
 
 | Menu item | What it does |
 |---|---|
@@ -185,13 +225,17 @@ Changes made from the menu take effect straight away and are saved.
 
 | Key | What it does |
 |---|---|
-| **Super+A** | Opens the popup for typing. |
-| **Super+Shift+A** | Hold to talk, or tap to talk until you stop. |
+| **Super+A** (Mac: **Option+A**) | Opens the popup for typing. |
+| **Super+Shift+A** (Mac: **Option+Shift+A**) | Hold to talk, or tap to talk until you stop. |
 | **Enter** | Sends your message. |
 | **Esc** | Hides the popup, and hangs up a voice conversation. A reply still in progress finishes as text, and you get a notification. |
 | **Ctrl+C** | Copies the text you highlighted in the popup. With nothing highlighted, stops the reply. |
 | **Ctrl+Shift+C** | Copies the whole conversation in the popup, questions and replies, as plain text. |
 | **Ctrl+N** | Starts a new conversation. |
+
+On a Mac, use **Cmd** for the **Ctrl** keys in the popup. The Mac's global keys are set in
+the `[keys]` section of the settings. Option+A normally types "å", so change them if you
+need that letter or another app (such as AeroSpace) uses them.
 
 The `fsc` command does the same from a terminal or a script. Run `fsc --help` for the
 full list.
@@ -223,9 +267,9 @@ memory of you.
 | Agent | Account | Install | Sign in |
 |---|---|---|---|
 | **Claude** (default) | Claude Pro or Max | [Claude Code](https://claude.com/claude-code) | run `claude` once |
-| **Codex** | ChatGPT | the Codex CLI and `codex-acp` (AUR `codex-acp`, or `npm i -g @agentclientprotocol/codex-acp`) | `codex login` |
+| **Codex** | ChatGPT | the Codex CLI and `codex-acp` (`npm i -g @openai/codex @agentclientprotocol/codex-acp`, or AUR `codex-acp`) | `codex login` |
 | **Antigravity** | Google | `agy` 1.5 or newer (AUR `antigravity-cli`) | `agy acp --login` |
-| **OpenCode** | none for its free models | `sudo pacman -S opencode` | `opencode auth login`, only for your own providers |
+| **OpenCode** | none for its free models | [OpenCode](https://opencode.ai) (on Arch, `sudo pacman -S opencode`) | `opencode auth login`, only for your own providers |
 
 If an agent isn't signed in, the popup tells you which command to run.
 
@@ -234,8 +278,8 @@ asks before acting. Claude's modes are Ask (the default), Accept edits, Auto and
 Codex starts in read-only, which asks before any edit, command or network use. The
 popup shows the current model and mode at the top.
 
-Codex, Antigravity and OpenCode work in a folder of their own,
-`~/.local/share/fsc/home/workspace`. They can write there freely, but they ask before
+Codex, Antigravity and OpenCode work in a folder of their own, `workspace` in the
+assistant's home (see [Where things are kept](#where-things-are-kept)). They can write there freely, but they ask before
 touching anything else of yours.
 
 Any other agent that supports the [Agent Client Protocol](https://agentclientprotocol.com)
@@ -253,8 +297,8 @@ were tested with synthetic voices only, and Vietnamese answers often weren't rec
 that way. If you speak one of them, a report of how it does for you would help. Japanese
 and Thai aren't available yet: their voices need a different speech engine.
 
-For Chinese and Korean text in the popup, install `noto-fonts-cjk`; for Hindi,
-`noto-fonts`.
+On Linux, install `noto-fonts-cjk` for Chinese and Korean text in the popup, and
+`noto-fonts` for Hindi.
 
 Pick another language from the tray's **Language** menu, or with `fsc language de`. It
 then listens for that language, speaks it, and tells the agent to reply in it.
@@ -298,7 +342,7 @@ the popup above a **NEW SESSION** line.
 Before a conversation ends, the agent updates a short list of lasting facts about you:
 your preferences, the people and things you mention, plans you're working on, anything you
 asked it to remember. It leaves out one-off questions and sensitive details. The list is
-kept in `~/.local/share/fsc/home/memory.md`, a plain text file you can read and edit.
+kept in `memory.md` in the assistant's home, a plain text file you can read and edit.
 
 - `fsc memory` shows the list.
 - `fsc forget` or **Forget memories** in the tray deletes it.
@@ -329,10 +373,11 @@ mic) for listening: choose it in the tray's **Microphone** menu.
 ## Settings
 
 The tray's **Settings…** opens [HyprCustard](https://github.com/ManofJELLO/hyprcustard) if
-you have it installed, or your settings file, `~/.config/fsc/config.toml`, in your text
-editor. If the file doesn't exist yet, it's created with every setting listed and
-commented out. Changes to the file take effect when you restart the assistant
-(`fsc quit`, then `fscd`).
+you have it installed, or your settings file, `config.toml` (see
+[Where things are kept](#where-things-are-kept)), in your text editor. If the file doesn't
+exist yet, it's created with every setting listed and commented out. Changes to the file
+take effect when you restart the assistant: `fsc quit`, then `fscd` (on a Mac, open the
+app again).
 
 Some settings you might want to change:
 
@@ -351,19 +396,28 @@ Some settings you might want to change:
 | `[voice] wake_model` | The speech model that listens for the wake phrase: `"small-q8_0"` (default) is fast. `""` uses the full model for it too, slower to notice the phrase. It's only used when it's smaller than `whisper_model`. |
 | `[agent] session_idle_minutes` | Minutes without a message before a new conversation starts. |
 
-The full list, with explanations, is in
-`/usr/share/fishsticks-and-custard/config.example.toml`.
+The settings file lists them all, with explanations (on Linux it's also at
+`/usr/share/fishsticks-and-custard/config.example.toml`).
 
-The popup follows your Qt theme's colours (qt6ct on Hyprland, as HyprCustard sets
-them) and your desktop's light or dark mode.
+On Linux the popup follows your Qt theme's colours (qt6ct on Hyprland, as HyprCustard
+sets them) and your desktop's light or dark mode. On a Mac it sits on the system's glass
+and follows its light or dark mode.
 
-**Personality:** how the assistant talks is described in
-`~/.local/share/fsc/home/persona.md`. Edit it and press **Ctrl+N** to start a
-conversation with the change.
+**Personality:** how the assistant talks is described in `persona.md` in the assistant's
+home. Edit it and press **Ctrl+N** to start a conversation with the change.
 
 **What Claude may do without asking:** your **ALWAYS** answers are saved in
-`~/.local/share/fsc/home/.claude/settings.local.json`. Remove an entry from its `allow`
+`.claude/settings.local.json` in the assistant's home. Remove an entry from its `allow`
 list to be asked again, or add one to `deny` to refuse it every time.
+
+### Where things are kept
+
+| | Linux | macOS |
+|---|---|---|
+| Settings | `~/.config/fsc/config.toml` | `~/Library/Application Support/fsc/config.toml` |
+| The assistant's home (memory, persona, workspace) | `~/.local/share/fsc/home` | `~/Library/Application Support/fsc/home` |
+| Speech models | `~/.local/share/fsc/models` | `~/Library/Application Support/fsc/models` |
+| Log | `~/.local/state/fsc/fscd.log` | `~/Library/Application Support/fsc/state/fscd.log` |
 
 ## Troubleshooting
 
@@ -374,22 +428,32 @@ list to be asked again, or add one to `deny` to refuse it every time.
 - **It cuts you off mid-sentence:** raise `end_silence_ms` in the `[voice]` settings.
 - **It wakes up by accident:** choose a longer or more unusual phrase with `fsc wake`.
 - **Nothing happens when you press Super+A:** check that the Hyprland lines are in your
-  config, and that the assistant is running (`fsc status`).
-- **To see what it's doing:** read its log, `~/.local/state/fsc/fscd.log`. The log from
-  the run before is kept as `fscd.log.old`, which is the one to look at after a crash or
-  freeze.
+  config, and that the assistant is running (`fsc status`). On a Mac, check that no other
+  app uses Option+A, or choose other keys in `[keys]`.
+- **On a Mac, it can't find your agent:** it looks where your shell does (your login
+  shell's PATH). Check that `claude` (or your agent) runs in a new Terminal window.
+- **To see what it's doing:** read its log, `fscd.log` (see
+  [Where things are kept](#where-things-are-kept)). The log from the run before is kept as
+  `fscd.log.old`, which is the one to look at after a crash or freeze.
 - **Reporting a problem:** [open an issue](https://github.com/ManofJELLO/fishsticks-and-custard/issues/new/choose)
   and attach the log. It doesn't hold the conversation, but it does note what it heard
   around the wake phrase, so look it over before you post it.
 
 ## Updating and uninstalling
 
-Updates arrive with your normal `sudo pacman -Syu`. Afterwards, restart the assistant
-with `fsc quit`, then `fscd`. If the update notes ask for new speech models, run
-`fsc fetch-models`.
+**macOS:** update with `brew update && brew upgrade --cask fishsticks-and-custard`, then
+quit it from the menu and open it again. To uninstall, run
+`brew uninstall --cask fishsticks-and-custard`; add `--zap` to remove your settings,
+memory, models and log as well.
 
-To uninstall, run `sudo pacman -Rns fishsticks-and-custard`. Your settings and data stay
-in `~/.config/fsc` and `~/.local/share/fsc`. Delete those folders to remove them too.
+**Arch Linux:** updates arrive with your normal `sudo pacman -Syu`. Afterwards, restart
+the assistant with `fsc quit`, then `fscd`. To uninstall, run
+`sudo pacman -Rns fishsticks-and-custard`. Your settings and data stay in
+`~/.config/fsc` and `~/.local/share/fsc`. Delete those folders to remove them too.
+
+If the update notes ask for new speech models, run `fsc fetch-models`. Version 0.10.0
+adds a small model for the wake phrase (about 250 MB); until you fetch it, the wake phrase
+is heard by the full model, more slowly.
 
 ---
 

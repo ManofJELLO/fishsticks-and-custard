@@ -88,14 +88,27 @@ Fix anything marked FAIL and read the WARNs. Then rerun with `--record` to save 
 tested, and commit `tested.json` with the release.
 
 Bump `version` in `Cargo.toml` and `pkgver` in `packaging/arch/PKGBUILD` (they must match),
+run `cargo update -w`, regenerate `packaging/arch/.SRCINFO` (`makepkg --printsrcinfo`),
 commit, then `git tag vX.Y.Z && git push --tags`. The `package` workflow builds, signs and
 publishes it to the `repo` release.
+
+The same tag starts the `macos-app` workflow, which builds the `.app`, zips it and attaches
+the zip and its `.sha256` to the tag's GitHub release (a tag with a suffix, like
+`v0.10.0-beta.1`, makes a pre-release and skips the Linux package). Then set `version` and
+`sha256` in `Casks/fishsticks-and-custard.rb` in
+[ManofJELLO/homebrew-tap](https://github.com/ManofJELLO/homebrew-tap) (the template is
+`packaging/homebrew/`) and push it.
 
 ## Screenshots
 
 The README images in `docs/images` come from a separate test instance of `fscd`, so
-they never show a real conversation. It runs with its own
-`XDG_CONFIG_HOME` (wake word off, `speak = "never"`) and `XDG_DATA_HOME`, a short
-`XDG_RUNTIME_DIR`, and an empty `PIPEWIRE_RUNTIME_DIR`. `fsc show` puts the popup on
-screen without taking focus. Each image is a `grim -g` capture of the window's geometry,
-with the corners rounded in ImageMagick.
+they never show your own conversations or settings. It runs with its own
+`XDG_CONFIG_HOME` (wake word off, `speak = "never"`, plus a copy of your `qt6ct` folder
+for the colours) and `XDG_DATA_HOME`, a short `XDG_RUNTIME_DIR`, an empty
+`PIPEWIRE_RUNTIME_DIR`, and `QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=qt6ct
+FSC_SHOT=popup.png`, so nothing appears on screen. `fsc show` and `fsc ask "…"` fill the
+popup; `fsc hide` then `fsc show` fits it to what's in it before the capture. The corners
+are rounded in ImageMagick.
+
+`fscd --dump-icons DIR` writes the tray icons for `tray-icons.png`. The macOS picture is a
+screenshot taken on a Mac.
