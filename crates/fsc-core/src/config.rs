@@ -454,14 +454,14 @@ pub struct UiConfig {
     pub margin_x: i32,
     /// Layer only: output name ("DP-1"); empty = the focused one.
     pub monitor: String,
-    /// Layer and macOS: panel opacity, 0..1. (Windows on Linux take
-    /// Hyprland's `opacity` rule.) On macOS it's the tint over the glass.
+    /// Layer: panel opacity, 0..1. (Windows on Linux take Hyprland's
+    /// `opacity` rule.) macOS: a tint over the glass, none by default.
     pub opacity: f64,
     /// Layer and macOS: fade the panel, most see-through behind the
     /// visualiser and most solid behind text, scaled by `opacity`.
     pub gradient: bool,
     /// macOS only: the system's glass behind the panel (Liquid Glass on
-    /// macOS 26 and later, else the frosted blur).
+    /// macOS 26 and later, else the frosted blur). Off, the panel is solid.
     pub glass: bool,
     pub width: i32,
     /// Max height of the conversation area before it scrolls.
@@ -489,8 +489,8 @@ impl Default for UiConfig {
             margin: 80,
             margin_x: 24,
             monitor: String::new(),
-            // Over the glass on macOS, a tint you can see through.
-            opacity: if cfg!(target_os = "macos") { 0.25 } else { 0.92 },
+            // macOS: the system's glass alone, like its own launcher.
+            opacity: if cfg!(target_os = "macos") { 0.0 } else { 0.92 },
             gradient: false,
             glass: true,
             width: 680,

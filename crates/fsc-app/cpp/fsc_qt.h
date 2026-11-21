@@ -117,6 +117,18 @@ inline void glass(id nswindow, double w, double h, bool on, bool dark, double ra
         return;
     }
     id existing = find_glass(frame);
+    // The whole window is clipped to the panel's rounded shape. Without
+    // this, something in it still counts as a rectangle, and macOS draws its
+    // focused-window rim (and the shadow) around the square corners.
+    set_bool(frame, "setWantsLayer:", true);
+    id clip = send(frame, "layer");
+    if (clip) {
+        set_double(clip, "setCornerRadius:", on ? radius : 0.0);
+        set_bool(clip, "setMasksToBounds:", on);
+        if (responds(clip, "setCornerCurve:")) {
+            set_id(clip, "setCornerCurve:", string("continuous"));
+        }
+    }
     if (!on) {
         if (existing) {
             send(existing, "removeFromSuperview");

@@ -35,6 +35,9 @@ pub struct Look {
     pub framed: bool,
     pub opacity: f64,
     pub gradient: bool,
+    /// The hairline round the edge of a framed panel. Not over macOS's
+    /// glass, which has a rim of its own.
+    pub edge: bool,
 }
 
 /// Gradient opacities relative to `Look::opacity`.
@@ -55,7 +58,9 @@ pub fn draw(cr: &mut Canvas, w: f64, h: f64, p: &Palette, r: Regions, look: Look
     let Some(shape) = rounded_rect(0.5, 0.5, w - 1.0, h - 1.0, RADIUS) else { return };
     if !look.gradient {
         cr.fill(&shape, bg, o);
-        hairline(cr, &shape, p);
+        if look.edge {
+            hairline(cr, &shape, p);
+        }
         return;
     }
 
@@ -82,7 +87,9 @@ pub fn draw(cr: &mut Canvas, w: f64, h: f64, p: &Palette, r: Regions, look: Look
         Some(g) => cr.fill_with(&shape, g),
         None => cr.fill(&shape, bg, o),
     }
-    hairline(cr, &shape, p);
+    if look.edge {
+        hairline(cr, &shape, p);
+    }
 }
 
 fn hairline(cr: &mut Canvas, shape: &tiny_skia::Path, p: &Palette) {
@@ -104,7 +111,7 @@ mod preview {
         let regions = Regions { header_bottom: 40.0, graphic_top: 56.0, graphic_bottom: 144.0, text_top: 160.0 };
         for (mode, name) in [(ThemeMode::Dark, "dark"), (ThemeMode::Light, "light")] {
             let mut c = Canvas::new(w, h, 2.0).unwrap();
-            let look = Look { framed: true, opacity: 0.85, gradient: true };
+            let look = Look { framed: true, opacity: 0.85, gradient: true, edge: true };
             draw(&mut c, w, h, &Palette::new(mode, NOTHING_RED), regions, look);
             c.pixmap().save_png(format!("{dir}/panel-{name}.png")).unwrap();
         }
